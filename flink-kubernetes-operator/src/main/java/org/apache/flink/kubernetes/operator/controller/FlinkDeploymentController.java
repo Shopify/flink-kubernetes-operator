@@ -159,6 +159,7 @@ public class FlinkDeploymentController
         }
 
         LOG.debug("End of reconciliation");
+        flinkApp.getStatus().setObservedGeneration(12345L);
         statusRecorder.patchAndCacheStatus(flinkApp, ctx.getKubernetesClient());
         return ReconciliationUtils.toUpdateControl(
                 ctx.getOperatorConfig(), flinkApp, previousDeployment, true);
