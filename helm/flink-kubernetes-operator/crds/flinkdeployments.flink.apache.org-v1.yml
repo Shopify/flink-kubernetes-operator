@@ -9707,6 +9707,8 @@ spec:
                   replicas:
                     type: integer
                 type: object
+              observedGeneration:
+                type: integer
               jobStatus:
                 properties:
                   jobName:

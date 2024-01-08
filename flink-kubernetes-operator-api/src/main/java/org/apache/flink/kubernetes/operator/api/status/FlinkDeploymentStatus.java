@@ -55,4 +55,7 @@ public class FlinkDeploymentStatus extends CommonStatus<FlinkDeploymentSpec> {
 
     /** Information about the TaskManagers for the scale subresource. */
     private TaskManagerInfo taskManager;
+
+    /** Last observed generation of the FlinkDeployment. */
+    private Long observedGeneration;
 }
