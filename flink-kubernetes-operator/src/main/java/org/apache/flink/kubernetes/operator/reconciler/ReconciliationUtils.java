@@ -126,6 +126,12 @@ public class ReconciliationUtils {
         status.setError(null);
         reconciliationStatus.setReconciliationTimestamp(clock.instant().toEpochMilli());
 
+        // Set observedGeneration
+        var lastSpecWithMeta = reconciliationStatus.deserializeLastReconciledSpecWithMeta();
+        if (lastSpecWithMeta != null) {
+            status.setObservedGeneration(lastSpecWithMeta.getMeta().getMetadata().getGeneration());
+        }
+
         var state = reconciliationStatus.getState();
         if (state == ReconciliationState.ROLLING_BACK) {
             state = upgrading ? ReconciliationState.ROLLING_BACK : ReconciliationState.ROLLED_BACK;
@@ -135,7 +141,6 @@ public class ReconciliationUtils {
         reconciliationStatus.setState(state);
 
         if (state == ReconciliationState.ROLLING_BACK || state == ReconciliationState.ROLLED_BACK) {
-            var lastSpecWithMeta = reconciliationStatus.deserializeLastReconciledSpecWithMeta();
             var job = lastSpecWithMeta.getSpec().getJob();
             if (job != null) {
                 // During the rollback we have to update the upgradeMode in the lastReconciledSpec
