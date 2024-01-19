@@ -126,6 +126,9 @@ public class ReconciliationUtils {
         status.setError(null);
         reconciliationStatus.setReconciliationTimestamp(clock.instant().toEpochMilli());
 
+        // Set observedGeneration
+        status.setObservedGeneration(target.getMetadata().getGeneration());
+
         var state = reconciliationStatus.getState();
         if (state == ReconciliationState.ROLLING_BACK) {
             state = upgrading ? ReconciliationState.ROLLING_BACK : ReconciliationState.ROLLED_BACK;
