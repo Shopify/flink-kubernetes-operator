@@ -223,11 +223,11 @@ public class EventUtils {
     }
 
     private static boolean isNamespaceMarkedForDeletion(KubernetesClient client, String namespace) {
-            try {
-                return client.namespaces().withName(namespace).get().isMarkedForDeletion();
-            } catch (Exception e) {
-                LOG.warn("Error while checking namespace status", e);
-                return false;
-            }
+        try {
+            return client.namespaces().withName(namespace).get().isMarkedForDeletion();
+        } catch (Exception e) {
+            LOG.warn("Error while checking namespace status", e);
+            return false;
         }
+    }
 }
