@@ -100,8 +100,10 @@ public class CanaryResourceManager<CR extends AbstractFlinkResource<?, ?>> {
                         .get(KubernetesOperatorConfigOptions.CANARY_RESOURCE_TIMEOUT);
 
         Long restartNonce = crs.resource.getSpec().getRestartNonce();
+        Long generation = crs.resource.getMetadata().getGeneration();
         crs.resource.getSpec().setRestartNonce(restartNonce == null ? 1L : restartNonce + 1);
         crs.previousGeneration = crs.resource.getMetadata().getGeneration();
+        crs.resource.getStatus().setObservedGeneration(generation);
 
         LOG.info("Scheduling canary check for {} in {}s", resourceID, canaryTimeout.toSeconds());
 
