@@ -103,6 +103,7 @@ public class CanaryResourceManager<CR extends AbstractFlinkResource<?, ?>> {
         Long generation = crs.resource.getMetadata().getGeneration();
         crs.resource.getSpec().setRestartNonce(restartNonce == null ? 1L : restartNonce + 1);
         crs.previousGeneration = crs.resource.getMetadata().getGeneration();
+        LOG.info("Setting Observed Generation to: {}", generation);
         crs.resource.getStatus().setObservedGeneration(generation);
 
         LOG.info("Scheduling canary check for {} in {}s", resourceID, canaryTimeout.toSeconds());
