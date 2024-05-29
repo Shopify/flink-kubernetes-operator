@@ -46,6 +46,7 @@ public final class MutatorUtils {
         DefaultFlinkMutator defaultFlinkMutator = new DefaultFlinkMutator();
         defaultFlinkMutator.configure(conf);
         flinkmutator.add(defaultFlinkMutator);
+        LOG.info("SEARCHING FOR MUTATOR PLUGINS");
         PluginUtils.createPluginManagerFromRootFolder(conf)
                 .load(FlinkResourceMutator.class)
                 .forEachRemaining(

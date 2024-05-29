@@ -42,6 +42,7 @@ public final class ValidatorUtils {
         DefaultValidator defaultValidator = new DefaultValidator(configManager);
         defaultValidator.configure(conf);
         resourceValidators.add(defaultValidator);
+        LOG.info("SEARCHING FOR VALIDATOR PLUGIN");
         PluginUtils.createPluginManagerFromRootFolder(conf)
                 .load(FlinkResourceValidator.class)
                 .forEachRemaining(
