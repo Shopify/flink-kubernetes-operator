@@ -20,7 +20,7 @@ public class FlinkSavepointMutator implements FlinkResourceMutator {
         LOG.info("STARTING MUTATION FOR NAMESPACE: {}", ns);
         if (ns.contains(testPipeline)) {
             String snapshotPath =
-                    "gs://staging-products-unrestricted-iyu9/flink-checkpoints/6ee4d2f82e861a681eec4ad74254e774/chk-780";
+                    "staging-products-unrestricted-iyu9/flink-checkpoints/270aa280f6c49857fd81d0007d670ab4/chk-714";
             deployment.getSpec().getJob().setInitialSavepointPath(snapshotPath);
             LOG.info("Job: {} | Set snapshot path as: {}", testPipeline, snapshotPath);
         }
