@@ -84,8 +84,13 @@ public class FlinkMutator implements Mutator<HasMetadata> {
     private FlinkDeployment mutateDeployment(HasMetadata resource) {
         try {
             var flinkDeployment = mapper.convertValue(resource, FlinkDeployment.class);
+            if flinkDeployment == null {
+                LOG.error("Failed to convert resource to FlinkDeployment: {}", resource);
+            }
             for (FlinkResourceMutator mutator : mutators) {
-                flinkDeployment = mutator.mutateDeployment(flinkDeployment);
+                flinkDeployment = mutator.mutateDeployment(
+                    flinkDeployment
+                );
             }
             return flinkDeployment;
         } catch (Exception e) {
