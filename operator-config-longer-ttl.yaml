@@ -88,7 +88,7 @@ data:
     
     kubernetes.operator.periodic.checkpoint.interval: 7d
     kubernetes.operator.deployment.readiness.timeout: 10m
-    kubernetes.operator.jm-deployment.shutdown-ttl: 5s
+    kubernetes.operator.jm-deployment.shutdown-ttl: 1m
     kubernetes.operator.pod-template.merge-arrays-by-name: true
     kubernetes.operator.deployment.rollback.enabled: true
 

@@ -297,6 +297,15 @@ public class ReconciliationUtils {
         }
 
         if (status instanceof FlinkDeploymentStatus) {
+            FlinkDeploymentStatus deploymentStatus = (FlinkDeploymentStatus) status;
+            if (ReconciliationUtils.isJobInTerminalState(status)
+                    && deploymentStatus.getJobManagerDeploymentStatus()
+                            == JobManagerDeploymentStatus.MISSING) {
+                return updateControl;
+            }
+        }
+
+        if (status instanceof FlinkDeploymentStatus) {
             return updateControl.rescheduleAfter(
                     rescheduleAfter(
                                     ((FlinkDeploymentStatus) status)

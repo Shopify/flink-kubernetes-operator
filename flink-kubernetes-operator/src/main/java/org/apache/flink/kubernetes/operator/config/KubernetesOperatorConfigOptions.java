@@ -596,7 +596,7 @@ public class KubernetesOperatorConfigOptions {
     public static final ConfigOption<Duration> OPERATOR_JM_SHUTDOWN_TTL =
             operatorConfig("jm-deployment.shutdown-ttl")
                     .durationType()
-                    .defaultValue(Duration.ofDays(1))
+                    .defaultValue(Duration.ofSeconds(5))
                     .withDescription(
                             "Time after which jobmanager pods of terminal application deployments are shut down.");
 
