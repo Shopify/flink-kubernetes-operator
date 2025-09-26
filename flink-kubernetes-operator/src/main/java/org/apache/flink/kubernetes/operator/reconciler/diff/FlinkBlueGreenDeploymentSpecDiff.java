@@ -87,11 +87,15 @@ public class FlinkBlueGreenDeploymentSpecDiff {
 
         // Case 2: ReflectiveDiffBuilder returns IGNORE
         if (diffType == DiffType.IGNORE) {
-            System.out.println("*** Returning PATCH_CHILD because ReflectiveDiffBuilder returned IGNORE ***");
+            System.out.println(
+                    "*** Returning PATCH_CHILD because ReflectiveDiffBuilder returned IGNORE ***");
             return BlueGreenDiffType.PATCH_CHILD;
         } else {
             // Case 3: ReflectiveDiffBuilder returns anything else map it to TRANSITION as well
-            System.out.println("*** Returning TRANSITION because ReflectiveDiffBuilder returned: " + diffType + " ***");
+            System.out.println(
+                    "*** Returning TRANSITION because ReflectiveDiffBuilder returned: "
+                            + diffType
+                            + " ***");
             return BlueGreenDiffType.TRANSITION;
         }
     }
