@@ -85,24 +85,30 @@ public class ReflectiveDiffBuilder<T> implements Builder<DiffResult<T>> {
                 try {
                     var leftField = readField(field, before, true);
                     var rightField = readField(field, after, true);
-                    
+
                     // DEBUG: Print field comparison details
                     boolean fieldsEqual = ObjectUtils.equals(leftField, rightField);
-                    System.out.println("*** Field: " + field.getName() + " - Equal: " + fieldsEqual);
+                    System.out.println(
+                            "*** Field: " + field.getName() + " - Equal: " + fieldsEqual);
                     if (!fieldsEqual) {
                         System.out.println("    Left:  " + leftField);
                         System.out.println("    Right: " + rightField);
-                        System.out.println("    Left class:  " + (leftField != null ? leftField.getClass() : "null"));
-                        System.out.println("    Right class: " + (rightField != null ? rightField.getClass() : "null"));
+                        System.out.println(
+                                "    Left class:  "
+                                        + (leftField != null ? leftField.getClass() : "null"));
+                        System.out.println(
+                                "    Right class: "
+                                        + (rightField != null ? rightField.getClass() : "null"));
                     }
-                    
+
                     if (field.getName().equals(FLINK_CONFIGURATION_PROPERTY_NAME)) {
                         leftField = ((ConfigObjectNode) leftField).asFlatMap();
                         rightField = ((ConfigObjectNode) rightField).asFlatMap();
-                        
+
                         // DEBUG: Print flinkConfiguration comparison after conversion
                         boolean configEqual = ObjectUtils.equals(leftField, rightField);
-                        System.out.println("*** FlinkConfiguration after conversion - Equal: " + configEqual);
+                        System.out.println(
+                                "*** FlinkConfiguration after conversion - Equal: " + configEqual);
                         if (!configEqual) {
                             System.out.println("    Left config:  " + leftField);
                             System.out.println("    Right config: " + rightField);
