@@ -403,6 +403,7 @@ public class BlueGreenDeploymentService {
             BlueGreenDiffType diffType = getSpecDiff(context);
 
             if (diffType != BlueGreenDiffType.IGNORE) {
+                LOG.info("DRDEBUG -- DIFF TYPE IS {}", diffType);
                 setLastReconciledSpec(context);
                 var oppositeDeploymentType =
                         context.getOppositeDeploymentType(currentBlueGreenDeploymentType);

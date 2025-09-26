@@ -104,7 +104,22 @@ public class BlueGreenUtils {
                         lastSpec,
                         context.getBgDeployment().getSpec());
 
-        return diff.compare();
+        BlueGreenDiffType result = diff.compare();
+        
+        // Debug logging to identify what's different
+        LOG.info("=== BlueGreen Spec Diff Debug ===");
+        LOG.info("Last reconciled spec: {}", lastReconciledSpec);
+        LOG.info("Current spec JSON: {}", SpecUtils.writeSpecAsJSON(context.getBgDeployment().getSpec(), "spec"));
+        LOG.info("Diff result: {}", result);
+        if (result != BlueGreenDiffType.IGNORE) {
+            LOG.info("*** Spec difference detected! Type: {} for deployment: {} ***", result, 
+                context.getBgDeployment().getMetadata().getName());
+            LOG.info("Last reconciled spec was: {}", lastReconciledSpec);
+            LOG.info("Current spec is now: {}", SpecUtils.writeSpecAsJSON(context.getBgDeployment().getSpec(), "spec"));
+        }
+        LOG.info("=== End Spec Diff Debug ===");
+        
+        return result;
     }
 
     public static void setLastReconciledSpec(BlueGreenContext context) {
