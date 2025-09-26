@@ -59,8 +59,19 @@ public class FlinkBlueGreenDeploymentSpecDiff {
         FlinkDeploymentSpec leftSpec = left.getTemplate().getSpec();
         FlinkDeploymentSpec rightSpec = right.getTemplate().getSpec();
 
+        // DEBUG: Log spec equality check
+        boolean specsEqual = leftSpec.equals(rightSpec);
+        System.out.println("=== FlinkBlueGreenDeploymentSpecDiff DEBUG ===");
+        System.out.println("leftSpec.equals(rightSpec): " + specsEqual);
+        System.out.println("leftSpec hashCode: " + leftSpec.hashCode());
+        System.out.println("rightSpec hashCode: " + rightSpec.hashCode());
+        System.out.println("leftSpec == rightSpec (identity): " + (leftSpec == rightSpec));
+        System.out.println("leftSpec: " + leftSpec.toString());
+        System.out.println("rightSpec: " + rightSpec.toString());
+        System.out.println("=== End DEBUG ===");
+
         // Case 1: FlinkDeploymentSpecs are identical
-        if (leftSpec.equals(rightSpec)) {
+        if (specsEqual) {
             return BlueGreenDiffType.IGNORE;
         }
 
@@ -70,11 +81,17 @@ public class FlinkBlueGreenDeploymentSpecDiff {
 
         DiffType diffType = diffResult.getType();
 
+        System.out.println("=== ReflectiveDiffBuilder DEBUG ===");
+        System.out.println("ReflectiveDiffBuilder diffType: " + diffType);
+        System.out.println("=== End ReflectiveDiffBuilder DEBUG ===");
+
         // Case 2: ReflectiveDiffBuilder returns IGNORE
         if (diffType == DiffType.IGNORE) {
+            System.out.println("*** Returning PATCH_CHILD because ReflectiveDiffBuilder returned IGNORE ***");
             return BlueGreenDiffType.PATCH_CHILD;
         } else {
             // Case 3: ReflectiveDiffBuilder returns anything else map it to TRANSITION as well
+            System.out.println("*** Returning TRANSITION because ReflectiveDiffBuilder returned: " + diffType + " ***");
             return BlueGreenDiffType.TRANSITION;
         }
     }
