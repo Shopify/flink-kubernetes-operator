@@ -26,6 +26,7 @@ import org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenDeploy
 import org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenStateHandlerRegistry;
 import org.apache.flink.kubernetes.operator.controller.bluegreen.handlers.BlueGreenStateHandler;
 import org.apache.flink.kubernetes.operator.service.FlinkResourceContextFactory;
+import org.apache.flink.kubernetes.operator.utils.StatusRecorder;
 
 import io.javaoperatorsdk.operator.api.config.informer.InformerEventSourceConfiguration;
 import io.javaoperatorsdk.operator.api.reconciler.Context;
@@ -70,10 +71,16 @@ public class FlinkBlueGreenDeploymentController implements Reconciler<FlinkBlueG
 
     private final FlinkResourceContextFactory ctxFactory;
     private final BlueGreenStateHandlerRegistry handlerRegistry;
+    private final StatusRecorder<FlinkBlueGreenDeployment, FlinkBlueGreenDeploymentStatus>
+            statusRecorder;
 
-    public FlinkBlueGreenDeploymentController(FlinkResourceContextFactory ctxFactory) {
+    public FlinkBlueGreenDeploymentController(
+            FlinkResourceContextFactory ctxFactory,
+            StatusRecorder<FlinkBlueGreenDeployment, FlinkBlueGreenDeploymentStatus>
+                    statusRecorder) {
         this.ctxFactory = ctxFactory;
         this.handlerRegistry = new BlueGreenStateHandlerRegistry();
+        this.statusRecorder = statusRecorder;
     }
 
     @Override
@@ -132,7 +139,9 @@ public class FlinkBlueGreenDeploymentController implements Reconciler<FlinkBlueG
                     context.getDeploymentName());
 
             BlueGreenStateHandler handler = handlerRegistry.getHandler(currentState);
-            return handler.handle(context);
+            UpdateControl<FlinkBlueGreenDeployment> updateControl = handler.handle(context);
+            statusRecorder.patchAndCacheStatus(bgDeployment, josdkContext.getClient());
+            return updateControl;
         }
     }
 
