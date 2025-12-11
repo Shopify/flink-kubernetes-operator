@@ -78,19 +78,26 @@ public class FlinkBlueGreenDeploymentSpecDiff {
         DiffResult<FlinkDeploymentSpec> diffResult =
                 new ReflectiveDiffBuilder<>(deploymentMode, leftSpec, rightSpec).build();
 
-        // Case 1: FlinkDeploymentSpecs are identical
+        // Extract the diff type from ReflectiveDiffBuilder result
+        DiffType diffType = diffResult.getType();
+
+        // Case 1: Check for savepoint redeploy first (savepointRedeployNonce changed)
+        // This takes precedence as it indicates user wants to redeploy from their
+        // initialSavepointPath
+        if (diffType == DiffType.SAVEPOINT_REDEPLOY) {
+            return BlueGreenDiffType.SAVEPOINT_REDEPLOY;
+        }
+
+        // Case 2: FlinkDeploymentSpecs are identical
         if (leftSpec.equals(rightSpec)) {
             return BlueGreenDiffType.IGNORE;
         }
 
-        // Extract the diff type from ReflectiveDiffBuilder result
-        DiffType diffType = diffResult.getType();
-
-        // Case 2: ReflectiveDiffBuilder returns IGNORE
+        // Case 3: ReflectiveDiffBuilder returns IGNORE
         if (diffType == DiffType.IGNORE) {
             return BlueGreenDiffType.PATCH_CHILD;
         } else {
-            // Case 3: ReflectiveDiffBuilder returns anything else map it to TRANSITION as well
+            // Case 4: ReflectiveDiffBuilder returns anything else map it to TRANSITION
             return BlueGreenDiffType.TRANSITION;
         }
     }

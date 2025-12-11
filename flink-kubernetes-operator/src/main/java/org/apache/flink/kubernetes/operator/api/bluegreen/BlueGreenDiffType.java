@@ -29,6 +29,12 @@ public enum BlueGreenDiffType {
     PATCH_CHILD,
 
     /**
+     * Full redeploy from user-specified savepoint. Triggered when savepointRedeployNonce changes.
+     * Uses the initialSavepointPath from spec instead of taking a new savepoint.
+     */
+    SAVEPOINT_REDEPLOY,
+
+    /**
      * In-place suspension. Triggered when job.state changes from RUNNING to SUSPENDED. Suspends the
      * currently active child without creating a new deployment.
      */
