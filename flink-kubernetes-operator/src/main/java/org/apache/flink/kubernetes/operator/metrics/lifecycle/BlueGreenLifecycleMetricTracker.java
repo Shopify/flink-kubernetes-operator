@@ -32,10 +32,8 @@ import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDepl
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.INITIALIZING_BLUE;
 
 /**
- * Tracks state transitions and timing for a single FlinkBlueGreenDeployment resource.
- * Records metrics for:
- * - Transition times (e.g., BlueToGreen, InitialDeployment)
- * - Time spent in each state
+ * Tracks state transitions and timing for a single FlinkBlueGreenDeployment resource. Records
+ * metrics for: - Transition times (e.g., BlueToGreen, InitialDeployment) - Time spent in each state
  */
 public class BlueGreenLifecycleMetricTracker {
 
@@ -87,10 +85,13 @@ public class BlueGreenLifecycleMetricTracker {
             return;
         }
 
+        // Update the end time for the state we're leaving
+        updateLastUpdateTime(currentState, time);
+
         recordTransitionMetrics(currentState, newState, time);
         recordStateTimeMetrics(newState);
         clearTrackedStates(newState);
-        
+
         stateTimeMap.put(newState, Tuple2.of(time, time));
         currentState = newState;
     }
@@ -103,14 +104,14 @@ public class BlueGreenLifecycleMetricTracker {
     }
 
     /**
-     * Records transition time metrics when moving to a new state.
-     * Checks if this transition matches any tracked transitions and records duration.
+     * Records transition time metrics when moving to a new state. Checks if this transition matches
+     * any tracked transitions and records duration.
      */
     private void recordTransitionMetrics(
             FlinkBlueGreenDeploymentState fromState,
             FlinkBlueGreenDeploymentState toState,
             Instant time) {
-        
+
         // InitialDeployment: INITIALIZING_BLUE -> ACTIVE_BLUE
         if (fromState == INITIALIZING_BLUE && toState == ACTIVE_BLUE) {
             recordTransition(TRANSITION_INITIAL_DEPLOYMENT, INITIALIZING_BLUE, time);
@@ -122,24 +123,23 @@ public class BlueGreenLifecycleMetricTracker {
         }
 
         // GreenToBlue: when reaching ACTIVE_BLUE from ACTIVE_GREEN path (not initial)
-        if (toState == ACTIVE_BLUE && fromState != INITIALIZING_BLUE 
+        if (toState == ACTIVE_BLUE
+                && fromState != INITIALIZING_BLUE
                 && stateTimeMap.containsKey(ACTIVE_GREEN)) {
             recordTransition(TRANSITION_GREEN_TO_BLUE, ACTIVE_GREEN, time);
         }
     }
 
     private void recordTransition(
-            String transitionName,
-            FlinkBlueGreenDeploymentState fromState,
-            Instant time) {
+            String transitionName, FlinkBlueGreenDeploymentState fromState, Instant time) {
         var fromTimes = stateTimeMap.get(fromState);
         if (fromTimes == null) {
             return;
         }
-        
+
         // Measure from when we first entered the "from" state
         long durationSeconds = Duration.between(fromTimes.f0, time).toSeconds();
-        
+
         var histograms = transitionHistos.get(transitionName);
         if (histograms != null) {
             histograms.forEach(h -> h.update(durationSeconds));
@@ -147,8 +147,8 @@ public class BlueGreenLifecycleMetricTracker {
     }
 
     /**
-     * Records state duration metrics for all tracked states.
-     * Only processes when reaching a stable state (ACTIVE_BLUE/ACTIVE_GREEN).
+     * Records state duration metrics for all tracked states. Only processes when reaching a stable
+     * state (ACTIVE_BLUE/ACTIVE_GREEN).
      */
     private void recordStateTimeMetrics(FlinkBlueGreenDeploymentState toState) {
         if (toState != ACTIVE_BLUE && toState != ACTIVE_GREEN) {
@@ -168,8 +168,8 @@ public class BlueGreenLifecycleMetricTracker {
     }
 
     /**
-     * Clears all tracked states from the map.
-     * Only clears when reaching a stable state (ACTIVE_BLUE/ACTIVE_GREEN).
+     * Clears all tracked states from the map. Only clears when reaching a stable state
+     * (ACTIVE_BLUE/ACTIVE_GREEN).
      */
     private void clearTrackedStates(FlinkBlueGreenDeploymentState toState) {
         if (toState != ACTIVE_BLUE && toState != ACTIVE_GREEN) {
@@ -178,4 +178,3 @@ public class BlueGreenLifecycleMetricTracker {
         stateTimeMap.clear();
     }
 }
-

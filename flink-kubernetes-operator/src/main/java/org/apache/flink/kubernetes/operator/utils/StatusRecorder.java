@@ -133,6 +133,8 @@ public class StatusRecorder<CR extends CustomResource<?, STATUS>, STATUS> {
             statusClass = FlinkSessionJobStatus.class;
         } else if (resource instanceof FlinkStateSnapshot) {
             statusClass = FlinkStateSnapshotStatus.class;
+        } else if (resource instanceof FlinkBlueGreenDeployment) {
+            statusClass = FlinkBlueGreenDeploymentStatus.class;
         } else {
             throw new RuntimeException(
                     String.format("Resource is unknown class: %s", resource.getClass()));
