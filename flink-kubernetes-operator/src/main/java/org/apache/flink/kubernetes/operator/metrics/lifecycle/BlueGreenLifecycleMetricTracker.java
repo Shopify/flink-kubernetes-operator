@@ -68,10 +68,6 @@ public class BlueGreenLifecycleMetricTracker {
         stateTimeMap.put(initialState, Tuple2.of(time, time));
     }
 
-    public FlinkBlueGreenDeploymentState getCurrentState() {
-        return currentState;
-    }
-
     /**
      * Called on every reconciliation. Updates timestamps and records metrics on state changes.
      *
@@ -80,7 +76,6 @@ public class BlueGreenLifecycleMetricTracker {
      */
     public void onUpdate(FlinkBlueGreenDeploymentState newState, Instant time) {
         if (newState == currentState) {
-            // Same state - just update the lastUpdate timestamp
             updateLastUpdateTime(newState, time);
             return;
         }

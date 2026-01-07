@@ -52,17 +52,27 @@ public class FlinkBlueGreenDeploymentMetrics
     private final Clock clock;
     private final boolean lifecycleMetricsEnabled;
 
-    // State counts: namespace -> state -> set of deployment names
+    // Tracks which deployments are in which state per namespace (for gauge metrics)
+    // Map: namespace -> state -> set of deployment names
     private final Map<String, Map<FlinkBlueGreenDeploymentState, Set<String>>> deploymentStatuses =
             new ConcurrentHashMap<>();
 
-    // Lifecycle trackers: (namespace, name) -> tracker
+    // Tracks state transitions and timing for each deployment (persists across reconciliations)
+    // Map: namespace -> deployment name -> tracker
     private final Map<String, Map<String, BlueGreenLifecycleMetricTracker>> lifecycleTrackers =
             new ConcurrentHashMap<>();
 
-    // Namespace-scoped histograms: metricKey -> namespace -> histogram
+    // Namespace-scoped histograms for transition durations (e.g., BlueToGreen)
+    // Map: transition name -> namespace -> histogram
+    // TODO: Currently aggregates across all deployments in a namespace. Consider adding
+    //       per-deployment metrics if more granular observability is needed.
     private final Map<String, Map<String, Histogram>> transitionHistograms =
             new ConcurrentHashMap<>();
+
+    // Namespace-scoped histograms for time spent in each state
+    // Map: state -> namespace -> histogram
+    // TODO: Currently aggregates across all deployments in a namespace. Consider adding
+    //       per-deployment metrics if more granular observability is needed.
     private final Map<FlinkBlueGreenDeploymentState, Map<String, Histogram>> stateTimeHistograms =
             new ConcurrentHashMap<>();
 
@@ -91,19 +101,17 @@ public class FlinkBlueGreenDeploymentMetrics
 
     @Override
     public void onUpdate(FlinkBlueGreenDeployment flinkBgDep) {
-        onRemove(flinkBgDep);
+        clearStateCount(flinkBgDep);
 
         var namespace = flinkBgDep.getMetadata().getNamespace();
         var name = flinkBgDep.getMetadata().getName();
         var state = flinkBgDep.getStatus().getBlueGreenState();
 
-        // Update state counts
         deploymentStatuses
                 .computeIfAbsent(namespace, this::initNamespaceMetrics)
                 .get(state)
                 .add(name);
 
-        // Update lifecycle metrics
         if (lifecycleMetricsEnabled) {
             getOrCreateTracker(namespace, name, flinkBgDep).onUpdate(state, clock.instant());
         }
@@ -111,22 +119,7 @@ public class FlinkBlueGreenDeploymentMetrics
 
     @Override
     public void onRemove(FlinkBlueGreenDeployment flinkBgDep) {
-        var namespace = flinkBgDep.getMetadata().getNamespace();
-        var name = flinkBgDep.getMetadata().getName();
-
-        // Only remove from state counts (so deployment doesn't appear in multiple states)
-        var namespaceStatuses = deploymentStatuses.get(namespace);
-        if (namespaceStatuses != null) {
-            namespaceStatuses.values().forEach(names -> names.remove(name));
-        }
-
-        // Note: Don't remove lifecycle tracker here - it needs to persist across updates
-        // to track state transitions. It's only removed when the resource is actually deleted.
-    }
-
-    /** Called when the resource is actually deleted from the cluster. */
-    public void onDelete(FlinkBlueGreenDeployment flinkBgDep) {
-        onRemove(flinkBgDep);
+        clearStateCount(flinkBgDep);
 
         var namespace = flinkBgDep.getMetadata().getNamespace();
         var name = flinkBgDep.getMetadata().getName();
@@ -134,6 +127,17 @@ public class FlinkBlueGreenDeploymentMetrics
         var namespaceTrackers = lifecycleTrackers.get(namespace);
         if (namespaceTrackers != null) {
             namespaceTrackers.remove(name);
+        }
+    }
+
+    /** Clears the deployment from all state count sets (used before updating to new state). */
+    private void clearStateCount(FlinkBlueGreenDeployment flinkBgDep) {
+        var namespace = flinkBgDep.getMetadata().getNamespace();
+        var name = flinkBgDep.getMetadata().getName();
+
+        var namespaceStatuses = deploymentStatuses.get(namespace);
+        if (namespaceStatuses != null) {
+            namespaceStatuses.values().forEach(names -> names.remove(name));
         }
     }
 
