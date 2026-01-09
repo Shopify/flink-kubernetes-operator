@@ -62,19 +62,21 @@ public class FlinkBlueGreenDeploymentMetrics
     private final Map<String, Map<String, BlueGreenLifecycleMetricTracker>> lifecycleTrackers =
             new ConcurrentHashMap<>();
 
+    // System-level histograms (aggregated across all namespaces)
+    // Map: transition name -> histogram
+    private Map<String, Histogram> systemTransitionHistograms;
+    // Map: state -> histogram
+    private Map<FlinkBlueGreenDeploymentState, Histogram> systemStateTimeHistograms;
+
     // Namespace-scoped histograms for transition durations (e.g., BlueToGreen)
     // Map: transition name -> namespace -> histogram
-    // TODO: Currently aggregates across all deployments in a namespace. Consider adding
-    //       per-deployment metrics if more granular observability is needed.
-    private final Map<String, Map<String, Histogram>> transitionHistograms =
+    private final Map<String, Map<String, Histogram>> namespaceTransitionHistograms =
             new ConcurrentHashMap<>();
 
     // Namespace-scoped histograms for time spent in each state
     // Map: state -> namespace -> histogram
-    // TODO: Currently aggregates across all deployments in a namespace. Consider adding
-    //       per-deployment metrics if more granular observability is needed.
-    private final Map<FlinkBlueGreenDeploymentState, Map<String, Histogram>> stateTimeHistograms =
-            new ConcurrentHashMap<>();
+    private final Map<FlinkBlueGreenDeploymentState, Map<String, Histogram>>
+            namespaceStateTimeHistograms = new ConcurrentHashMap<>();
 
     public FlinkBlueGreenDeploymentMetrics(
             KubernetesOperatorMetricGroup parentMetricGroup, Configuration configuration) {
@@ -86,16 +88,58 @@ public class FlinkBlueGreenDeploymentMetrics
                 configuration.get(
                         KubernetesOperatorMetricOptions.OPERATOR_LIFECYCLE_METRICS_ENABLED);
 
-        // Initialize histogram maps for each metric key
+        // Initialize namespace histogram maps for each metric key
         for (String transition :
                 List.of(
                         BlueGreenLifecycleMetricTracker.TRANSITION_INITIAL_DEPLOYMENT,
                         BlueGreenLifecycleMetricTracker.TRANSITION_BLUE_TO_GREEN,
                         BlueGreenLifecycleMetricTracker.TRANSITION_GREEN_TO_BLUE)) {
-            transitionHistograms.put(transition, new ConcurrentHashMap<>());
+            namespaceTransitionHistograms.put(transition, new ConcurrentHashMap<>());
         }
         for (FlinkBlueGreenDeploymentState state : FlinkBlueGreenDeploymentState.values()) {
-            stateTimeHistograms.put(state, new ConcurrentHashMap<>());
+            namespaceStateTimeHistograms.put(state, new ConcurrentHashMap<>());
+        }
+    }
+
+    /** Initialize system-level histograms (once, lazily on first use). */
+    private synchronized void initSystemHistogramsIfNeeded() {
+        if (systemTransitionHistograms != null) {
+            return;
+        }
+
+        MetricGroup systemGroup =
+                parentMetricGroup
+                        .addGroup(FlinkBlueGreenDeployment.class.getSimpleName())
+                        .addGroup(LIFECYCLE_GROUP_NAME);
+
+        // System-level transition histograms
+        systemTransitionHistograms = new ConcurrentHashMap<>();
+        for (String transition :
+                List.of(
+                        BlueGreenLifecycleMetricTracker.TRANSITION_INITIAL_DEPLOYMENT,
+                        BlueGreenLifecycleMetricTracker.TRANSITION_BLUE_TO_GREEN,
+                        BlueGreenLifecycleMetricTracker.TRANSITION_GREEN_TO_BLUE)) {
+            systemTransitionHistograms.put(
+                    transition,
+                    systemGroup
+                            .addGroup(TRANSITION_GROUP_NAME)
+                            .addGroup(transition)
+                            .histogram(
+                                    TIME_SECONDS_NAME,
+                                    OperatorMetricUtils.createHistogram(operatorConfig)));
+        }
+
+        // System-level state time histograms
+        systemStateTimeHistograms = new ConcurrentHashMap<>();
+        for (FlinkBlueGreenDeploymentState state : FlinkBlueGreenDeploymentState.values()) {
+            systemStateTimeHistograms.put(
+                    state,
+                    systemGroup
+                            .addGroup(STATE_GROUP_NAME)
+                            .addGroup(state.name())
+                            .histogram(
+                                    TIME_SECONDS_NAME,
+                                    OperatorMetricUtils.createHistogram(operatorConfig)));
         }
     }
 
@@ -171,6 +215,7 @@ public class FlinkBlueGreenDeploymentMetrics
 
     private BlueGreenLifecycleMetricTracker getOrCreateTracker(
             String namespace, String name, FlinkBlueGreenDeployment flinkBgDep) {
+        initSystemHistogramsIfNeeded();
 
         return lifecycleTrackers
                 .computeIfAbsent(namespace, ns -> new ConcurrentHashMap<>())
@@ -193,15 +238,16 @@ public class FlinkBlueGreenDeploymentMetrics
 
     private Map<String, List<Histogram>> getTransitionHistograms(String namespace) {
         var histos = new HashMap<String, List<Histogram>>();
-        transitionHistograms.forEach(
+        namespaceTransitionHistograms.forEach(
                 (transitionName, nsMap) ->
                         histos.put(
                                 transitionName,
                                 List.of(
+                                        systemTransitionHistograms.get(transitionName),
                                         nsMap.computeIfAbsent(
                                                 namespace,
                                                 ns ->
-                                                        createHistogram(
+                                                        createNamespaceHistogram(
                                                                 ns,
                                                                 TRANSITION_GROUP_NAME,
                                                                 transitionName)))));
@@ -211,22 +257,24 @@ public class FlinkBlueGreenDeploymentMetrics
     private Map<FlinkBlueGreenDeploymentState, List<Histogram>> getStateTimeHistograms(
             String namespace) {
         var histos = new HashMap<FlinkBlueGreenDeploymentState, List<Histogram>>();
-        stateTimeHistograms.forEach(
+        namespaceStateTimeHistograms.forEach(
                 (state, nsMap) ->
                         histos.put(
                                 state,
                                 List.of(
+                                        systemStateTimeHistograms.get(state),
                                         nsMap.computeIfAbsent(
                                                 namespace,
                                                 ns ->
-                                                        createHistogram(
+                                                        createNamespaceHistogram(
                                                                 ns,
                                                                 STATE_GROUP_NAME,
                                                                 state.name())))));
         return histos;
     }
 
-    private Histogram createHistogram(String namespace, String groupName, String metricName) {
+    private Histogram createNamespaceHistogram(
+            String namespace, String groupName, String metricName) {
         return parentMetricGroup
                 .createResourceNamespaceGroup(
                         configuration, FlinkBlueGreenDeployment.class, namespace)

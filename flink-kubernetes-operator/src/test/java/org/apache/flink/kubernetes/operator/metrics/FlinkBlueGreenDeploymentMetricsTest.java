@@ -297,11 +297,14 @@ public class FlinkBlueGreenDeploymentMetricsTest {
         metricManager.onUpdate(dep2);
         metricManager.onUpdate(dep3);
 
-        // Same namespace should have the same histogram (verify by checking same metric ID resolves)
+        // Same namespace should have the same histogram (verify by checking same metric ID
+        // resolves)
         var ns1TransitionHistoId =
-                getLifecycleHistogramId(namespace1, TRANSITION_GROUP_NAME, TRANSITION_INITIAL_DEPLOYMENT);
+                getLifecycleHistogramId(
+                        namespace1, TRANSITION_GROUP_NAME, TRANSITION_INITIAL_DEPLOYMENT);
         var ns2TransitionHistoId =
-                getLifecycleHistogramId(namespace2, TRANSITION_GROUP_NAME, TRANSITION_INITIAL_DEPLOYMENT);
+                getLifecycleHistogramId(
+                        namespace2, TRANSITION_GROUP_NAME, TRANSITION_INITIAL_DEPLOYMENT);
 
         // Both ns1 deployments write to the same histogram
         assertTrue(listener.getHistogram(ns1TransitionHistoId).isPresent());
@@ -322,7 +325,8 @@ public class FlinkBlueGreenDeploymentMetricsTest {
     // review
     @Test
     public void testLifecycleMetricsDisabled() {
-        // When OPERATOR_LIFECYCLE_METRICS_ENABLED is false, lifecycle histograms should not be created
+        // When OPERATOR_LIFECYCLE_METRICS_ENABLED is false, lifecycle histograms should not be
+        // created
         var conf = new Configuration();
         conf.set(OPERATOR_LIFECYCLE_METRICS_ENABLED, false);
         var disabledListener = new TestingMetricListener(conf);
@@ -363,6 +367,35 @@ public class FlinkBlueGreenDeploymentMetricsTest {
         assertTrue(
                 disabledListener.getHistogram(stateTimeHistoId).isEmpty(),
                 "State time histogram should not exist when lifecycle metrics are disabled");
+    }
+
+    @Test
+    public void testSystemLevelHistogramsExist() {
+        var deployment = buildBlueGreenDeployment("test-deployment", TEST_NAMESPACE);
+        metricManager.onUpdate(deployment);
+
+        // Verify system-level transition histograms exist (without namespace in path)
+        assertTrue(
+                listener.getHistogram(
+                                getSystemLevelHistogramId(
+                                        TRANSITION_GROUP_NAME, TRANSITION_INITIAL_DEPLOYMENT))
+                        .isPresent(),
+                "System-level InitialDeployment histogram should exist");
+
+        assertTrue(
+                listener.getHistogram(
+                                getSystemLevelHistogramId(
+                                        TRANSITION_GROUP_NAME, TRANSITION_BLUE_TO_GREEN))
+                        .isPresent(),
+                "System-level BlueToGreen histogram should exist");
+
+        // Verify system-level state time histograms exist
+        for (FlinkBlueGreenDeploymentState state : FlinkBlueGreenDeploymentState.values()) {
+            assertTrue(
+                    listener.getHistogram(getSystemLevelHistogramId(STATE_GROUP_NAME, state.name()))
+                            .isPresent(),
+                    "System-level state time histogram should exist for: " + state);
+        }
     }
 
     // ==================== Helper Methods ====================
@@ -422,4 +455,3 @@ public class FlinkBlueGreenDeploymentMetricsTest {
                 TIME_SECONDS_NAME);
     }
 }
-
