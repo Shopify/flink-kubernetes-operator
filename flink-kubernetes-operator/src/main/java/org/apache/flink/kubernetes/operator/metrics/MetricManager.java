@@ -24,6 +24,7 @@ import org.apache.flink.kubernetes.operator.api.FlinkBlueGreenDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkSessionJob;
 import org.apache.flink.kubernetes.operator.api.FlinkStateSnapshot;
+import org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics;
 import org.apache.flink.kubernetes.operator.metrics.lifecycle.LifecycleMetrics;
 
 import io.fabric8.kubernetes.client.CustomResource;
@@ -75,6 +76,7 @@ public class MetricManager<CR extends CustomResource<?, ?>> {
                     Configuration conf, KubernetesOperatorMetricGroup metricGroup) {
         MetricManager<FlinkBlueGreenDeployment> metricManager = new MetricManager<>();
         registerFlinkBlueGreenDeploymentMetrics(conf, metricGroup, metricManager);
+        registerBlueGreenLifecycleMetrics(conf, metricGroup, metricManager);
         return metricManager;
     }
 
@@ -121,6 +123,17 @@ public class MetricManager<CR extends CustomResource<?, ?>> {
         if (conf.get(KubernetesOperatorMetricOptions.OPERATOR_RESOURCE_METRICS_ENABLED)
                 && conf.get(KubernetesOperatorMetricOptions.OPERATOR_LIFECYCLE_METRICS_ENABLED)) {
             metricManager.register(new LifecycleMetrics<>(conf, metricGroup));
+        }
+    }
+
+    // <CR extends AbstractFlinkResource<?, ?>> what is this pattern?
+    private static void registerBlueGreenLifecycleMetrics(
+            Configuration conf,
+            KubernetesOperatorMetricGroup metricGroup,
+            MetricManager<FlinkBlueGreenDeployment> metricManager) {
+        if (conf.get(KubernetesOperatorMetricOptions.OPERATOR_RESOURCE_METRICS_ENABLED)
+                && conf.get(KubernetesOperatorMetricOptions.OPERATOR_LIFECYCLE_METRICS_ENABLED)) {
+            metricManager.register(new BlueGreenLifecycleMetrics(conf, metricGroup));
         }
     }
 

@@ -38,13 +38,13 @@ import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDepl
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.SAVEPOINTING_GREEN;
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.TRANSITIONING_TO_BLUE;
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN;
-import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetricTracker.TRANSITION_BLUE_TO_GREEN;
-import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetricTracker.TRANSITION_GREEN_TO_BLUE;
-import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetricTracker.TRANSITION_INITIAL_DEPLOYMENT;
+import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_BLUE_TO_GREEN;
+import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_GREEN_TO_BLUE;
+import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_INITIAL_DEPLOYMENT;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-/** Tests for {@link BlueGreenLifecycleMetricTracker}. */
-public class BlueGreenLifecycleMetricTrackerTest {
+/** Tests for {@link BlueGreenResourceLifecycleMetricTracker}. */
+public class BlueGreenResourceLifecycleMetricTrackerTest {
 
     private Map<String, List<Histogram>> transitionHistos;
     private Map<FlinkBlueGreenDeploymentState, List<Histogram>> stateTimeHistos;
@@ -86,7 +86,8 @@ public class BlueGreenLifecycleMetricTrackerTest {
 
         tracker.onUpdate(ACTIVE_BLUE, now());
 
-        assertStateTimeRecorded(INITIALIZING_BLUE, 5);
+        // State time measures total time from entry (t=0) to exit (t=10), not to last heartbeat
+        assertStateTimeRecorded(INITIALIZING_BLUE, 10);
     }
 
     // ==================== Blue to Green Transition ====================
@@ -229,9 +230,9 @@ public class BlueGreenLifecycleMetricTrackerTest {
 
     // ==================== Helpers ====================
 
-    private BlueGreenLifecycleMetricTracker createTracker(
+    private BlueGreenResourceLifecycleMetricTracker createTracker(
             FlinkBlueGreenDeploymentState initialState) {
-        return new BlueGreenLifecycleMetricTracker(
+        return new BlueGreenResourceLifecycleMetricTracker(
                 initialState, now(), transitionHistos, stateTimeHistos);
     }
 

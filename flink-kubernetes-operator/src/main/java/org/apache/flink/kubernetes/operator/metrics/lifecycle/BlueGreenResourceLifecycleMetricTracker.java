@@ -35,7 +35,7 @@ import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDepl
  * Tracks state transitions and timing for a single FlinkBlueGreenDeployment resource. Records
  * metrics for: - Transition times (e.g., BlueToGreen, InitialDeployment) - Time spent in each state
  */
-public class BlueGreenLifecycleMetricTracker {
+public class BlueGreenResourceLifecycleMetricTracker {
 
     // Transition metric names
     public static final String TRANSITION_INITIAL_DEPLOYMENT = "InitialDeployment";
@@ -56,7 +56,7 @@ public class BlueGreenLifecycleMetricTracker {
     // Histograms for recording time spent in each state
     private final Map<FlinkBlueGreenDeploymentState, List<Histogram>> stateTimeHistos;
 
-    public BlueGreenLifecycleMetricTracker(
+    public BlueGreenResourceLifecycleMetricTracker(
             FlinkBlueGreenDeploymentState initialState,
             Instant time,
             Map<String, List<Histogram>> transitionHistos,
@@ -80,7 +80,10 @@ public class BlueGreenLifecycleMetricTracker {
             return;
         }
 
-        // Update the end time for the state we're leaving
+        // Update the end time for the state we're leaving.
+        // This is important for states that transition quickly without receiving heartbeats
+        // (e.g., SAVEPOINTING_BLUE, TRANSITIONING_TO_GREEN) - without this, their state time
+        // would be 0 since f1 wouldn't be updated from entry time.
         updateLastUpdateTime(currentState, time);
 
         recordTransitionMetrics(currentState, newState, time);
