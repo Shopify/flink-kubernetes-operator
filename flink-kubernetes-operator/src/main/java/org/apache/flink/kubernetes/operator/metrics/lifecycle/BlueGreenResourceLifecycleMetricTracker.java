@@ -21,6 +21,9 @@ import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState;
 import org.apache.flink.metrics.Histogram;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
@@ -36,6 +39,9 @@ import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDepl
  * metrics for: - Transition times (e.g., BlueToGreen, InitialDeployment) - Time spent in each state
  */
 public class BlueGreenResourceLifecycleMetricTracker {
+
+    private static final Logger LOG =
+            LoggerFactory.getLogger(BlueGreenResourceLifecycleMetricTracker.class);
 
     // Transition metric names
     public static final String TRANSITION_INITIAL_DEPLOYMENT = "InitialDeployment";
@@ -110,9 +116,18 @@ public class BlueGreenResourceLifecycleMetricTracker {
             FlinkBlueGreenDeploymentState toState,
             Instant time) {
 
-        // InitialDeployment: INITIALIZING_BLUE -> ACTIVE_BLUE
-        if (fromState == INITIALIZING_BLUE && toState == ACTIVE_BLUE) {
+        // InitialDeployment: when reaching ACTIVE_BLUE from INITIALIZING_BLUE path
+        // (goes through TRANSITIONING_TO_BLUE, so check stateTimeMap instead of fromState)
+        if (toState == ACTIVE_BLUE && stateTimeMap.containsKey(INITIALIZING_BLUE)) {
+            LOG.info(
+                    "Recording InitialDeployment transition. stateTimeMap keys: {}",
+                    stateTimeMap.keySet());
             recordTransition(TRANSITION_INITIAL_DEPLOYMENT, INITIALIZING_BLUE, time);
+        } else if (toState == ACTIVE_BLUE) {
+            LOG.info(
+                    "NOT recording InitialDeployment. toState={}, stateTimeMap keys: {}",
+                    toState,
+                    stateTimeMap.keySet());
         }
 
         // BlueToGreen: when reaching ACTIVE_GREEN from ACTIVE_BLUE path

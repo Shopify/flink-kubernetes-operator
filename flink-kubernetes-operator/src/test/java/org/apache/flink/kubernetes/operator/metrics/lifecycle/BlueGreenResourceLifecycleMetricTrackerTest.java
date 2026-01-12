@@ -66,14 +66,18 @@ public class BlueGreenResourceLifecycleMetricTrackerTest {
     }
 
     // ==================== Initial Deployment ====================
+    // Note: Real flow is INITIALIZING_BLUE → TRANSITIONING_TO_BLUE → ACTIVE_BLUE
 
     @Test
     void initialDeployment_recordsTransitionTime() {
         var tracker = createTracker(INITIALIZING_BLUE);
-        tick(10);
+        tick(5);
+        tracker.onUpdate(TRANSITIONING_TO_BLUE, now());
+        tick(5);
 
         tracker.onUpdate(ACTIVE_BLUE, now());
 
+        // InitialDeployment measures from INITIALIZING_BLUE entry to ACTIVE_BLUE
         assertTransitionRecorded(TRANSITION_INITIAL_DEPLOYMENT, 10);
     }
 
@@ -81,13 +85,14 @@ public class BlueGreenResourceLifecycleMetricTrackerTest {
     void initialDeployment_recordsStateTime() {
         var tracker = createTracker(INITIALIZING_BLUE);
         tick(5);
-        tracker.onUpdate(INITIALIZING_BLUE, now()); // Update timestamp within state
+        tracker.onUpdate(TRANSITIONING_TO_BLUE, now());
         tick(5);
 
         tracker.onUpdate(ACTIVE_BLUE, now());
 
-        // State time measures total time from entry (t=0) to exit (t=10), not to last heartbeat
-        assertStateTimeRecorded(INITIALIZING_BLUE, 10);
+        // Both INITIALIZING_BLUE and TRANSITIONING_TO_BLUE state times should be recorded
+        assertStateTimeRecorded(INITIALIZING_BLUE, 5);
+        assertStateTimeRecorded(TRANSITIONING_TO_BLUE, 5);
     }
 
     // ==================== Blue to Green Transition ====================
