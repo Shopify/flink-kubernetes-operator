@@ -38,9 +38,9 @@ import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDepl
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.SAVEPOINTING_GREEN;
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.TRANSITIONING_TO_BLUE;
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN;
-import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_BLUE_TO_GREEN;
-import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_GREEN_TO_BLUE;
-import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_INITIAL_DEPLOYMENT;
+import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.TRANSITION_BLUE_TO_GREEN;
+import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.TRANSITION_GREEN_TO_BLUE;
+import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.TRANSITION_INITIAL_DEPLOYMENT;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /** Tests for {@link BlueGreenResourceLifecycleMetricTracker}. */

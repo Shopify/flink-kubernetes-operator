@@ -44,10 +44,10 @@ import static org.apache.flink.kubernetes.operator.metrics.KubernetesOperatorMet
 import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.LIFECYCLE_GROUP_NAME;
 import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.STATE_GROUP_NAME;
 import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.TIME_SECONDS_NAME;
+import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.TRANSITION_BLUE_TO_GREEN;
+import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.TRANSITION_GREEN_TO_BLUE;
 import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.TRANSITION_GROUP_NAME;
-import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_BLUE_TO_GREEN;
-import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_GREEN_TO_BLUE;
-import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_INITIAL_DEPLOYMENT;
+import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.TRANSITION_INITIAL_DEPLOYMENT;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 

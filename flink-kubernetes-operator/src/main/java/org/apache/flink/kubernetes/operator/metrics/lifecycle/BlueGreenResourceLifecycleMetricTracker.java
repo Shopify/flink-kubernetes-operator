@@ -21,6 +21,9 @@ import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState;
 import org.apache.flink.metrics.Histogram;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
@@ -30,6 +33,9 @@ import java.util.Map;
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.ACTIVE_BLUE;
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.ACTIVE_GREEN;
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.INITIALIZING_BLUE;
+import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.TRANSITION_BLUE_TO_GREEN;
+import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.TRANSITION_GREEN_TO_BLUE;
+import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.TRANSITION_INITIAL_DEPLOYMENT;
 
 /**
  * Tracks state transitions and timing for a single FlinkBlueGreenDeployment resource. Records
@@ -37,9 +43,8 @@ import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDepl
  */
 public class BlueGreenResourceLifecycleMetricTracker {
 
-    public static final String TRANSITION_INITIAL_DEPLOYMENT = "InitialDeployment";
-    public static final String TRANSITION_BLUE_TO_GREEN = "BlueToGreen";
-    public static final String TRANSITION_GREEN_TO_BLUE = "GreenToBlue";
+    private static final Logger LOG =
+            LoggerFactory.getLogger(BlueGreenResourceLifecycleMetricTracker.class);
 
     private FlinkBlueGreenDeploymentState currentState;
 
@@ -79,6 +84,12 @@ public class BlueGreenResourceLifecycleMetricTracker {
         recordTransitionMetrics(currentState, newState, time);
 
         if (newState == ACTIVE_BLUE || newState == ACTIVE_GREEN) {
+            LOG.debug(
+                    "Transitioned from {} to {}, recording state times for {} and clearing",
+                    currentState,
+                    newState,
+                    stateTimeMap.keySet());
+                    
             recordStateTimeMetrics();
             clearTrackedStates();
         }
@@ -122,6 +133,12 @@ public class BlueGreenResourceLifecycleMetricTracker {
         }
 
         long durationSeconds = Duration.between(fromTimes.f0, time).toSeconds();
+
+        LOG.debug(
+                "Recording transition time {}s for {} (from {})",
+                durationSeconds,
+                transitionName,
+                fromState);
 
         var histograms = transitionHistos.get(transitionName);
         if (histograms != null) {

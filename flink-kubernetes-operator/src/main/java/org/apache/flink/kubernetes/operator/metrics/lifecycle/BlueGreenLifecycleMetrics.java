@@ -35,9 +35,6 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.INITIALIZING_BLUE;
-import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_BLUE_TO_GREEN;
-import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_GREEN_TO_BLUE;
-import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_INITIAL_DEPLOYMENT;
 
 /** Manages lifecycle metrics for FlinkBlueGreenDeployment resources. */
 public class BlueGreenLifecycleMetrics implements CustomResourceMetrics<FlinkBlueGreenDeployment> {
@@ -46,6 +43,10 @@ public class BlueGreenLifecycleMetrics implements CustomResourceMetrics<FlinkBlu
     public static final String TRANSITION_GROUP_NAME = "Transition";
     public static final String STATE_GROUP_NAME = "State";
     public static final String TIME_SECONDS_NAME = "TimeSeconds";
+
+    public static final String TRANSITION_INITIAL_DEPLOYMENT = "InitialDeployment";
+    public static final String TRANSITION_BLUE_TO_GREEN = "BlueToGreen";
+    public static final String TRANSITION_GREEN_TO_BLUE = "GreenToBlue";
 
     private static final List<String> TRANSITIONS =
             List.of(

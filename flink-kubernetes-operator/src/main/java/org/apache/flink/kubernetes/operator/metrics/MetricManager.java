@@ -126,7 +126,6 @@ public class MetricManager<CR extends CustomResource<?, ?>> {
         }
     }
 
-    // <CR extends AbstractFlinkResource<?, ?>> what is this pattern?
     private static void registerBlueGreenLifecycleMetrics(
             Configuration conf,
             KubernetesOperatorMetricGroup metricGroup,
