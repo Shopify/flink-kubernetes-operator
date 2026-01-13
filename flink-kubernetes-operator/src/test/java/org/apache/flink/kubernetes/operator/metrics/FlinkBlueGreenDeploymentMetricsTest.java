@@ -166,7 +166,7 @@ public class FlinkBlueGreenDeploymentMetricsTest {
     }
 
     @Test
-    public void testStateTransitionUpdatesCount() {
+    public void testFullLifecycleStateCountUpdates() {
         var deployment = buildBlueGreenDeployment("test", TEST_NAMESPACE);
 
         // Start in INITIALIZING_BLUE
@@ -238,8 +238,6 @@ public class FlinkBlueGreenDeploymentMetricsTest {
         assertEquals(1, listener.getGauge(counterId).get().getValue());
         assertStateCount(TEST_NAMESPACE, INITIALIZING_BLUE, 1);
     }
-
-    // ==================== Helper Methods ====================
 
     private FlinkBlueGreenDeployment buildBlueGreenDeployment(String name, String namespace) {
         var deployment = new FlinkBlueGreenDeployment();

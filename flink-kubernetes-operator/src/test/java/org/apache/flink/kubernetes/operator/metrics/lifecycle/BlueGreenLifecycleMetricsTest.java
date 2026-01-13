@@ -28,7 +28,6 @@ import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentStatus;
 import org.apache.flink.kubernetes.operator.metrics.CustomResourceMetrics;
-import org.apache.flink.kubernetes.operator.metrics.KubernetesOperatorMetricOptions;
 import org.apache.flink.kubernetes.operator.metrics.MetricManager;
 import org.apache.flink.kubernetes.operator.metrics.TestingMetricListener;
 
@@ -41,7 +40,6 @@ import java.util.HashMap;
 import java.util.UUID;
 
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.INITIALIZING_BLUE;
-import static org.apache.flink.kubernetes.operator.metrics.FlinkBlueGreenDeploymentMetrics.COUNTER_NAME;
 import static org.apache.flink.kubernetes.operator.metrics.KubernetesOperatorMetricOptions.OPERATOR_LIFECYCLE_METRICS_ENABLED;
 import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.LIFECYCLE_GROUP_NAME;
 import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLifecycleMetrics.STATE_GROUP_NAME;
@@ -50,7 +48,6 @@ import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenLi
 import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_BLUE_TO_GREEN;
 import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_GREEN_TO_BLUE;
 import static org.apache.flink.kubernetes.operator.metrics.lifecycle.BlueGreenResourceLifecycleMetricTracker.TRANSITION_INITIAL_DEPLOYMENT;
-import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -58,6 +55,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 public class BlueGreenLifecycleMetricsTest {
 
     private static final String TEST_NAMESPACE = "test-namespace";
+    private static final String[] TRANSITIONS = {
+        TRANSITION_INITIAL_DEPLOYMENT, TRANSITION_BLUE_TO_GREEN, TRANSITION_GREEN_TO_BLUE
+    };
 
     private final Configuration configuration = new Configuration();
     private TestingMetricListener listener;
@@ -71,42 +71,20 @@ public class BlueGreenLifecycleMetricsTest {
                         configuration, listener.getMetricGroup());
     }
 
-    // ==================== Histogram Existence Tests ====================
-
     @Test
     public void testNamespaceHistogramMetricsExist() {
         var deployment = buildBlueGreenDeployment("test-deployment", TEST_NAMESPACE);
         metricManager.onUpdate(deployment);
 
-        // Verify namespace-level transition histograms exist
-        assertTrue(
-                listener.getHistogram(
-                                getNamespaceHistogramId(
-                                        TEST_NAMESPACE,
-                                        TRANSITION_GROUP_NAME,
-                                        TRANSITION_INITIAL_DEPLOYMENT))
-                        .isPresent(),
-                "InitialDeployment histogram should exist");
+        for (String transition : TRANSITIONS) {
+            assertTrue(
+                    listener.getHistogram(
+                                    getNamespaceHistogramId(
+                                            TEST_NAMESPACE, TRANSITION_GROUP_NAME, transition))
+                            .isPresent(),
+                    "Transition histogram should exist for: " + transition);
+        }
 
-        assertTrue(
-                listener.getHistogram(
-                                getNamespaceHistogramId(
-                                        TEST_NAMESPACE,
-                                        TRANSITION_GROUP_NAME,
-                                        TRANSITION_BLUE_TO_GREEN))
-                        .isPresent(),
-                "BlueToGreen histogram should exist");
-
-        assertTrue(
-                listener.getHistogram(
-                                getNamespaceHistogramId(
-                                        TEST_NAMESPACE,
-                                        TRANSITION_GROUP_NAME,
-                                        TRANSITION_GREEN_TO_BLUE))
-                        .isPresent(),
-                "GreenToBlue histogram should exist");
-
-        // Verify namespace-level state time histograms exist
         for (FlinkBlueGreenDeploymentState state : FlinkBlueGreenDeploymentState.values()) {
             assertTrue(
                     listener.getHistogram(
@@ -122,182 +100,55 @@ public class BlueGreenLifecycleMetricsTest {
         var deployment = buildBlueGreenDeployment("test-deployment", TEST_NAMESPACE);
         metricManager.onUpdate(deployment);
 
-        // Verify system-level transition histograms exist (without namespace in path)
-        assertTrue(
-                listener.getHistogram(
-                                getSystemLevelHistogramId(
-                                        TRANSITION_GROUP_NAME, TRANSITION_INITIAL_DEPLOYMENT))
-                        .isPresent(),
-                "System-level InitialDeployment histogram should exist");
+        for (String transition : TRANSITIONS) {
+            assertTrue(
+                    listener.getHistogram(
+                                    getSystemLevelHistogramId(listener, TRANSITION_GROUP_NAME, transition))
+                            .isPresent(),
+                    "System-level transition histogram should exist for: " + transition);
+        }
 
-        assertTrue(
-                listener.getHistogram(
-                                getSystemLevelHistogramId(
-                                        TRANSITION_GROUP_NAME, TRANSITION_BLUE_TO_GREEN))
-                        .isPresent(),
-                "System-level BlueToGreen histogram should exist");
-
-        assertTrue(
-                listener.getHistogram(
-                                getSystemLevelHistogramId(
-                                        TRANSITION_GROUP_NAME, TRANSITION_GREEN_TO_BLUE))
-                        .isPresent(),
-                "System-level GreenToBlue histogram should exist");
-
-        // Verify system-level state time histograms exist
         for (FlinkBlueGreenDeploymentState state : FlinkBlueGreenDeploymentState.values()) {
             assertTrue(
-                    listener.getHistogram(getSystemLevelHistogramId(STATE_GROUP_NAME, state.name()))
+                    listener.getHistogram(
+                                    getSystemLevelHistogramId(listener, STATE_GROUP_NAME, state.name()))
                             .isPresent(),
                     "System-level state time histogram should exist for: " + state);
         }
     }
 
-    // ==================== Namespace Sharing Tests ====================
-
     @Test
-    public void testNamespaceHistogramSharing() {
-        // Deployments in the same namespace should share the same namespace histogram objects
-        // Deployments in different namespaces should have different namespace histograms
-        // But all should share system-level histograms
+    public void testMultiNamespaceHistogramIsolation() {
         var namespace1 = "ns1";
         var namespace2 = "ns2";
-
-        var dep1 = buildBlueGreenDeployment("dep1", namespace1);
-        var dep2 = buildBlueGreenDeployment("dep2", namespace1);
-        var dep3 = buildBlueGreenDeployment("dep3", namespace2);
-
-        metricManager.onUpdate(dep1);
-        metricManager.onUpdate(dep2);
-        metricManager.onUpdate(dep3);
-
-        // Same namespace should have the same histogram (verify by checking same metric ID
-        // resolves)
-        var ns1TransitionHistoId =
+        var ns1HistoId =
                 getNamespaceHistogramId(
                         namespace1, TRANSITION_GROUP_NAME, TRANSITION_INITIAL_DEPLOYMENT);
-        var ns2TransitionHistoId =
+
+        var dep1 = buildBlueGreenDeployment("dep1", namespace1);
+        metricManager.onUpdate(dep1);
+        var ns1Histo = listener.getHistogram(ns1HistoId).get();
+
+        var dep2 = buildBlueGreenDeployment("dep2", namespace1);
+        metricManager.onUpdate(dep2);
+        assertTrue(
+                ns1Histo == listener.getHistogram(ns1HistoId).get(),
+                "Deployments in same namespace should share histogram instance");
+
+        var dep3 = buildBlueGreenDeployment("dep3", namespace2);
+        metricManager.onUpdate(dep3);
+        var ns2HistoId =
                 getNamespaceHistogramId(
                         namespace2, TRANSITION_GROUP_NAME, TRANSITION_INITIAL_DEPLOYMENT);
-
-        // Both ns1 deployments write to the same histogram
-        assertTrue(listener.getHistogram(ns1TransitionHistoId).isPresent());
-        assertTrue(listener.getHistogram(ns2TransitionHistoId).isPresent());
-
-        // Different namespaces should have different histograms (different metric IDs)
-        var ns1StateHistoId =
-                getNamespaceHistogramId(namespace1, STATE_GROUP_NAME, INITIALIZING_BLUE.name());
-        var ns2StateHistoId =
-                getNamespaceHistogramId(namespace2, STATE_GROUP_NAME, INITIALIZING_BLUE.name());
-
-        // Verify they are different metric IDs (namespace isolation)
-        assertNotEquals(
-                ns1StateHistoId,
-                ns2StateHistoId,
-                "Namespace histograms should have different metric IDs");
-
-        // But system-level histogram should be shared (same metric ID for all)
-        var systemHistoId =
-                getSystemLevelHistogramId(TRANSITION_GROUP_NAME, TRANSITION_INITIAL_DEPLOYMENT);
         assertTrue(
-                listener.getHistogram(systemHistoId).isPresent(),
-                "System-level histogram should exist and be shared");
+                ns1Histo != listener.getHistogram(ns2HistoId).get(),
+                "Different namespaces should have different histogram instances");
     }
-
-    @Test
-    public void testTrackerSharingAcrossDeployments() {
-        // Similar to testLifecycleMetricsConfig in ResourceLifecycleMetricsTest
-        // Verifies that trackers in same namespace share histogram references
-        var dep1 = buildBlueGreenDeployment("n1", "ns1");
-        var dep2 = buildBlueGreenDeployment("n2", "ns1");
-        var dep3 = buildBlueGreenDeployment("n3", "ns2");
-
-        metricManager.onUpdate(dep1);
-        metricManager.onUpdate(dep2);
-        metricManager.onUpdate(dep3);
-
-        var lifecycleMetrics = getBlueGreenLifecycleMetrics(metricManager);
-
-        // Verify lifecycle metrics was registered
-        assertTrue(lifecycleMetrics != null, "BlueGreenLifecycleMetrics should be registered");
-
-        // All should have namespace histograms created
-        assertTrue(
-                listener.getHistogram(
-                                getNamespaceHistogramId(
-                                        "ns1",
-                                        TRANSITION_GROUP_NAME,
-                                        TRANSITION_INITIAL_DEPLOYMENT))
-                        .isPresent());
-        assertTrue(
-                listener.getHistogram(
-                                getNamespaceHistogramId(
-                                        "ns2",
-                                        TRANSITION_GROUP_NAME,
-                                        TRANSITION_INITIAL_DEPLOYMENT))
-                        .isPresent());
-    }
-
-    // ==================== Config Tests ====================
 
     @Test
     public void testLifecycleMetricsDisabled() {
-        // When OPERATOR_LIFECYCLE_METRICS_ENABLED is false, lifecycle histograms should not be
-        // created
         var conf = new Configuration();
         conf.set(OPERATOR_LIFECYCLE_METRICS_ENABLED, false);
-        var disabledListener = new TestingMetricListener(conf);
-        var disabledMetricManager =
-                MetricManager.createFlinkBlueGreenDeploymentMetricManager(
-                        conf, disabledListener.getMetricGroup());
-
-        var deployment = buildBlueGreenDeployment("test", TEST_NAMESPACE);
-        disabledMetricManager.onUpdate(deployment);
-
-        // State count gauges should still exist (they're part of FlinkBlueGreenDeploymentMetrics)
-        var counterId =
-                disabledListener.getNamespaceMetricId(
-                        FlinkBlueGreenDeployment.class, TEST_NAMESPACE, COUNTER_NAME);
-        assertTrue(disabledListener.getGauge(counterId).isPresent());
-
-        // But lifecycle histograms should NOT exist
-        var transitionHistoId =
-                disabledListener.getNamespaceMetricId(
-                        FlinkBlueGreenDeployment.class,
-                        TEST_NAMESPACE,
-                        LIFECYCLE_GROUP_NAME,
-                        TRANSITION_GROUP_NAME,
-                        TRANSITION_INITIAL_DEPLOYMENT,
-                        TIME_SECONDS_NAME);
-        assertTrue(
-                disabledListener.getHistogram(transitionHistoId).isEmpty(),
-                "Lifecycle histogram should not exist when lifecycle metrics are disabled");
-
-        var stateTimeHistoId =
-                disabledListener.getNamespaceMetricId(
-                        FlinkBlueGreenDeployment.class,
-                        TEST_NAMESPACE,
-                        LIFECYCLE_GROUP_NAME,
-                        STATE_GROUP_NAME,
-                        INITIALIZING_BLUE.name(),
-                        TIME_SECONDS_NAME);
-        assertTrue(
-                disabledListener.getHistogram(stateTimeHistoId).isEmpty(),
-                "State time histogram should not exist when lifecycle metrics are disabled");
-
-        // System-level histograms should also not exist
-        var systemHistoId =
-                getSystemLevelHistogramIdForListener(
-                        disabledListener, TRANSITION_GROUP_NAME, TRANSITION_INITIAL_DEPLOYMENT);
-        assertTrue(
-                disabledListener.getHistogram(systemHistoId).isEmpty(),
-                "System-level histogram should not exist when lifecycle metrics are disabled");
-    }
-
-    @Test
-    public void testLifecycleMetricsNotRegisteredWhenDisabled() {
-        var conf = new Configuration();
-        conf.set(KubernetesOperatorMetricOptions.OPERATOR_LIFECYCLE_METRICS_ENABLED, false);
         var disabledMetricManager =
                 MetricManager.createFlinkBlueGreenDeploymentMetricManager(
                         conf, new TestingMetricListener(conf).getMetricGroup());
@@ -306,8 +157,6 @@ public class BlueGreenLifecycleMetricsTest {
                 getBlueGreenLifecycleMetrics(disabledMetricManager),
                 "BlueGreenLifecycleMetrics should not be registered when disabled");
     }
-
-    // ==================== Helper Methods ====================
 
     private FlinkBlueGreenDeployment buildBlueGreenDeployment(String name, String namespace) {
         var deployment = new FlinkBlueGreenDeployment();
@@ -349,18 +198,7 @@ public class BlueGreenLifecycleMetricsTest {
                 TIME_SECONDS_NAME);
     }
 
-    private String getSystemLevelHistogramId(String groupName, String metricName) {
-        return listener.getMetricId(
-                String.format(
-                        "%s.%s.%s.%s.%s",
-                        FlinkBlueGreenDeployment.class.getSimpleName(),
-                        LIFECYCLE_GROUP_NAME,
-                        groupName,
-                        metricName,
-                        TIME_SECONDS_NAME));
-    }
-
-    private String getSystemLevelHistogramIdForListener(
+    private String getSystemLevelHistogramId(
             TestingMetricListener metricListener, String groupName, String metricName) {
         return metricListener.getMetricId(
                 String.format(

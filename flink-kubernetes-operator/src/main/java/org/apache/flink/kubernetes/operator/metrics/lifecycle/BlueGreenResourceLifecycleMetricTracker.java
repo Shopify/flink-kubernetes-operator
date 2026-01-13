@@ -21,9 +21,6 @@ import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState;
 import org.apache.flink.metrics.Histogram;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
@@ -36,19 +33,14 @@ import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDepl
 
 /**
  * Tracks state transitions and timing for a single FlinkBlueGreenDeployment resource. Records
- * metrics for: - Transition times (e.g., BlueToGreen, InitialDeployment) - Time spent in each state
+ * transition durations and time spent in each state.
  */
 public class BlueGreenResourceLifecycleMetricTracker {
 
-    private static final Logger LOG =
-            LoggerFactory.getLogger(BlueGreenResourceLifecycleMetricTracker.class);
-
-    // Transition metric names
     public static final String TRANSITION_INITIAL_DEPLOYMENT = "InitialDeployment";
     public static final String TRANSITION_BLUE_TO_GREEN = "BlueToGreen";
     public static final String TRANSITION_GREEN_TO_BLUE = "GreenToBlue";
 
-    // Current state of this resource
     private FlinkBlueGreenDeploymentState currentState;
 
     // map(state -> (firstEntryTime, lastUpdateTime))
@@ -56,10 +48,7 @@ public class BlueGreenResourceLifecycleMetricTracker {
     private final Map<FlinkBlueGreenDeploymentState, Tuple2<Instant, Instant>> stateTimeMap =
             new HashMap<>();
 
-    // Histograms for recording transition times (e.g., "BlueToGreen" -> histogram)
     private final Map<String, List<Histogram>> transitionHistos;
-
-    // Histograms for recording time spent in each state
     private final Map<FlinkBlueGreenDeploymentState, List<Histogram>> stateTimeHistos;
 
     public BlueGreenResourceLifecycleMetricTracker(
@@ -70,7 +59,6 @@ public class BlueGreenResourceLifecycleMetricTracker {
         this.currentState = initialState;
         this.transitionHistos = transitionHistos;
         this.stateTimeHistos = stateTimeHistos;
-        // Record initial state entry time
         stateTimeMap.put(initialState, Tuple2.of(time, time));
     }
 
@@ -86,15 +74,14 @@ public class BlueGreenResourceLifecycleMetricTracker {
             return;
         }
 
-        // Update the end time for the state we're leaving.
-        // This is important for states that transition quickly without receiving heartbeats
-        // (e.g., SAVEPOINTING_BLUE, TRANSITIONING_TO_GREEN) - without this, their state time
-        // would be 0 since f1 wouldn't be updated from entry time.
+        // Record exit time for states that transition faster than the heartbeat interval.
         updateLastUpdateTime(currentState, time);
-
         recordTransitionMetrics(currentState, newState, time);
-        recordStateTimeMetrics(newState);
-        clearTrackedStates(newState);
+
+        if (newState == ACTIVE_BLUE || newState == ACTIVE_GREEN) {
+            recordStateTimeMetrics();
+            clearTrackedStates();
+        }
 
         stateTimeMap.put(newState, Tuple2.of(time, time));
         currentState = newState;
@@ -107,35 +94,19 @@ public class BlueGreenResourceLifecycleMetricTracker {
         }
     }
 
-    /**
-     * Records transition time metrics when moving to a new state. Checks if this transition matches
-     * any tracked transitions and records duration.
-     */
     private void recordTransitionMetrics(
             FlinkBlueGreenDeploymentState fromState,
             FlinkBlueGreenDeploymentState toState,
             Instant time) {
 
-        // InitialDeployment: when reaching ACTIVE_BLUE from INITIALIZING_BLUE path
-        // (goes through TRANSITIONING_TO_BLUE, so check stateTimeMap instead of fromState)
         if (toState == ACTIVE_BLUE && stateTimeMap.containsKey(INITIALIZING_BLUE)) {
-            LOG.info(
-                    "Recording InitialDeployment transition. stateTimeMap keys: {}",
-                    stateTimeMap.keySet());
             recordTransition(TRANSITION_INITIAL_DEPLOYMENT, INITIALIZING_BLUE, time);
-        } else if (toState == ACTIVE_BLUE) {
-            LOG.info(
-                    "NOT recording InitialDeployment. toState={}, stateTimeMap keys: {}",
-                    toState,
-                    stateTimeMap.keySet());
         }
 
-        // BlueToGreen: when reaching ACTIVE_GREEN from ACTIVE_BLUE path
         if (toState == ACTIVE_GREEN && stateTimeMap.containsKey(ACTIVE_BLUE)) {
             recordTransition(TRANSITION_BLUE_TO_GREEN, ACTIVE_BLUE, time);
         }
 
-        // GreenToBlue: when reaching ACTIVE_BLUE from ACTIVE_GREEN path (not initial)
         if (toState == ACTIVE_BLUE
                 && fromState != INITIALIZING_BLUE
                 && stateTimeMap.containsKey(ACTIVE_GREEN)) {
@@ -150,7 +121,6 @@ public class BlueGreenResourceLifecycleMetricTracker {
             return;
         }
 
-        // Measure from when we first entered the "from" state
         long durationSeconds = Duration.between(fromTimes.f0, time).toSeconds();
 
         var histograms = transitionHistos.get(transitionName);
@@ -159,35 +129,18 @@ public class BlueGreenResourceLifecycleMetricTracker {
         }
     }
 
-    /**
-     * Records state duration metrics for all tracked states. Only processes when reaching a stable
-     * state (ACTIVE_BLUE/ACTIVE_GREEN).
-     */
-    private void recordStateTimeMetrics(FlinkBlueGreenDeploymentState toState) {
-        if (toState != ACTIVE_BLUE && toState != ACTIVE_GREEN) {
-            return;
-        }
-
-        for (var state : stateTimeMap.keySet()) {
-            var times = stateTimeMap.get(state);
-            if (times != null) {
-                long durationSeconds = Duration.between(times.f0, times.f1).toSeconds();
-                var histograms = stateTimeHistos.get(state);
-                if (histograms != null) {
-                    histograms.forEach(h -> h.update(durationSeconds));
-                }
-            }
-        }
+    private void recordStateTimeMetrics() {
+        stateTimeMap.forEach(
+                (state, times) -> {
+                    long durationSeconds = Duration.between(times.f0, times.f1).toSeconds();
+                    var histograms = stateTimeHistos.get(state);
+                    if (histograms != null) {
+                        histograms.forEach(h -> h.update(durationSeconds));
+                    }
+                });
     }
 
-    /**
-     * Clears all tracked states from the map. Only clears when reaching a stable state
-     * (ACTIVE_BLUE/ACTIVE_GREEN).
-     */
-    private void clearTrackedStates(FlinkBlueGreenDeploymentState toState) {
-        if (toState != ACTIVE_BLUE && toState != ACTIVE_GREEN) {
-            return;
-        }
+    private void clearTrackedStates() {
         stateTimeMap.clear();
     }
 }

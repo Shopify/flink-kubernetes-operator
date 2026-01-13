@@ -52,13 +52,13 @@ public class FlinkBlueGreenDeploymentMetrics
         clearStateCount(flinkBgDep);
 
         var namespace = flinkBgDep.getMetadata().getNamespace();
-        var name = flinkBgDep.getMetadata().getName();
+        var deploymentName = flinkBgDep.getMetadata().getName();
         var state = flinkBgDep.getStatus().getBlueGreenState();
 
         deploymentStatuses
                 .computeIfAbsent(namespace, this::initNamespaceMetrics)
                 .get(state)
-                .add(name);
+                .add(deploymentName);
     }
 
     @Override
@@ -69,11 +69,13 @@ public class FlinkBlueGreenDeploymentMetrics
     /** Clears the deployment from all state count sets (used before updating to new state). */
     private void clearStateCount(FlinkBlueGreenDeployment flinkBgDep) {
         var namespace = flinkBgDep.getMetadata().getNamespace();
-        var name = flinkBgDep.getMetadata().getName();
+        var deploymentName = flinkBgDep.getMetadata().getName();
 
         var namespaceStatuses = deploymentStatuses.get(namespace);
         if (namespaceStatuses != null) {
-            namespaceStatuses.values().forEach(names -> names.remove(name));
+            namespaceStatuses
+                    .values()
+                    .forEach(deploymentNames -> deploymentNames.remove(deploymentName));
         }
     }
 

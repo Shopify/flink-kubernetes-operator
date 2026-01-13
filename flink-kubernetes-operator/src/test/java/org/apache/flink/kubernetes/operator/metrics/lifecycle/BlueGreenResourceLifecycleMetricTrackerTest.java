@@ -48,7 +48,6 @@ public class BlueGreenResourceLifecycleMetricTrackerTest {
 
     private Map<String, List<Histogram>> transitionHistos;
     private Map<FlinkBlueGreenDeploymentState, List<Histogram>> stateTimeHistos;
-    private long currentTimeSeconds;
 
     @BeforeEach
     void setUp() {
@@ -61,115 +60,84 @@ public class BlueGreenResourceLifecycleMetricTrackerTest {
         for (FlinkBlueGreenDeploymentState state : FlinkBlueGreenDeploymentState.values()) {
             stateTimeHistos.put(state, List.of(createHistogram()));
         }
-
-        currentTimeSeconds = 0;
     }
 
-    // ==================== Initial Deployment ====================
-    // Note: Real flow is INITIALIZING_BLUE → TRANSITIONING_TO_BLUE → ACTIVE_BLUE
-
     @Test
-    void initialDeployment_recordsTransitionTime() {
-        var tracker = createTracker(INITIALIZING_BLUE);
-        tick(5);
-        tracker.onUpdate(TRANSITIONING_TO_BLUE, now());
-        tick(5);
+    void testInitialDeploymentRecordsTransitionTime() {
+        long ts = 0;
+        var tracker = createTracker(INITIALIZING_BLUE, Instant.ofEpochSecond(ts));
+        tracker.onUpdate(TRANSITIONING_TO_BLUE, Instant.ofEpochSecond(ts += 5));
+        tracker.onUpdate(ACTIVE_BLUE, Instant.ofEpochSecond(ts += 5));
 
-        tracker.onUpdate(ACTIVE_BLUE, now());
-
-        // InitialDeployment measures from INITIALIZING_BLUE entry to ACTIVE_BLUE
         assertTransitionRecorded(TRANSITION_INITIAL_DEPLOYMENT, 10);
     }
 
     @Test
-    void initialDeployment_recordsStateTime() {
-        var tracker = createTracker(INITIALIZING_BLUE);
-        tick(5);
-        tracker.onUpdate(TRANSITIONING_TO_BLUE, now());
-        tick(5);
+    void testInitialDeploymentRecordsStateTime() {
+        long ts = 0;
+        var tracker = createTracker(INITIALIZING_BLUE, Instant.ofEpochSecond(ts));
+        tracker.onUpdate(TRANSITIONING_TO_BLUE, Instant.ofEpochSecond(ts += 2));
+        tracker.onUpdate(ACTIVE_BLUE, Instant.ofEpochSecond(ts += 5));
 
-        tracker.onUpdate(ACTIVE_BLUE, now());
-
-        // Both INITIALIZING_BLUE and TRANSITIONING_TO_BLUE state times should be recorded
-        assertStateTimeRecorded(INITIALIZING_BLUE, 5);
+        assertStateTimeRecorded(INITIALIZING_BLUE, 2);
         assertStateTimeRecorded(TRANSITIONING_TO_BLUE, 5);
     }
 
-    // ==================== Blue to Green Transition ====================
-
     @Test
-    void blueToGreen_recordsTransitionTime() {
-        var tracker = createTracker(ACTIVE_BLUE);
-        tick(5);
-        tracker.onUpdate(SAVEPOINTING_BLUE, now());
-        tick(10);
-        tracker.onUpdate(TRANSITIONING_TO_GREEN, now());
-        tick(5);
-
-        tracker.onUpdate(ACTIVE_GREEN, now());
+    void testBlueToGreenRecordsTransitionTime() {
+        long ts = 0;
+        var tracker = createTracker(ACTIVE_BLUE, Instant.ofEpochSecond(ts));
+        tracker.onUpdate(SAVEPOINTING_BLUE, Instant.ofEpochSecond(ts += 5));
+        tracker.onUpdate(TRANSITIONING_TO_GREEN, Instant.ofEpochSecond(ts += 10));
+        tracker.onUpdate(ACTIVE_GREEN, Instant.ofEpochSecond(ts += 5));
 
         assertTransitionRecorded(TRANSITION_BLUE_TO_GREEN, 20);
     }
 
     @Test
-    void blueToGreen_recordsAllIntermediateStateTimes() {
-        var tracker = createTracker(ACTIVE_BLUE);
-        tick(5);
-        tracker.onUpdate(SAVEPOINTING_BLUE, now());
-        tick(10);
-        tracker.onUpdate(TRANSITIONING_TO_GREEN, now());
-        tick(3);
-
-        tracker.onUpdate(ACTIVE_GREEN, now());
+    void testBlueToGreenRecordsAllIntermediateStateTimes() {
+        long ts = 0;
+        var tracker = createTracker(ACTIVE_BLUE, Instant.ofEpochSecond(ts));
+        tracker.onUpdate(SAVEPOINTING_BLUE, Instant.ofEpochSecond(ts += 5));
+        tracker.onUpdate(TRANSITIONING_TO_GREEN, Instant.ofEpochSecond(ts += 10));
+        tracker.onUpdate(ACTIVE_GREEN, Instant.ofEpochSecond(ts += 3));
 
         assertStateTimeRecorded(ACTIVE_BLUE, 5);
         assertStateTimeRecorded(SAVEPOINTING_BLUE, 10);
         assertStateTimeRecorded(TRANSITIONING_TO_GREEN, 3);
     }
 
-    // ==================== Green to Blue Transition ====================
-
     @Test
-    void greenToBlue_recordsTransitionTime() {
-        var tracker = createTracker(ACTIVE_GREEN);
-        tick(5);
-        tracker.onUpdate(SAVEPOINTING_GREEN, now());
-        tick(8);
-        tracker.onUpdate(TRANSITIONING_TO_BLUE, now());
-        tick(2);
-
-        tracker.onUpdate(ACTIVE_BLUE, now());
+    void testGreenToBlueRecordsTransitionTime() {
+        long ts = 0;
+        var tracker = createTracker(ACTIVE_GREEN, Instant.ofEpochSecond(ts));
+        tracker.onUpdate(SAVEPOINTING_GREEN, Instant.ofEpochSecond(ts += 5));
+        tracker.onUpdate(TRANSITIONING_TO_BLUE, Instant.ofEpochSecond(ts += 8));
+        tracker.onUpdate(ACTIVE_BLUE, Instant.ofEpochSecond(ts += 2));
 
         assertTransitionRecorded(TRANSITION_GREEN_TO_BLUE, 15);
     }
 
     @Test
-    void greenToBlue_recordsAllIntermediateStateTimes() {
-        var tracker = createTracker(ACTIVE_GREEN);
-        tick(5);
-        tracker.onUpdate(SAVEPOINTING_GREEN, now());
-        tick(8);
-        tracker.onUpdate(TRANSITIONING_TO_BLUE, now());
-        tick(2);
-
-        tracker.onUpdate(ACTIVE_BLUE, now());
+    void testGreenToBlueRecordsAllIntermediateStateTimes() {
+        long ts = 0;
+        var tracker = createTracker(ACTIVE_GREEN, Instant.ofEpochSecond(ts));
+        tracker.onUpdate(SAVEPOINTING_GREEN, Instant.ofEpochSecond(ts += 5));
+        tracker.onUpdate(TRANSITIONING_TO_BLUE, Instant.ofEpochSecond(ts += 8));
+        tracker.onUpdate(ACTIVE_BLUE, Instant.ofEpochSecond(ts += 2));
 
         assertStateTimeRecorded(ACTIVE_GREEN, 5);
         assertStateTimeRecorded(SAVEPOINTING_GREEN, 8);
         assertStateTimeRecorded(TRANSITIONING_TO_BLUE, 2);
     }
 
-    // ==================== Edge Cases ====================
-
     @Test
-    void sameStateUpdates_onlyUpdateTimestamp() {
-        var tracker = createTracker(ACTIVE_BLUE);
-        tick(1);
-        tracker.onUpdate(ACTIVE_BLUE, now());
-        tick(1);
-        tracker.onUpdate(ACTIVE_BLUE, now());
-        tick(1);
-        tracker.onUpdate(ACTIVE_BLUE, now());
+    void testSameStateUpdatesOnlyUpdateTimestamp() {
+        long ts = 0;
+        var tracker = createTracker(ACTIVE_BLUE, Instant.ofEpochSecond(ts));
+        tracker.onUpdate(ACTIVE_BLUE, Instant.ofEpochSecond(ts += 1));
+        tracker.onUpdate(ACTIVE_BLUE, Instant.ofEpochSecond(ts += 1));
+        tracker.onUpdate(ACTIVE_BLUE, Instant.ofEpochSecond(ts += 1));
 
         assertNoTransitionRecorded(TRANSITION_BLUE_TO_GREEN);
         assertNoTransitionRecorded(TRANSITION_GREEN_TO_BLUE);
@@ -177,76 +145,80 @@ public class BlueGreenResourceLifecycleMetricTrackerTest {
     }
 
     @Test
-    void intermediateStateMetrics_onlyRecordedAtStableState() {
-        var tracker = createTracker(ACTIVE_BLUE);
-        tick(5);
-        tracker.onUpdate(SAVEPOINTING_BLUE, now());
-        tick(5);
-        tracker.onUpdate(TRANSITIONING_TO_GREEN, now());
+    void testIntermediateStateMetricsOnlyRecordedAtStableState() {
+        long ts = 0;
+        var tracker = createTracker(ACTIVE_BLUE, Instant.ofEpochSecond(ts));
+        tracker.onUpdate(SAVEPOINTING_BLUE, Instant.ofEpochSecond(ts += 5));
+        tracker.onUpdate(TRANSITIONING_TO_GREEN, Instant.ofEpochSecond(ts += 5));
 
-        // Metrics should not be recorded yet
         assertNoStateTimeRecorded(ACTIVE_BLUE);
         assertNoStateTimeRecorded(SAVEPOINTING_BLUE);
 
-        // Now reach stable state
-        tick(5);
-        tracker.onUpdate(ACTIVE_GREEN, now());
+        tracker.onUpdate(ACTIVE_GREEN, Instant.ofEpochSecond(ts += 5));
 
-        // Now all should be recorded
         assertStateTimeRecorded(ACTIVE_BLUE, 5);
         assertStateTimeRecorded(SAVEPOINTING_BLUE, 5);
         assertStateTimeRecorded(TRANSITIONING_TO_GREEN, 5);
     }
 
     @Test
-    void recoveryFromActiveState_tracksNextTransition() {
-        // Simulates operator restart with resource already in ACTIVE_BLUE
-        var tracker = createTracker(ACTIVE_BLUE);
-        tick(10);
-        tracker.onUpdate(TRANSITIONING_TO_GREEN, now());
-        tick(5);
-
-        tracker.onUpdate(ACTIVE_GREEN, now());
+    void testRecoveryFromActiveStateTracksNextTransition() {
+        long ts = 0;
+        var tracker = createTracker(ACTIVE_BLUE, Instant.ofEpochSecond(ts));
+        tracker.onUpdate(TRANSITIONING_TO_GREEN, Instant.ofEpochSecond(ts += 10));
+        tracker.onUpdate(ACTIVE_GREEN, Instant.ofEpochSecond(ts += 5));
 
         assertTransitionRecorded(TRANSITION_BLUE_TO_GREEN, 15);
     }
 
     @Test
-    void consecutiveTransitions_eachTrackedIndependently() {
-        // Full cycle: blue -> green -> blue
-        var tracker = createTracker(ACTIVE_BLUE);
+    void testConsecutiveTransitionsEachTrackedIndependently() {
+        long ts = 0;
+        var tracker = createTracker(ACTIVE_BLUE, Instant.ofEpochSecond(ts));
 
-        // Blue to Green
-        tick(10);
-        tracker.onUpdate(TRANSITIONING_TO_GREEN, now());
-        tick(5);
-        tracker.onUpdate(ACTIVE_GREEN, now());
+        tracker.onUpdate(TRANSITIONING_TO_GREEN, Instant.ofEpochSecond(ts += 10));
+        tracker.onUpdate(ACTIVE_GREEN, Instant.ofEpochSecond(ts += 5));
 
         assertTransitionRecorded(TRANSITION_BLUE_TO_GREEN, 15);
 
-        // Green to Blue
-        tick(8);
-        tracker.onUpdate(TRANSITIONING_TO_BLUE, now());
-        tick(2);
-        tracker.onUpdate(ACTIVE_BLUE, now());
+        tracker.onUpdate(TRANSITIONING_TO_BLUE, Instant.ofEpochSecond(ts += 8));
+        tracker.onUpdate(ACTIVE_BLUE, Instant.ofEpochSecond(ts += 2));
 
         assertTransitionRecorded(TRANSITION_GREEN_TO_BLUE, 10);
     }
 
-    // ==================== Helpers ====================
+    @Test
+    void testFailedBlueToGreenRollbackRecordsStateTimes() {
+        long ts = 0;
+        var tracker = createTracker(ACTIVE_BLUE, Instant.ofEpochSecond(ts));
+
+        tracker.onUpdate(SAVEPOINTING_BLUE, Instant.ofEpochSecond(ts += 10));
+        tracker.onUpdate(TRANSITIONING_TO_GREEN, Instant.ofEpochSecond(ts += 15));
+        tracker.onUpdate(ACTIVE_BLUE, Instant.ofEpochSecond(ts += 5));
+
+        assertStateTimeRecorded(ACTIVE_BLUE, 10);
+        assertStateTimeRecorded(SAVEPOINTING_BLUE, 15);
+        assertStateTimeRecorded(TRANSITIONING_TO_GREEN, 5);
+    }
+
+    @Test
+    void testFailedGreenToBlueRollbackRecordsStateTimes() {
+        long ts = 0;
+        var tracker = createTracker(ACTIVE_GREEN, Instant.ofEpochSecond(ts));
+
+        tracker.onUpdate(SAVEPOINTING_GREEN, Instant.ofEpochSecond(ts += 8));
+        tracker.onUpdate(TRANSITIONING_TO_BLUE, Instant.ofEpochSecond(ts += 12));
+        tracker.onUpdate(ACTIVE_GREEN, Instant.ofEpochSecond(ts += 3));
+
+        assertStateTimeRecorded(ACTIVE_GREEN, 8);
+        assertStateTimeRecorded(SAVEPOINTING_GREEN, 12);
+        assertStateTimeRecorded(TRANSITIONING_TO_BLUE, 3);
+    }
 
     private BlueGreenResourceLifecycleMetricTracker createTracker(
-            FlinkBlueGreenDeploymentState initialState) {
+            FlinkBlueGreenDeploymentState initialState, Instant initialTime) {
         return new BlueGreenResourceLifecycleMetricTracker(
-                initialState, now(), transitionHistos, stateTimeHistos);
-    }
-
-    private Instant now() {
-        return Instant.ofEpochSecond(currentTimeSeconds);
-    }
-
-    private void tick(long seconds) {
-        currentTimeSeconds += seconds;
+                initialState, initialTime, transitionHistos, stateTimeHistos);
     }
 
     private Histogram createHistogram() {
