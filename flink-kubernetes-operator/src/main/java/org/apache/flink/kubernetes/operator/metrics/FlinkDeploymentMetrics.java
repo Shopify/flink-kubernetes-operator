@@ -40,7 +40,6 @@ public class FlinkDeploymentMetrics implements CustomResourceMetrics<FlinkDeploy
     private final Map<String, Map<JobManagerDeploymentStatus, Set<String>>> deploymentStatuses =
             new ConcurrentHashMap<>();
     // map(namespace, map(version, set(deployment)))
-    // James Review: Do we need to provide versions? what's this all about?
     private final Map<String, Map<String, Set<String>>> deploymentFlinkVersions =
             new ConcurrentHashMap<>();
     // map(namespace, map(version, set(deployment)))

@@ -121,7 +121,6 @@ public class FlinkBlueGreenDeploymentController implements Reconciler<FlinkBlueG
                     BlueGreenDeploymentService.patchStatusUpdateControl(
                                     context, INITIALIZING_BLUE, null, null)
                             .rescheduleAfter(0);
-            // Record metrics for INITIALIZING_BLUE state
             statusRecorder.patchAndCacheStatus(bgDeployment, josdkContext.getClient());
             return updateControl;
         } else {

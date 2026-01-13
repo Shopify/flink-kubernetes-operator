@@ -311,7 +311,6 @@ public class StatusRecorder<CR extends CustomResource<?, STATUS>, STATUS> {
                     Collection<FlinkResourceListener> listeners) {
         BiConsumer<FlinkBlueGreenDeployment, FlinkBlueGreenDeploymentStatus> consumer =
                 (resource, previousStatus) -> {
-                    var now = Instant.now();
                     listeners.forEach(
                             listener -> {
                                 // FlinkResourceListener doesn't have a specific method for
