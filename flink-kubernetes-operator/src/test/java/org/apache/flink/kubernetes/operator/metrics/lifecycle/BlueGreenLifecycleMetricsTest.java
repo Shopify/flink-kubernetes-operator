@@ -103,7 +103,8 @@ public class BlueGreenLifecycleMetricsTest {
         for (String transition : TRANSITIONS) {
             assertTrue(
                     listener.getHistogram(
-                                    getSystemLevelHistogramId(listener, TRANSITION_GROUP_NAME, transition))
+                                    getSystemLevelHistogramId(
+                                            listener, TRANSITION_GROUP_NAME, transition))
                             .isPresent(),
                     "System-level transition histogram should exist for: " + transition);
         }
@@ -111,7 +112,8 @@ public class BlueGreenLifecycleMetricsTest {
         for (FlinkBlueGreenDeploymentState state : FlinkBlueGreenDeploymentState.values()) {
             assertTrue(
                     listener.getHistogram(
-                                    getSystemLevelHistogramId(listener, STATE_GROUP_NAME, state.name()))
+                                    getSystemLevelHistogramId(
+                                            listener, STATE_GROUP_NAME, state.name()))
                             .isPresent(),
                     "System-level state time histogram should exist for: " + state);
         }

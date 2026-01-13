@@ -89,7 +89,7 @@ public class BlueGreenResourceLifecycleMetricTracker {
                     currentState,
                     newState,
                     stateTimeMap.keySet());
-                    
+
             recordStateTimeMetrics();
             clearTrackedStates();
         }
