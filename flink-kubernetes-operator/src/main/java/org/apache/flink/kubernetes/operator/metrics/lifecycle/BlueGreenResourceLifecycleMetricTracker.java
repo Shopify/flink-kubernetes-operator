@@ -132,7 +132,7 @@ public class BlueGreenResourceLifecycleMetricTracker {
             return;
         }
 
-        long durationSeconds = Duration.between(fromTimes.f0, time).toSeconds();
+        long durationSeconds = Duration.between(fromTimes.f1, time).toSeconds();
 
         LOG.debug(
                 "Recording transition time {}s for {} (from {})",

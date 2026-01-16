@@ -69,11 +69,13 @@ In addition to the simple counts we further track a few selected state transitio
 
 FlinkBlueGreenDeployment resources have their own lifecycle states that track the blue-green deployment process. The operator monitors the following transitions:
 
- - InitialDeployment : Time from INITIALIZING_BLUE to ACTIVE_BLUE (first deployment)
- - BlueToGreen : Time from ACTIVE_BLUE to ACTIVE_GREEN (upgrade via savepoint and traffic switch)
- - GreenToBlue : Time from ACTIVE_GREEN to ACTIVE_BLUE (upgrade via savepoint and traffic switch)
+ - InitialDeployment : Time from leaving INITIALIZING_BLUE to reaching ACTIVE_BLUE (first deployment)
+ - BlueToGreen : Time from leaving ACTIVE_BLUE to reaching ACTIVE_GREEN (actual transition duration)
+ - GreenToBlue : Time from leaving ACTIVE_GREEN to reaching ACTIVE_BLUE (actual transition duration)
 
-State time metrics track how long a resource spends in each intermediate state (SAVEPOINTING_BLUE, TRANSITIONING_TO_GREEN, etc.), which helps identify bottlenecks in the deployment pipeline.
+Transition metrics measure the actual transition time - from when the deployment leaves the source stable state until it reaches the target stable state. This excludes time spent running stably before the transition was initiated.
+
+State time metrics track how long a resource spends in each state (ACTIVE_BLUE, SAVEPOINTING_BLUE, TRANSITIONING_TO_GREEN, etc.), which helps identify bottlenecks in the deployment pipeline.
 
 #### FlinkBlueGreenDeployment JobStatus Tracking
 

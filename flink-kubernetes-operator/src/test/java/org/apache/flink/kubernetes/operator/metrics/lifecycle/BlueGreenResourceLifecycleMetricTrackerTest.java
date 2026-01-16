@@ -69,7 +69,7 @@ public class BlueGreenResourceLifecycleMetricTrackerTest {
         tracker.onUpdate(TRANSITIONING_TO_BLUE, Instant.ofEpochSecond(ts += 5));
         tracker.onUpdate(ACTIVE_BLUE, Instant.ofEpochSecond(ts += 5));
 
-        assertTransitionRecorded(TRANSITION_INITIAL_DEPLOYMENT, 10);
+        assertTransitionRecorded(TRANSITION_INITIAL_DEPLOYMENT, 5);
     }
 
     @Test
@@ -91,7 +91,7 @@ public class BlueGreenResourceLifecycleMetricTrackerTest {
         tracker.onUpdate(TRANSITIONING_TO_GREEN, Instant.ofEpochSecond(ts += 10));
         tracker.onUpdate(ACTIVE_GREEN, Instant.ofEpochSecond(ts += 5));
 
-        assertTransitionRecorded(TRANSITION_BLUE_TO_GREEN, 20);
+        assertTransitionRecorded(TRANSITION_BLUE_TO_GREEN, 15);
     }
 
     @Test
@@ -115,7 +115,7 @@ public class BlueGreenResourceLifecycleMetricTrackerTest {
         tracker.onUpdate(TRANSITIONING_TO_BLUE, Instant.ofEpochSecond(ts += 8));
         tracker.onUpdate(ACTIVE_BLUE, Instant.ofEpochSecond(ts += 2));
 
-        assertTransitionRecorded(TRANSITION_GREEN_TO_BLUE, 15);
+        assertTransitionRecorded(TRANSITION_GREEN_TO_BLUE, 10);
     }
 
     @Test
@@ -168,7 +168,7 @@ public class BlueGreenResourceLifecycleMetricTrackerTest {
         tracker.onUpdate(TRANSITIONING_TO_GREEN, Instant.ofEpochSecond(ts += 10));
         tracker.onUpdate(ACTIVE_GREEN, Instant.ofEpochSecond(ts += 5));
 
-        assertTransitionRecorded(TRANSITION_BLUE_TO_GREEN, 15);
+        assertTransitionRecorded(TRANSITION_BLUE_TO_GREEN, 5);
     }
 
     @Test
@@ -179,12 +179,12 @@ public class BlueGreenResourceLifecycleMetricTrackerTest {
         tracker.onUpdate(TRANSITIONING_TO_GREEN, Instant.ofEpochSecond(ts += 10));
         tracker.onUpdate(ACTIVE_GREEN, Instant.ofEpochSecond(ts += 5));
 
-        assertTransitionRecorded(TRANSITION_BLUE_TO_GREEN, 15);
+        assertTransitionRecorded(TRANSITION_BLUE_TO_GREEN, 5);
 
         tracker.onUpdate(TRANSITIONING_TO_BLUE, Instant.ofEpochSecond(ts += 8));
         tracker.onUpdate(ACTIVE_BLUE, Instant.ofEpochSecond(ts += 2));
 
-        assertTransitionRecorded(TRANSITION_GREEN_TO_BLUE, 10);
+        assertTransitionRecorded(TRANSITION_GREEN_TO_BLUE, 2);
     }
 
     @Test
