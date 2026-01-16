@@ -35,18 +35,20 @@ Different operator metrics can be turned on/off individually using the configura
 ### Flink Resource Metrics
 The Operator gathers aggregates metrics about managed resources.
 
-| Scope              | Metrics                                                                                   | Description                                                                                                                                                                                        | Type      |
-|--------------------|-------------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------|
+| Scope              | Metrics                                                                                   | Description                                                                                                                                                                                       | Type      |
+|--------------------|-------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------|
 | Namespace          | FlinkDeployment/FlinkSessionJob.Count                                                     | Number of managed resources per namespace                                                                                                                               | Gauge     |
-| Namespace          | FlinkDeployment.ResourceUsage.Cpu/Memory                                            | Total resources used per namespace                                                                                                                                                                | Gauge     |
-| Namespace          | FlinkDeployment.JmDeploymentStatus.&lt;Status&gt;.Count                                   | Number of managed FlinkDeployment resources per &lt;Status&gt; per namespace. &lt;Status&gt; can take values from: READY, DEPLOYED_NOT_READY, DEPLOYING, MISSING, ERROR                            | Gauge     |
-| Namespace          | FlinkDeployment.FlinkVersion.&lt;FlinkVersion&gt;.Count                               | Number of managed FlinkDeployment resources per &lt;FlinkVersion&gt; per namespace. &lt;FlinkVersion&gt; is retrieved via REST API from Flink JM.                                                  | Gauge     |
+| Namespace          | FlinkDeployment.ResourceUsage.Cpu/Memory                                            | Total resources used per namespace                                                                                                                                                               | Gauge     |
+| Namespace          | FlinkDeployment.JmDeploymentStatus.&lt;Status&gt;.Count                                   | Number of managed FlinkDeployment resources per &lt;Status&gt; per namespace. &lt;Status&gt; can take values from: READY, DEPLOYED_NOT_READY, DEPLOYING, MISSING, ERROR                           | Gauge     |
+| Namespace          | FlinkDeployment.FlinkVersion.&lt;FlinkVersion&gt;.Count                               | Number of managed FlinkDeployment resources per &lt;FlinkVersion&gt; per namespace. &lt;FlinkVersion&gt; is retrieved via REST API from Flink JM.                                                 | Gauge     |
 | Namespace          | FlinkDeployment/FlinkSessionJob.Lifecycle.State.&lt;State&gt;.Count                       | Number of managed resources currently in state &lt;State&gt; per namespace. &lt;State&gt; can take values from: CREATED, SUSPENDED, UPGRADING, DEPLOYED, STABLE, ROLLING_BACK, ROLLED_BACK, FAILED | Gauge     |
-| System/Namespace   | FlinkDeployment/FlinkSessionJob.Lifecycle.State.&lt;State&gt;.TimeSeconds                 | Time spent in state &lt;State&gt; for a given resource. &lt;State&gt; can take values from: CREATED, SUSPENDED, UPGRADING, DEPLOYED, STABLE, ROLLING_BACK, ROLLED_BACK, FAILED                      | Histogram |
-| System/Namespace   | FlinkDeployment/FlinkSessionJob.Lifecycle.Transition.&lt;Transition&gt;.TimeSeconds       | Time statistics for selected lifecycle state transitions. &lt;Transition&gt; can take values from: Resume, Upgrade, Suspend, Stabilization, Rollback, Submission                                   | Histogram |
+| System/Namespace   | FlinkDeployment/FlinkSessionJob.Lifecycle.State.&lt;State&gt;.TimeSeconds                 | Time spent in state &lt;State&gt; for a given resource. &lt;State&gt; can take values from: CREATED, SUSPENDED, UPGRADING, DEPLOYED, STABLE, ROLLING_BACK, ROLLED_BACK, FAILED                     | Histogram |
+| System/Namespace   | FlinkDeployment/FlinkSessionJob.Lifecycle.Transition.&lt;Transition&gt;.TimeSeconds       | Time statistics for selected lifecycle state transitions. &lt;Transition&gt; can take values from: Resume, Upgrade, Suspend, Stabilization, Rollback, Submission                                  | Histogram |
 | Namespace          | FlinkBlueGreenDeployment.BlueGreenState.&lt;State&gt;.Count                              | Number of managed FlinkBlueGreenDeployment resources currently in state &lt;State&gt; per namespace. &lt;State&gt; can take values from: INITIALIZING_BLUE, ACTIVE_BLUE, SAVEPOINTING_BLUE, TRANSITIONING_TO_GREEN, ACTIVE_GREEN, SAVEPOINTING_GREEN, TRANSITIONING_TO_BLUE | Gauge     |
-| System/Namespace   | FlinkBlueGreenDeployment.Lifecycle.State.&lt;State&gt;.TimeSeconds                        | Time spent in state &lt;State&gt; for a given FlinkBlueGreenDeployment resource. &lt;State&gt; values same as above.                                                                                | Histogram |
-| System/Namespace   | FlinkBlueGreenDeployment.Lifecycle.Transition.&lt;Transition&gt;.TimeSeconds              | Time statistics for blue-green lifecycle state transitions. &lt;Transition&gt; can take values from: InitialDeployment, BlueToGreen, GreenToBlue                                                   | Histogram |
+| Namespace          | FlinkBlueGreenDeployment.JobStatus.&lt;Status&gt;.Count                                  | Number of managed FlinkBlueGreenDeployment resources currently in JobStatus &lt;Status&gt; per namespace. &lt;Status&gt; can take values from: RUNNING, FAILING, SUSPENDED, FAILED, RECONCILING | Gauge     |
+| Namespace          | FlinkBlueGreenDeployment.Failures                                                        | Historical count of failure events (transitions to FAILING state) for all FlinkBlueGreenDeployment resources in the namespace. Counter increments on each transition to FAILING and never decrements. | Counter   |
+| System/Namespace   | FlinkBlueGreenDeployment.Lifecycle.State.&lt;State&gt;.TimeSeconds                        | Time spent in state &lt;State&gt; for a given FlinkBlueGreenDeployment resource. &lt;State&gt; values same as above.                                                                               | Histogram |
+| System/Namespace   | FlinkBlueGreenDeployment.Lifecycle.Transition.&lt;Transition&gt;.TimeSeconds              | Time statistics for blue-green lifecycle state transitions. &lt;Transition&gt; can take values from: InitialDeployment, BlueToGreen, GreenToBlue                                                  | Histogram |
 
 #### Lifecycle metrics
 
@@ -72,6 +74,20 @@ FlinkBlueGreenDeployment resources have their own lifecycle states that track th
  - GreenToBlue : Time from ACTIVE_GREEN to ACTIVE_BLUE (upgrade via savepoint and traffic switch)
 
 State time metrics track how long a resource spends in each intermediate state (SAVEPOINTING_BLUE, TRANSITIONING_TO_GREEN, etc.), which helps identify bottlenecks in the deployment pipeline.
+
+#### FlinkBlueGreenDeployment JobStatus Tracking
+
+In addition to BlueGreenState tracking, FlinkBlueGreenDeployment resources also expose JobStatus metrics that track the Flink job state:
+
+**JobStatus Gauges**: Current count of deployments per JobStatus (RUNNING, FAILING, SUSPENDED, etc.) - these gauges go up and down as deployments transition between states.
+
+**Failures Counter**: Historical count that increments each time a deployment transitions TO the FAILING state. This counter:
+ - Never decrements (accumulates total failures since operator start)
+ - Increments on each new transition to FAILING (even if the same deployment fails multiple times)
+ - Persists across deployment recoveries (provides historical failure tracking)
+ - Useful for calculating failure rates and setting up alerts
+
+Example: A deployment goes RUNNING → FAILING → RUNNING → FAILING. The FAILING gauge shows 0 or 1 (current state), while the Failures counter shows 2 (historical events).
 
 ### Kubernetes Client Metrics
 

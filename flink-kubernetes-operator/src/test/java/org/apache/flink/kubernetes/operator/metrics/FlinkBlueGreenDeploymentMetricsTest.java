@@ -17,6 +17,7 @@
 
 package org.apache.flink.kubernetes.operator.metrics;
 
+import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.kubernetes.operator.api.FlinkBlueGreenDeployment;
 import org.apache.flink.kubernetes.operator.api.spec.ConfigObjectNode;
@@ -42,6 +43,8 @@ import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDepl
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN;
 import static org.apache.flink.kubernetes.operator.metrics.FlinkBlueGreenDeploymentMetrics.BG_STATE_GROUP_NAME;
 import static org.apache.flink.kubernetes.operator.metrics.FlinkBlueGreenDeploymentMetrics.COUNTER_NAME;
+import static org.apache.flink.kubernetes.operator.metrics.FlinkBlueGreenDeploymentMetrics.FAILURES_COUNTER_NAME;
+import static org.apache.flink.kubernetes.operator.metrics.FlinkBlueGreenDeploymentMetrics.JOB_STATUS_GROUP_NAME;
 import static org.apache.flink.kubernetes.operator.metrics.KubernetesOperatorMetricOptions.OPERATOR_RESOURCE_METRICS_ENABLED;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -239,6 +242,211 @@ public class FlinkBlueGreenDeploymentMetricsTest {
         assertStateCount(TEST_NAMESPACE, INITIALIZING_BLUE, 1);
     }
 
+    @Test
+    public void testJobStatusGaugeTracking() {
+        var deployment1 = buildBlueGreenDeployment("deployment1", TEST_NAMESPACE);
+        var deployment2 = buildBlueGreenDeployment("deployment2", TEST_NAMESPACE);
+
+        var runningId =
+                listener.getNamespaceMetricId(
+                        FlinkBlueGreenDeployment.class,
+                        TEST_NAMESPACE,
+                        JOB_STATUS_GROUP_NAME,
+                        JobStatus.RUNNING.name(),
+                        COUNTER_NAME);
+        var failingId =
+                listener.getNamespaceMetricId(
+                        FlinkBlueGreenDeployment.class,
+                        TEST_NAMESPACE,
+                        JOB_STATUS_GROUP_NAME,
+                        JobStatus.FAILING.name(),
+                        COUNTER_NAME);
+
+        assertTrue(listener.getGauge(runningId).isEmpty());
+        assertTrue(listener.getGauge(failingId).isEmpty());
+
+        // Both start with RUNNING
+        deployment1.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        deployment2.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        metricManager.onUpdate(deployment1);
+        metricManager.onUpdate(deployment2);
+        assertJobStatusCount(TEST_NAMESPACE, JobStatus.RUNNING, 2);
+        assertJobStatusCount(TEST_NAMESPACE, JobStatus.FAILING, 0);
+
+        // deployment1 transitions to FAILING
+        deployment1.getStatus().getJobStatus().setState(JobStatus.FAILING);
+        metricManager.onUpdate(deployment1);
+        assertJobStatusCount(TEST_NAMESPACE, JobStatus.RUNNING, 1);
+        assertJobStatusCount(TEST_NAMESPACE, JobStatus.FAILING, 1);
+
+        // deployment2 also transitions to FAILING
+        deployment2.getStatus().getJobStatus().setState(JobStatus.FAILING);
+        metricManager.onUpdate(deployment2);
+        assertJobStatusCount(TEST_NAMESPACE, JobStatus.RUNNING, 0);
+        assertJobStatusCount(TEST_NAMESPACE, JobStatus.FAILING, 2);
+
+        // Remove deployment1
+        metricManager.onRemove(deployment1);
+        assertJobStatusCount(TEST_NAMESPACE, JobStatus.FAILING, 1);
+
+        // Remove deployment2
+        metricManager.onRemove(deployment2);
+        assertJobStatusCount(TEST_NAMESPACE, JobStatus.FAILING, 0);
+    }
+
+    @Test
+    public void testFailuresCounterIncrementsOnTransitionToFailing() {
+        var deployment = buildBlueGreenDeployment("test", TEST_NAMESPACE);
+
+        var failuresId =
+                listener.getNamespaceMetricId(
+                        FlinkBlueGreenDeployment.class, TEST_NAMESPACE, FAILURES_COUNTER_NAME);
+
+        assertTrue(listener.getCounter(failuresId).isEmpty());
+
+        // Start with RUNNING
+        deployment.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        metricManager.onUpdate(deployment);
+        assertEquals(0L, listener.getCounter(failuresId).get().getCount());
+
+        // First transition to FAILING - counter increments
+        deployment.getStatus().getJobStatus().setState(JobStatus.FAILING);
+        metricManager.onUpdate(deployment);
+        assertEquals(1L, listener.getCounter(failuresId).get().getCount());
+
+        // Stay in FAILING - counter does NOT increment
+        metricManager.onUpdate(deployment);
+        assertEquals(1L, listener.getCounter(failuresId).get().getCount());
+
+        // Recover to RUNNING - counter stays same (never decrements)
+        deployment.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        metricManager.onUpdate(deployment);
+        assertEquals(1L, listener.getCounter(failuresId).get().getCount());
+
+        // Second transition to FAILING - counter increments again
+        deployment.getStatus().getJobStatus().setState(JobStatus.FAILING);
+        metricManager.onUpdate(deployment);
+        assertEquals(2L, listener.getCounter(failuresId).get().getCount());
+    }
+
+    @Test
+    public void testFailuresCounterMultipleDeployments() {
+        var deployment1 = buildBlueGreenDeployment("deployment1", TEST_NAMESPACE);
+        var deployment2 = buildBlueGreenDeployment("deployment2", TEST_NAMESPACE);
+
+        var failuresId =
+                listener.getNamespaceMetricId(
+                        FlinkBlueGreenDeployment.class, TEST_NAMESPACE, FAILURES_COUNTER_NAME);
+
+        assertTrue(listener.getCounter(failuresId).isEmpty());
+
+        // Both start RUNNING
+        deployment1.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        deployment2.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        metricManager.onUpdate(deployment1);
+        metricManager.onUpdate(deployment2);
+        assertEquals(0L, listener.getCounter(failuresId).get().getCount());
+
+        // deployment1 fails
+        deployment1.getStatus().getJobStatus().setState(JobStatus.FAILING);
+        metricManager.onUpdate(deployment1);
+        assertEquals(1L, listener.getCounter(failuresId).get().getCount());
+
+        // deployment2 fails
+        deployment2.getStatus().getJobStatus().setState(JobStatus.FAILING);
+        metricManager.onUpdate(deployment2);
+        assertEquals(2L, listener.getCounter(failuresId).get().getCount());
+
+        // deployment1 recovers - counter stays 2
+        deployment1.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        metricManager.onUpdate(deployment1);
+        assertEquals(2L, listener.getCounter(failuresId).get().getCount());
+
+        // Remove deployments - counter stays 2 (historical, never decrements)
+        metricManager.onRemove(deployment1);
+        assertEquals(2L, listener.getCounter(failuresId).get().getCount());
+        metricManager.onRemove(deployment2);
+        assertEquals(2L, listener.getCounter(failuresId).get().getCount());
+    }
+
+    @Test
+    public void testFailuresCounterIsolatedByNamespace() {
+        var namespace1 = "ns1";
+        var namespace2 = "ns2";
+        var deployment1 = buildBlueGreenDeployment("deployment", namespace1);
+        var deployment2 = buildBlueGreenDeployment("deployment", namespace2);
+
+        var failuresId1 =
+                listener.getNamespaceMetricId(
+                        FlinkBlueGreenDeployment.class, namespace1, FAILURES_COUNTER_NAME);
+        var failuresId2 =
+                listener.getNamespaceMetricId(
+                        FlinkBlueGreenDeployment.class, namespace2, FAILURES_COUNTER_NAME);
+
+        assertTrue(listener.getCounter(failuresId1).isEmpty());
+        assertTrue(listener.getCounter(failuresId2).isEmpty());
+
+        // Initialize both namespaces first with RUNNING deployments
+        deployment1.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        deployment2.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        metricManager.onUpdate(deployment1);
+        metricManager.onUpdate(deployment2);
+        assertEquals(0L, listener.getCounter(failuresId1).get().getCount());
+        assertEquals(0L, listener.getCounter(failuresId2).get().getCount());
+
+        // deployment1 in ns1 fails
+        deployment1.getStatus().getJobStatus().setState(JobStatus.FAILING);
+        metricManager.onUpdate(deployment1);
+
+        // Only ns1 counter increments
+        assertEquals(1L, listener.getCounter(failuresId1).get().getCount());
+        assertEquals(0L, listener.getCounter(failuresId2).get().getCount());
+
+        // deployment2 in ns2 fails
+        deployment2.getStatus().getJobStatus().setState(JobStatus.FAILING);
+        metricManager.onUpdate(deployment2);
+
+        // Counters are isolated
+        assertEquals(1L, listener.getCounter(failuresId1).get().getCount());
+        assertEquals(1L, listener.getCounter(failuresId2).get().getCount());
+    }
+
+    @Test
+    public void testAllJobStatusesHaveMetrics() {
+        var deployment = buildBlueGreenDeployment("test-deployment", TEST_NAMESPACE);
+        deployment.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        metricManager.onUpdate(deployment);
+
+        // Verify each JobStatus has a gauge registered
+        for (JobStatus status : JobStatus.values()) {
+            var statusId =
+                    listener.getNamespaceMetricId(
+                            FlinkBlueGreenDeployment.class,
+                            TEST_NAMESPACE,
+                            JOB_STATUS_GROUP_NAME,
+                            status.name(),
+                            COUNTER_NAME);
+            assertTrue(
+                    listener.getGauge(statusId).isPresent(),
+                    "Metric should exist for JobStatus: " + status);
+        }
+    }
+
+    @Test
+    public void testJobStatusDoesNotDoubleCount() {
+        var deployment = buildBlueGreenDeployment("test", TEST_NAMESPACE);
+
+        // Start with RUNNING
+        deployment.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        metricManager.onUpdate(deployment);
+        assertJobStatusCount(TEST_NAMESPACE, JobStatus.RUNNING, 1);
+
+        // Multiple updates in same JobStatus should not duplicate
+        metricManager.onUpdate(deployment);
+        metricManager.onUpdate(deployment);
+        assertJobStatusCount(TEST_NAMESPACE, JobStatus.RUNNING, 1);
+    }
+
     private FlinkBlueGreenDeployment buildBlueGreenDeployment(String name, String namespace) {
         var deployment = new FlinkBlueGreenDeployment();
         deployment.setMetadata(
@@ -264,6 +472,7 @@ public class FlinkBlueGreenDeploymentMetricsTest {
 
         var status = new FlinkBlueGreenDeploymentStatus();
         status.setBlueGreenState(INITIALIZING_BLUE);
+        status.setJobStatus(new org.apache.flink.kubernetes.operator.api.status.JobStatus());
         deployment.setStatus(status);
 
         return deployment;
@@ -282,5 +491,19 @@ public class FlinkBlueGreenDeploymentMetricsTest {
                 expectedCount,
                 listener.getGauge(stateId).get().getValue(),
                 "State count mismatch for " + state);
+    }
+
+    private void assertJobStatusCount(String namespace, JobStatus status, int expectedCount) {
+        var statusId =
+                listener.getNamespaceMetricId(
+                        FlinkBlueGreenDeployment.class,
+                        namespace,
+                        JOB_STATUS_GROUP_NAME,
+                        status.name(),
+                        COUNTER_NAME);
+        assertEquals(
+                expectedCount,
+                listener.getGauge(statusId).get().getValue(),
+                "JobStatus count mismatch for " + status);
     }
 }
