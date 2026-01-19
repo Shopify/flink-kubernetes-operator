@@ -262,7 +262,8 @@ public class FlinkOperator {
         var statusRecorder =
                 StatusRecorder.createForFlinkBlueGreenDeployment(client, metricManager, listeners);
 
-        var controller = new FlinkBlueGreenDeploymentController(ctxFactory, configManager, statusRecorder);
+        var controller =
+                new FlinkBlueGreenDeploymentController(ctxFactory, configManager, statusRecorder);
         registeredControllers.add(operator.register(controller, this::overrideControllerConfigs));
     }
 
