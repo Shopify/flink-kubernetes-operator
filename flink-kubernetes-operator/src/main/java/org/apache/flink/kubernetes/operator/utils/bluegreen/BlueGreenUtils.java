@@ -26,6 +26,7 @@ import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDeploymentType;
 import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDiffType;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentSpec;
+import org.apache.flink.kubernetes.operator.api.spec.IngressSpec;
 import org.apache.flink.kubernetes.operator.api.spec.KubernetesDeploymentMode;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentStatus;
@@ -332,7 +333,9 @@ public class BlueGreenUtils {
                         "spec",
                         FlinkBlueGreenDeploymentSpec.class);
 
-        // The Blue/Green initialSavepointPath is only used for first-time deployments
+        // The Blue/Green initialSavepointPath is used for:
+        // 1. First-time deployments
+        // 2. When savepointRedeployNonce changes (lastCheckpoint will be null)
         if (isFirstDeployment) {
             String initialSavepointPath =
                     spec.getTemplate().getSpec().getJob().getInitialSavepointPath();
@@ -346,9 +349,30 @@ public class BlueGreenUtils {
             String location = lastCheckpoint.getLocation().replace("file:", "");
             LOG.info("Using Blue/Green savepoint/checkpoint: " + location);
             spec.getTemplate().getSpec().getJob().setInitialSavepointPath(location);
+        } else {
+            // lastCheckpoint is null in two scenarios:
+            // 1. savepointRedeployNonce changed - user wants to redeploy from initialSavepointPath
+            // 2. upgradeMode is STATELESS - don't take savepoints (but use initialSavepointPath if
+            // set)
+            String initialSavepointPath =
+                    spec.getTemplate().getSpec().getJob().getInitialSavepointPath();
+            if (initialSavepointPath != null && !initialSavepointPath.isEmpty()) {
+                LOG.info(
+                        "Using user-specified initialSavepointPath for redeploy: {}",
+                        initialSavepointPath);
+            } else {
+                LOG.info("Starting fresh with no savepoint restoration");
+            }
         }
 
         flinkDeployment.setSpec(spec.getTemplate().getSpec());
+
+        // Update Ingress template if exists to prevent path collision between Blue and Green
+        IngressSpec ingress = flinkDeployment.getSpec().getIngress();
+        if (ingress != null) {
+            ingress.setTemplate(
+                    blueGreenDeploymentType.name().toLowerCase() + "-" + ingress.getTemplate());
+        }
 
         // Deployment metadata
         ObjectMeta flinkDeploymentMeta = getDependentObjectMeta(context.getBgDeployment());
