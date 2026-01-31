@@ -159,6 +159,16 @@ webhook:
     # key: password-key
   serviceLabels: {}
 
+# ValidatingAdmissionPolicy to protect child FlinkDeployments from direct modifications
+# Uses Kubernetes native ValidatingAdmissionPolicy (requires K8s 1.30+ or 1.26+ with feature gate)
+# This is NOT a webhook - it's evaluated directly by the K8s API server
+# Enable this if using FlinkBlueGreenDeployment to prevent direct edits to child resources
+blueGreenAdmissionPolicy:
+  create: false
+  failurePolicy: Fail
+  validationActions:
+    - Deny
+
 defaultConfiguration:
   # If set to true, creates ConfigMaps/VolumeMounts. If set to false, no configuration will be created.
   # All below fields will be ignored if create is set to false.

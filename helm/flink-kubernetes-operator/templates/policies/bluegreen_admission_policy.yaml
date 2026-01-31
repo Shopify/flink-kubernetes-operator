@@ -1,0 +1,75 @@
+{{/*
+  Licensed to the Apache Software Foundation (ASF) under one
+  or more contributor license agreements.  See the NOTICE file
+  distributed with this work for additional information
+  regarding copyright ownership.  The ASF licenses this file
+  to you under the Apache License, Version 2.0 (the
+  "License"); you may not use this file except in compliance
+  with the License.  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+ limitations under the License.
+*/}}
+
+{{/*
+ValidatingAdmissionPolicy to prevent direct modifications to FlinkDeployments
+that are managed by a FlinkBlueGreenDeployment.
+
+This policy uses CEL expressions evaluated by the Kubernetes API server directly,
+requiring no webhook server. Requires Kubernetes 1.30+ (GA) or 1.26+ (beta with
+feature gate enabled).
+
+When a user tries to UPDATE a FlinkDeployment that has an ownerReference to a
+FlinkBlueGreenDeployment, the request is denied unless it comes from the
+operator's service account.
+*/}}
+
+{{- if .Values.blueGreenAdmissionPolicy.create }}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "flink-operator.name" . }}-block-bluegreen-direct-updates
+  labels:
+    {{- include "flink-operator.labels" . | nindent 4 }}
+spec:
+  failurePolicy: {{ .Values.blueGreenAdmissionPolicy.failurePolicy | default "Fail" }}
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["flink.apache.org"]
+        apiVersions: ["*"]
+        operations: ["UPDATE"]
+        resources: ["flinkdeployments"]
+  validations:
+    - expression: |
+        !has(object.metadata.ownerReferences) ||
+        !object.metadata.ownerReferences.exists(ref, ref.kind == 'FlinkBlueGreenDeployment') ||
+        request.userInfo.username == 'system:serviceaccount:{{ .Release.Namespace }}:{{ include "flink-operator.serviceAccountName" . }}'
+      message: >-
+        FlinkDeployments managed by FlinkBlueGreenDeployment cannot be modified directly.
+        Please update the parent FlinkBlueGreenDeployment instead.
+      reason: Forbidden
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "flink-operator.name" . }}-block-bluegreen-direct-updates-binding
+  labels:
+    {{- include "flink-operator.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "flink-operator.name" . }}-block-bluegreen-direct-updates
+  validationActions:
+    {{- toYaml .Values.blueGreenAdmissionPolicy.validationActions | nindent 4 }}
+  {{- with .Values.blueGreenAdmissionPolicy.matchResources }}
+  matchResources:
+    {{- toYaml . | nindent 4 }}
+  {{- else }}
+  matchResources: {}
+  {{- end }}
+{{- end }}
+
