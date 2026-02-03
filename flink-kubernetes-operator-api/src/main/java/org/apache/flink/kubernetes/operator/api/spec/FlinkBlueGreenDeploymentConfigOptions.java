@@ -53,7 +53,7 @@ public class FlinkBlueGreenDeploymentConfigOptions {
     public static final ConfigOption<Duration> ABORT_GRACE_PERIOD =
             operatorConfig("abort.grace-period")
                     .durationType()
-                    .defaultValue(Duration.ofMinutes(10))
+                    .defaultValue(Duration.ofMinutes(15))
                     .withDescription(
                             "The max time to wait for a deployment to become ready before aborting it.");
 
