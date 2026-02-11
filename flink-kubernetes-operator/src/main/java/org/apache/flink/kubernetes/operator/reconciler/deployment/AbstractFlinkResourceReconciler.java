@@ -34,6 +34,7 @@ import org.apache.flink.kubernetes.operator.api.status.ReconciliationState;
 import org.apache.flink.kubernetes.operator.autoscaler.KubernetesJobAutoScalerContext;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
+import org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService;
 import org.apache.flink.kubernetes.operator.reconciler.Reconciler;
 import org.apache.flink.kubernetes.operator.reconciler.ReconciliationUtils;
 import org.apache.flink.kubernetes.operator.reconciler.diff.DiffResult;
@@ -129,6 +130,22 @@ public abstract class AbstractFlinkResourceReconciler<
                 cr.getStatus().getReconciliationStatus().deserializeLastReconciledSpec();
         SPEC currentDeploySpec = cr.getSpec();
 
+        // For B/G owned children, capture whether there's a user/parent-initiated spec change
+        // BEFORE the autoscaler modifies the in-memory spec. This lets us distinguish
+        // autoscaler-induced changes from parent-initiated changes.
+        boolean isBlueGreenOwned = isBlueGreenOwnedDeployment(ctx);
+        boolean hasPreAutoscalerSpecChange = false;
+        if (isBlueGreenOwned) {
+            hasPreAutoscalerSpecChange =
+                    DiffType.IGNORE
+                            != new ReflectiveDiffBuilder<>(
+                                            ctx.getDeploymentMode(),
+                                            lastReconciledSpec,
+                                            currentDeploySpec)
+                                    .build()
+                                    .getType();
+        }
+
         applyAutoscaler(ctx);
 
         var reconciliationState = reconciliationStatus.getState();
@@ -152,6 +169,23 @@ public abstract class AbstractFlinkResourceReconciler<
             if (checkNewSpecAlreadyDeployed(cr, deployConfig)) {
                 return;
             }
+
+            // For B/G owned children: if the diff is PURELY from the autoscaler
+            // (no pre-existing spec change from parent), skip ALL in-place processing.
+            // This covers both horizontal (SCALE) and vertical (UPGRADE) autoscaler changes.
+            // The B/G parent controller will detect this via lastReconciledSpec and trigger
+            // a Blue/Green transition instead.
+            if (isBlueGreenOwned && !hasPreAutoscalerSpecChange) {
+                LOG.info(
+                        "Skipping autoscaler-induced spec change ({}) for B/G owned '{}'. "
+                                + "Changes will be handled via Blue/Green transition.",
+                        diffType,
+                        cr.getMetadata().getName());
+                ReconciliationUtils.updateStatusForDeployedSpec(
+                        ctx.getResource(), deployConfig, clock);
+                return;
+            }
+
             triggerSpecChangeEvent(cr, specDiff, ctx.getKubernetesClient());
 
             // Try scaling if this is not an upgrade/redeploy change
@@ -352,9 +386,15 @@ public abstract class AbstractFlinkResourceReconciler<
      * Scale the cluster in-place if possible, either through reactive scaling or declarative
      * resources.
      *
+     * <p>Note: In-place scaling is skipped for FlinkDeployments owned by a
+     * FlinkBlueGreenDeployment. Blue/Green deployments handle scaling through full transitions
+     * instead, where autoscaler changes are propagated to the parent and trigger a new deployment.
+     * When scaling is skipped for B/G owned deployments, we return true to prevent the reconciler
+     * from attempting a full job restart, and update the status to record the spec change.
+     *
      * @param ctx Resource context.
      * @param deployConfig Configuration to be deployed.
-     * @return True if the scaling is successful
+     * @return True if the scaling is successful or handled externally (e.g., by B/G parent)
      * @throws Exception
      */
     private boolean scale(FlinkResourceContext<CR> ctx, Configuration deployConfig)
@@ -367,6 +407,18 @@ public abstract class AbstractFlinkResourceReconciler<
         }
 
         return scaled;
+    }
+
+    /**
+     * Checks if the current resource is a FlinkDeployment owned by a FlinkBlueGreenDeployment.
+     *
+     * @param ctx the resource context
+     * @return true if the resource is a B/G owned FlinkDeployment
+     */
+    private boolean isBlueGreenOwnedDeployment(FlinkResourceContext<CR> ctx) {
+        return ctx.getResource() instanceof FlinkDeployment
+                && BlueGreenKubernetesService.isOwnedByBlueGreenDeployment(
+                        (FlinkDeployment) ctx.getResource());
     }
 
     /**

@@ -366,6 +366,20 @@ public class BlueGreenUtils {
 
         flinkDeployment.setSpec(spec.getTemplate().getSpec());
 
+        // Explicitly set job.state to ensure it's not null (which could cause merge issues)
+        // If the parent spec has an explicit state, use it; otherwise default to RUNNING
+        var parentJobState = spec.getTemplate().getSpec().getJob().getState();
+        if (parentJobState == null) {
+            flinkDeployment
+                    .getSpec()
+                    .getJob()
+                    .setState(org.apache.flink.kubernetes.operator.api.spec.JobState.RUNNING);
+            LOG.info("Job state was null, explicitly setting to RUNNING");
+        } else {
+            flinkDeployment.getSpec().getJob().setState(parentJobState);
+            LOG.info("Using explicit job state from parent: {}", parentJobState);
+        }
+
         // Update Ingress template if exists to prevent path collision between Blue and Green
         IngressSpec ingress = flinkDeployment.getSpec().getIngress();
         if (ingress != null) {

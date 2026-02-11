@@ -20,6 +20,7 @@ package org.apache.flink.kubernetes.operator.controller;
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.PipelineOptions;
 import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.kubernetes.operator.TestUtils;
 import org.apache.flink.kubernetes.operator.TestingFlinkService;
@@ -62,6 +63,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Consumer;
 import java.util.stream.Stream;
 
 import static org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentConfigOptions.ABORT_GRACE_PERIOD;
@@ -255,6 +257,371 @@ public class FlinkBlueGreenDeploymentControllerTest {
         assertEquals(
                 FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
                 rs.reconciledStatus.getBlueGreenState());
+    }
+
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyAutoscalerChangesTriggersBlueGreenTransition(FlinkVersion flinkVersion)
+            throws Exception {
+        var rs =
+                executeBasicDeployment(
+                        flinkVersion, buildAutoscalerEnabledCluster(flinkVersion), false, null);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE, rs.reconciledStatus.getBlueGreenState());
+
+        // Simulate autoscaler adding parallelism overrides to the active Blue child
+        String autoscalerOverrides = "vertex1:4,vertex2:8";
+        simulateAutoscalerOnChild(
+                getChildByColor("blue"),
+                spec ->
+                        spec.getFlinkConfiguration()
+                                .put(
+                                        PipelineOptions.PARALLELISM_OVERRIDES.key(),
+                                        autoscalerOverrides));
+
+        // Reconcile — should trigger a B/G transition
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "Autoscaler changes should trigger transition to Green");
+
+        // Verify: new Green child has the overrides (parent spec is NOT modified)
+        assertEquals(
+                autoscalerOverrides,
+                getChildByColor("green")
+                        .getSpec()
+                        .getFlinkConfiguration()
+                        .asFlatMap()
+                        .get(PipelineOptions.PARALLELISM_OVERRIDES.key()),
+                "Green deployment should have the parallelism overrides");
+
+        // Complete the transition
+        rs = completeTransition(rs, "green");
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "Should be ACTIVE_GREEN after transition completes");
+    }
+
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyVerticalAutoscalerChangesTriggerBlueGreenTransition(FlinkVersion flinkVersion)
+            throws Exception {
+        // Setup: Deploy with initial TM memory and autoscaler enabled
+        var deployment = buildAutoscalerEnabledCluster(flinkVersion);
+        var tmSpec = new TaskManagerSpec();
+        var tmResource = new Resource();
+        tmResource.setMemory("2048m");
+        tmSpec.setResource(tmResource);
+        deployment.getSpec().getTemplate().getSpec().setTaskManager(tmSpec);
+
+        var rs = executeBasicDeployment(flinkVersion, deployment, false, null);
+
+        // Simulate autoscaler performing vertical scaling (memory tuning)
+        String scaledMemory = String.valueOf(4096 * 1024 * 1024L);
+        simulateAutoscalerOnChild(
+                getChildByColor("blue"),
+                spec -> {
+                    spec.getFlinkConfiguration()
+                            .put(TaskManagerOptions.TOTAL_PROCESS_MEMORY.key(), scaledMemory);
+                    spec.getFlinkConfiguration()
+                            .put(TaskManagerOptions.FRAMEWORK_HEAP_MEMORY.key(), "0 bytes");
+                    spec.getTaskManager().getResource().setMemory(scaledMemory);
+                });
+
+        // Reconcile — should trigger a B/G transition
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "Vertical autoscaler changes should trigger transition to Green");
+
+        // Verify Green child has the updated memory
+        var greenChild = getChildByColor("green");
+        assertEquals(
+                scaledMemory,
+                greenChild.getSpec().getTaskManager().getResource().getMemory(),
+                "Green deployment should have the autoscaler's TM memory");
+        assertNotNull(
+                greenChild
+                        .getSpec()
+                        .getFlinkConfiguration()
+                        .get(TaskManagerOptions.TOTAL_PROCESS_MEMORY.key()),
+                "Green deployment should have TM total process memory config");
+    }
+
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyUserParallelismChangeAfterAutoscalerTriggersTransition(
+            FlinkVersion flinkVersion) throws Exception {
+        var rs =
+                executeBasicDeployment(
+                        flinkVersion, buildAutoscalerEnabledCluster(flinkVersion), false, null);
+
+        // Autoscaler adds parallelism overrides → B/G transition → complete to ACTIVE_GREEN
+        simulateAutoscalerOnChild(
+                getChildByColor("blue"),
+                spec ->
+                        spec.getFlinkConfiguration()
+                                .put(
+                                        PipelineOptions.PARALLELISM_OVERRIDES.key(),
+                                        "vertex1:4,vertex2:8"));
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+        rs = completeTransition(rs, "green");
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+
+        // User manually sets parallelism overrides → should trigger a new B/G transition.
+        rs.deployment = kubernetesClient.resource(rs.deployment).get();
+        rs.deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getFlinkConfiguration()
+                .put(PipelineOptions.PARALLELISM_OVERRIDES.key(), "vertex1:2,vertex2:4");
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_BLUE,
+                rs.reconciledStatus.getBlueGreenState(),
+                "User parallelism change after autoscaler should trigger a new transition");
+    }
+
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyUserTmMemoryChangeAfterAutoscalerTriggersTransition(FlinkVersion flinkVersion)
+            throws Exception {
+        var deployment = buildAutoscalerEnabledCluster(flinkVersion);
+        deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getFlinkConfiguration()
+                .put("job.autoscaler.memory.tuning.enabled", "true");
+        var tmSpec = new TaskManagerSpec();
+        var tmResource = new Resource();
+        tmResource.setMemory("2048m");
+        tmSpec.setResource(tmResource);
+        deployment.getSpec().getTemplate().getSpec().setTaskManager(tmSpec);
+
+        var rs = executeBasicDeployment(flinkVersion, deployment, false, null);
+
+        // Autoscaler changes TM memory → B/G transition → complete to ACTIVE_GREEN
+        simulateAutoscalerOnChild(
+                getChildByColor("blue"),
+                spec -> spec.getTaskManager().getResource().setMemory("4096m"));
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+        rs = completeTransition(rs, "green");
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+
+        // User manually changes TM memory → should trigger a new B/G transition.
+        rs.deployment = kubernetesClient.resource(rs.deployment).get();
+        rs.deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getTaskManager()
+                .getResource()
+                .setMemory("3072m");
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_BLUE,
+                rs.reconciledStatus.getBlueGreenState(),
+                "User TM memory change after autoscaler should trigger a new transition");
+    }
+
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyAutoscalerPhantomDiffPreventionAfterTransition(FlinkVersion flinkVersion)
+            throws Exception {
+        var rs =
+                executeBasicDeployment(
+                        flinkVersion, buildAutoscalerEnabledCluster(flinkVersion), false, null);
+
+        // Autoscaler adds parallelism overrides → B/G transition → complete
+        simulateAutoscalerOnChild(
+                getChildByColor("blue"),
+                spec ->
+                        spec.getFlinkConfiguration()
+                                .put(
+                                        PipelineOptions.PARALLELISM_OVERRIDES.key(),
+                                        "vertex1:4,vertex2:8"));
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+        rs = completeTransition(rs, "green");
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+
+        // Subsequent reconciles should NOT trigger spurious transitions.
+        // Parent spec and lastReconciledSpec were never modified with autoscaler values,
+        // so there is no phantom diff. The green child was created with overrides baked into
+        // its K8s spec, and its lastReconciledSpec matches (no further autoscaler diff).
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "No phantom diff — should remain ACTIVE_GREEN");
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "Should still be ACTIVE_GREEN after multiple reconciles");
+    }
+
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyAutoscalerRetriggersAfterAbortedTransition(FlinkVersion flinkVersion)
+            throws Exception {
+        var rs =
+                executeBasicDeployment(
+                        flinkVersion, buildAutoscalerEnabledCluster(flinkVersion), false, null);
+
+        // Autoscaler adds parallelism overrides → triggers B/G transition
+        String autoscalerOverrides = "vertex1:4,vertex2:8";
+        simulateAutoscalerOnChild(
+                getChildByColor("blue"),
+                spec ->
+                        spec.getFlinkConfiguration()
+                                .put(
+                                        PipelineOptions.PARALLELISM_OVERRIDES.key(),
+                                        autoscalerOverrides));
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+
+        // Green child fails to start — abort after grace period.
+        Thread.sleep(MINIMUM_ABORT_GRACE_PERIOD);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
+                rs.reconciledStatus.getBlueGreenState(),
+                "Should roll back to ACTIVE_BLUE after abort");
+
+        // Clean up stale Green child. Blue is already stable with autoscaler overrides
+        // still in its lastReconciledSpec (abort is a parent-level operation and does not
+        // touch the Blue child's status).
+        try {
+            kubernetesClient.resource(getChildByColor("green")).delete();
+        } catch (AssertionError ignored) {
+            // Green may already be deleted
+        }
+
+        // Next reconcile should re-detect autoscaler diff and re-trigger transition
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "Should re-trigger transition after abort (not permanently stuck)");
+    }
+
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyAutoscalerTransitionWithSavepointUpgradeMode(FlinkVersion flinkVersion)
+            throws Exception {
+        // Setup: SAVEPOINT upgrade mode with autoscaler enabled
+        var deployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+        deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getFlinkConfiguration()
+                .put("job.autoscaler.enabled", "true");
+
+        var rs = executeBasicDeployment(flinkVersion, deployment, false, null);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE, rs.reconciledStatus.getBlueGreenState());
+
+        // Simulate autoscaler adding parallelism overrides to the active Blue child
+        String autoscalerOverrides = "vertex1:4,vertex2:8";
+        simulateAutoscalerOnChild(
+                getChildByColor("blue"),
+                spec ->
+                        spec.getFlinkConfiguration()
+                                .put(
+                                        PipelineOptions.PARALLELISM_OVERRIDES.key(),
+                                        autoscalerOverrides));
+
+        // Drive the savepoint flow — reuse the existing handleSavepoint helper.
+        // First reconcile detects overrides and triggers a savepoint → SAVEPOINTING_BLUE
+        var triggers = flinkService.getSavepointTriggers();
+        triggers.clear();
+
+        rs = reconcile(rs.deployment);
+
+        // Simulating a pending savepoint
+        triggers.put(rs.deployment.getStatus().getSavepointTriggerId(), false);
+
+        assertEquals(
+                FlinkBlueGreenDeploymentState.SAVEPOINTING_BLUE,
+                rs.reconciledStatus.getBlueGreenState(),
+                "Autoscaler transition should enter SAVEPOINTING_BLUE for SAVEPOINT upgrade mode");
+        assertTrue(rs.updateControl.isPatchStatus());
+
+        // Next reconciliation waits on the pending savepoint
+        rs = reconcile(rs.deployment);
+        assertTrue(rs.updateControl.isNoUpdate());
+
+        // Complete the savepoint
+        triggers.put(rs.deployment.getStatus().getSavepointTriggerId(), true);
+        rs = reconcile(rs.deployment);
+
+        // Should return to ACTIVE_BLUE after savepoint completes
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
+                rs.reconciledStatus.getBlueGreenState(),
+                "Should return to ACTIVE_BLUE after savepoint completes");
+
+        // Next reconcile re-detects autoscaler overrides and starts the actual transition
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "Should transition to Green after savepoint completes");
+
+        // Verify: Green child has the autoscaler overrides
+        assertEquals(
+                autoscalerOverrides,
+                getChildByColor("green")
+                        .getSpec()
+                        .getFlinkConfiguration()
+                        .asFlatMap()
+                        .get(PipelineOptions.PARALLELISM_OVERRIDES.key()),
+                "Green deployment should have the parallelism overrides");
+
+        // Verify: Green child uses the savepoint (not null)
+        assertNotNull(
+                getChildByColor("green").getSpec().getJob().getInitialSavepointPath(),
+                "Green deployment should use a savepoint path");
+
+        // Complete the transition
+        rs = completeTransition(rs, "green");
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "Should be ACTIVE_GREEN after transition completes");
     }
 
     @ParameterizedTest
@@ -1105,6 +1472,64 @@ public class FlinkBlueGreenDeploymentControllerTest {
                         UpgradeMode.STATELESS);
         return executeBasicDeployment(
                 flinkVersion, blueGreenDeployment, false, TEST_INITIAL_SAVEPOINT_PATH);
+    }
+
+    // ---- Autoscaler Test Helpers ----
+
+    /** Builds a session cluster with the autoscaler enabled in the parent's flinkConfiguration. */
+    private FlinkBlueGreenDeployment buildAutoscalerEnabledCluster(FlinkVersion flinkVersion) {
+        var deployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.STATELESS);
+        deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getFlinkConfiguration()
+                .put("job.autoscaler.enabled", "true");
+        return deployment;
+    }
+
+    /**
+     * Simulates the autoscaler modifying the child's in-memory spec. Applies the given mutation to
+     * the child's spec, serializes it into lastReconciledSpec, marks it stable, and updates status.
+     */
+    private void simulateAutoscalerOnChild(
+            FlinkDeployment child, Consumer<FlinkDeploymentSpec> specMutation) {
+        var spec = child.getSpec();
+        specMutation.accept(spec);
+        child.getStatus().getReconciliationStatus().serializeAndSetLastReconciledSpec(spec, child);
+        child.getStatus().getReconciliationStatus().markReconciledSpecAsStable();
+        kubernetesClient.resource(child).updateStatus();
+    }
+
+    /** Finds a child FlinkDeployment by color suffix ("blue" or "green"). */
+    private FlinkDeployment getChildByColor(String color) {
+        return getFlinkDeployments().stream()
+                .filter(d -> d.getMetadata().getName().endsWith("-" + color))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("No " + color + " child found"));
+    }
+
+    /**
+     * Drives a B/G transition to completion: simulates a successful job start on the target child,
+     * waits for the deletion delay, and reconciles until the new color is active.
+     */
+    private TestingFlinkBlueGreenDeploymentController.BlueGreenReconciliationResult
+            completeTransition(
+                    TestingFlinkBlueGreenDeploymentController.BlueGreenReconciliationResult rs,
+                    String targetColor)
+                    throws Exception {
+        simulateSuccessfulJobStart(getChildByColor(targetColor));
+        rs = reconcile(rs.deployment);
+        Thread.sleep(rs.updateControl.getScheduleDelay().get());
+        reconcile(rs.deployment);
+        assertEquals(1, getFlinkDeployments().size());
+        return reconcile(rs.deployment);
     }
 
     private ReconcileResult reconcileAndVerifyPatchBehavior(
