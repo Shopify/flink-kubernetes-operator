@@ -750,8 +750,11 @@ public class BlueGreenDeploymentService {
         // Clear stale savepointTriggerId to prevent reuse after abort (defense-in-depth).
         context.getDeploymentStatus().setSavepointTriggerId(null);
 
-        // Autoscaler overrides persist in the active child's lastReconciledSpec
-        // and will be re-detected on the next ACTIVE reconcile.
+        // Autoscaler overrides persist in the active child's lastReconciledSpec.
+        // They will NOT be re-detected immediately because markDeploymentFailing sets
+        // FAILING, and the FAILING guard in checkAndInitiateDeployment blocks autoscaler
+        // checks — preventing an infinite abort→re-trigger→abort loop.
+        // A user spec change is required to clear FAILING and unblock transitions.
 
         FlinkBlueGreenDeploymentState previousState =
                 getPreviousState(nextState, context.getDeployments());
@@ -930,7 +933,7 @@ public class BlueGreenDeploymentService {
         // automatically, including future autoscaler capabilities.
         var autoscalerDiff =
                 new ReflectiveDiffBuilder<>(
-                                KubernetesDeploymentMode.NATIVE,
+                                KubernetesDeploymentMode.getDeploymentMode(activeChild),
                                 childKubeSpec,
                                 childLastReconciledSpec)
                         .build();
