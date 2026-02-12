@@ -386,15 +386,9 @@ public abstract class AbstractFlinkResourceReconciler<
      * Scale the cluster in-place if possible, either through reactive scaling or declarative
      * resources.
      *
-     * <p>Note: In-place scaling is skipped for FlinkDeployments owned by a
-     * FlinkBlueGreenDeployment. Blue/Green deployments handle scaling through full transitions
-     * instead, where autoscaler changes are propagated to the parent and trigger a new deployment.
-     * When scaling is skipped for B/G owned deployments, we return true to prevent the reconciler
-     * from attempting a full job restart, and update the status to record the spec change.
-     *
      * @param ctx Resource context.
      * @param deployConfig Configuration to be deployed.
-     * @return True if the scaling is successful or handled externally (e.g., by B/G parent)
+     * @return True if the scaling is successful
      * @throws Exception
      */
     private boolean scale(FlinkResourceContext<CR> ctx, Configuration deployConfig)

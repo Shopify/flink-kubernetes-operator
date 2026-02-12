@@ -486,7 +486,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
 
     @ParameterizedTest
     @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
-    public void verifyAutoscalerRetriggersAfterAbortedTransition(FlinkVersion flinkVersion)
+    public void verifyAutoscalerDoesNotRetriggerAfterAbortedTransition(FlinkVersion flinkVersion)
             throws Exception {
         var rs =
                 executeBasicDeployment(
@@ -514,21 +514,22 @@ public class FlinkBlueGreenDeploymentControllerTest {
                 rs.reconciledStatus.getBlueGreenState(),
                 "Should roll back to ACTIVE_BLUE after abort");
 
-        // Clean up stale Green child. Blue is already stable with autoscaler overrides
-        // still in its lastReconciledSpec (abort is a parent-level operation and does not
-        // touch the Blue child's status).
+        // Clean up stale Green child.
         try {
             kubernetesClient.resource(getChildByColor("green")).delete();
         } catch (AssertionError ignored) {
             // Green may already be deleted
         }
 
-        // Next reconcile should re-detect autoscaler diff and re-trigger transition
+        // After abort the parent is in FAILING state. The FAILING guard prevents the
+        // autoscaler from re-triggering the same overrides that just failed — this avoids
+        // an infinite abort→re-trigger→abort loop. A user spec change is required to
+        // clear FAILING and unblock new transitions.
         rs = reconcile(rs.deployment);
         assertEquals(
-                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
                 rs.reconciledStatus.getBlueGreenState(),
-                "Should re-trigger transition after abort (not permanently stuck)");
+                "Should remain ACTIVE_BLUE (FAILING) — autoscaler must not re-trigger after abort");
     }
 
     @ParameterizedTest

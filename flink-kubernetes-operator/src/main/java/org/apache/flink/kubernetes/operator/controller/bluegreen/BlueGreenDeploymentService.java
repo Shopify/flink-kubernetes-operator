@@ -22,9 +22,12 @@ import org.apache.flink.kubernetes.operator.api.FlinkBlueGreenDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDeploymentType;
 import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDiffType;
+import org.apache.flink.kubernetes.operator.api.diff.DiffType;
 import org.apache.flink.kubernetes.operator.api.lifecycle.ResourceLifecycleState;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentSpec;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentSpec;
+import org.apache.flink.kubernetes.operator.api.spec.JobState;
+import org.apache.flink.kubernetes.operator.api.spec.KubernetesDeploymentMode;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState;
 import org.apache.flink.kubernetes.operator.api.status.Savepoint;
 import org.apache.flink.kubernetes.operator.api.status.SavepointFormatType;
@@ -33,6 +36,7 @@ import org.apache.flink.kubernetes.operator.api.utils.SpecUtils;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.controller.FlinkBlueGreenDeployments;
 import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
+import org.apache.flink.kubernetes.operator.reconciler.diff.ReflectiveDiffBuilder;
 import org.apache.flink.kubernetes.operator.utils.IngressUtils;
 import org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils;
 import org.apache.flink.util.Preconditions;
@@ -47,8 +51,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
-import java.util.HashMap;
-import java.util.Map;
 import java.util.Objects;
 
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.deleteFlinkDeployment;
@@ -89,6 +91,29 @@ public class BlueGreenDeploymentService {
             FlinkBlueGreenDeploymentState nextState,
             Savepoint lastCheckpoint,
             boolean isFirstDeployment) {
+        return initiateDeployment(
+                context,
+                nextBlueGreenDeploymentType,
+                nextState,
+                lastCheckpoint,
+                isFirstDeployment,
+                null);
+    }
+
+    /**
+     * Initiates a new Blue/Green deployment, optionally using a pre-built spec override.
+     *
+     * @param specOverride if non-null, used as the source spec for child creation instead of the
+     *     parent's current spec. This is used by autoscaler-triggered transitions to pass overrides
+     *     without mutating the parent's in-memory spec.
+     */
+    private UpdateControl<FlinkBlueGreenDeployment> initiateDeployment(
+            BlueGreenContext context,
+            BlueGreenDeploymentType nextBlueGreenDeploymentType,
+            FlinkBlueGreenDeploymentState nextState,
+            Savepoint lastCheckpoint,
+            boolean isFirstDeployment,
+            @Nullable FlinkBlueGreenDeploymentSpec specOverride) {
         ObjectMeta bgMeta = context.getBgDeployment().getMetadata();
 
         FlinkDeployment flinkDeployment =
@@ -97,7 +122,8 @@ public class BlueGreenDeploymentService {
                         nextBlueGreenDeploymentType,
                         lastCheckpoint,
                         isFirstDeployment,
-                        bgMeta);
+                        bgMeta,
+                        specOverride);
 
         deployCluster(context, flinkDeployment);
 
@@ -243,9 +269,7 @@ public class BlueGreenDeploymentService {
             return false;
         }
         var job = deployment.getSpec().getJob();
-        return job != null
-                && job.getState()
-                        == org.apache.flink.kubernetes.operator.api.spec.JobState.SUSPENDED;
+        return job != null && job.getState() == JobState.SUSPENDED;
     }
 
     private UpdateControl<FlinkBlueGreenDeployment> patchFlinkDeployment(
@@ -324,6 +348,21 @@ public class BlueGreenDeploymentService {
             BlueGreenContext context,
             BlueGreenDeploymentType currentBlueGreenDeploymentType,
             FlinkDeployment currentFlinkDeployment) {
+        return startTransition(
+                context, currentBlueGreenDeploymentType, currentFlinkDeployment, null);
+    }
+
+    /**
+     * Starts a B/G transition, optionally using a pre-built spec override for the new child.
+     *
+     * @param specOverride if non-null, passed through to {@code prepareFlinkDeployment} so the new
+     *     child is created from this spec instead of the parent's current spec.
+     */
+    private UpdateControl<FlinkBlueGreenDeployment> startTransition(
+            BlueGreenContext context,
+            BlueGreenDeploymentType currentBlueGreenDeploymentType,
+            FlinkDeployment currentFlinkDeployment,
+            @Nullable FlinkBlueGreenDeploymentSpec specOverride) {
         DeploymentTransition transition = calculateTransition(currentBlueGreenDeploymentType);
 
         LOG.info(
@@ -340,7 +379,8 @@ public class BlueGreenDeploymentService {
                 transition.nextBlueGreenDeploymentType,
                 transition.nextState,
                 lastCheckpoint,
-                false);
+                false,
+                specOverride);
     }
 
     /**
@@ -854,9 +894,9 @@ public class BlueGreenDeploymentService {
 
     /**
      * Detects autoscaler overrides on the active child and initiates a B/G transition if any are
-     * found. Overrides are applied ephemerally to the parent's in-memory spec so the new child
-     * inherits them via {@code prepareFlinkDeployment}; the parent spec is restored in a finally
-     * block to prevent phantom diffs.
+     * found. A merged spec copy (parent spec + overrides) is built and passed explicitly to the
+     * transition flow so the new child inherits the overrides without mutating the parent's
+     * in-memory spec.
      *
      * @return UpdateControl if a transition was initiated, or {@code null} if no overrides
      */
@@ -884,20 +924,26 @@ public class BlueGreenDeploymentService {
         }
 
         FlinkDeploymentSpec childKubeSpec = activeChild.getSpec();
-        Map<String, String> configOverrides =
-                detectConfigOverrides(childKubeSpec, childLastReconciledSpec);
-        String tmMemoryOverride = detectTmMemoryOverride(childKubeSpec, childLastReconciledSpec);
 
-        if (configOverrides.isEmpty() && tmMemoryOverride == null) {
+        // Use the same diff infrastructure as the child reconciler to detect overrides.
+        // This keeps both layers in sync — any field the autoscaler modifies is caught
+        // automatically, including future autoscaler capabilities.
+        var autoscalerDiff =
+                new ReflectiveDiffBuilder<>(
+                                KubernetesDeploymentMode.NATIVE,
+                                childKubeSpec,
+                                childLastReconciledSpec)
+                        .build();
+
+        if (autoscalerDiff.getType() == DiffType.IGNORE) {
             return null; // No autoscaler changes — nothing to do
         }
 
         LOG.info(
-                "Autoscaler overrides detected on child '{}' (config keys: {}, TM memory: {}). "
+                "Autoscaler overrides detected on child '{}' (diffType: {}). "
                         + "Initiating Blue/Green transition.",
                 activeChild.getMetadata().getName(),
-                configOverrides.size(),
-                tmMemoryOverride != null);
+                autoscalerDiff.getType());
 
         // Handle savepoint if required — reuses the existing savepoint flow.
         // Do NOT call setLastReconciledSpec before SAVEPOINTING so overrides
@@ -916,112 +962,58 @@ public class BlueGreenDeploymentService {
             return markDeploymentFailing(context, error, e);
         }
 
-        // Serialize the clean parent spec BEFORE applying in-memory overrides.
+        // Serialize the clean parent spec (without overrides) as the lastReconciledSpec.
         setLastReconciledSpec(context);
 
-        // Capture the clean spec JSON in a local variable so the finally-block restore is
-        // decoupled from whatever may happen to deploymentStatus.lastReconciledSpec inside
-        // startTransition (defensive — nothing modifies it today, but this avoids a subtle
-        // implicit contract).
-        final String cleanSpecJson = context.getDeploymentStatus().getLastReconciledSpec();
-
-        // Apply overrides to the parent's in-memory spec (ephemeral — not persisted to K8s).
-        // prepareFlinkDeployment deep-copies from this spec, so the new child gets the overrides.
-        applyOverridesToParentSpec(context, configOverrides, tmMemoryOverride);
+        // Build a merged spec: deep-copy the parent and swap in the child's
+        // lastReconciledSpec as the template.  Since we only reach this path when
+        // there are no user spec changes, the child's lastReconciledSpec already
+        // equals the parent's template spec + all autoscaler modifications.
+        FlinkBlueGreenDeploymentSpec mergedSpec = buildMergedSpec(context, childLastReconciledSpec);
 
         try {
-            // Use the existing transition flow — same path as user-triggered transitions.
-            return startTransition(context, currentType, activeChild);
+            return startTransition(context, currentType, activeChild, mergedSpec);
         } catch (Exception e) {
             var error = "Could not start autoscaler transition. Details: " + e.getMessage();
             context.getDeploymentStatus().setSavepointTriggerId(null);
             return markDeploymentFailing(context, error, e);
-        } finally {
-            // Restore the parent's in-memory spec to the clean version (before autoscaler
-            // overrides). The new child already received the overrides via deep copy in
-            // prepareFlinkDeployment. Without this restoration,
-            // handleSpecChangesDuringTransition would detect a phantom diff on the next
-            // reconcile (parent spec with overrides vs clean lastReconciledSpec).
-            context.getBgDeployment()
-                    .setSpec(
-                            SpecUtils.readSpecFromJSON(
-                                    cleanSpecJson, "spec", FlinkBlueGreenDeploymentSpec.class));
         }
     }
 
     /**
-     * Detects flinkConfiguration keys that the autoscaler added or changed in lastReconciledSpec
-     * relative to the child's K8s spec. Only scans keys present in lastReconciledSpec — keys
-     * removed from lastReconciledSpec (but still in K8s spec) are intentionally not detected, as
-     * autoscalers add/modify overrides but do not remove them.
+     * Builds a spec for the new child by deep-copying the parent and overwriting only the fields
+     * the autoscaler modifies ({@code flinkConfiguration} and {@code taskManager}).
+     *
+     * <p>We copy these fields <em>wholesale</em> from the child's {@code lastReconciledSpec} rather
+     * than computing per-key deltas. Because we only reach this path when there are no user spec
+     * changes, the child's config/TM equals {@code parentValue + autoscalerDelta}; copying the
+     * whole field implicitly handles additions, changes, <b>and removals</b>.
+     *
+     * <p>We intentionally do <b>not</b> replace the entire {@code template.spec} because the
+     * child's {@link FlinkDeploymentSpec} contains deployment-specific transformations applied by
+     * {@code prepareFlinkDeployment} (e.g., ingress template prefixed with {@code blue-}/{@code
+     * green-}) that must not leak back into the parent's template.
      */
-    private Map<String, String> detectConfigOverrides(
-            FlinkDeploymentSpec childKubeSpec, FlinkDeploymentSpec childLastReconciledSpec) {
+    private FlinkBlueGreenDeploymentSpec buildMergedSpec(
+            BlueGreenContext context, FlinkDeploymentSpec childLastReconciledSpec) {
 
-        Map<String, String> kubeConfig =
-                childKubeSpec.getFlinkConfiguration() != null
-                        ? childKubeSpec.getFlinkConfiguration().asFlatMap()
-                        : Map.of();
-        Map<String, String> reconConfig =
-                childLastReconciledSpec.getFlinkConfiguration() != null
-                        ? childLastReconciledSpec.getFlinkConfiguration().asFlatMap()
-                        : Map.of();
+        // Deep copy the parent spec via JSON round-trip to avoid mutation.
+        FlinkBlueGreenDeploymentSpec merged =
+                SpecUtils.readSpecFromJSON(
+                        SpecUtils.writeSpecAsJSON(context.getBgDeployment().getSpec(), "spec"),
+                        "spec",
+                        FlinkBlueGreenDeploymentSpec.class);
 
-        Map<String, String> overrides = new HashMap<>();
-        for (Map.Entry<String, String> entry : reconConfig.entrySet()) {
-            if (!entry.getValue().equals(kubeConfig.get(entry.getKey()))) {
-                overrides.put(entry.getKey(), entry.getValue());
-            }
-        }
-        return overrides;
-    }
+        // Overwrite only the autoscaler-managed fields (KubernetesScalingRealizer touches
+        // flinkConfiguration and taskManager.resource.memory — nothing else).
+        // Copying wholesale avoids per-key delta logic and naturally propagates config
+        // key removals (e.g., from memory tuning) that would otherwise cause phantom
+        // transition loops.
+        var parentFlinkSpec = merged.getTemplate().getSpec();
+        parentFlinkSpec.setFlinkConfiguration(childLastReconciledSpec.getFlinkConfiguration());
+        parentFlinkSpec.setTaskManager(childLastReconciledSpec.getTaskManager());
 
-    /** Detects taskManager.resource.memory override (lastReconciledSpec differs from K8s spec). */
-    @Nullable
-    private String detectTmMemoryOverride(
-            FlinkDeploymentSpec childKubeSpec, FlinkDeploymentSpec childLastReconciledSpec) {
-        String kubeMemory = getTaskManagerMemory(childKubeSpec);
-        String reconMemory = getTaskManagerMemory(childLastReconciledSpec);
-        return (reconMemory != null && !reconMemory.equals(kubeMemory)) ? reconMemory : null;
-    }
-
-    @Nullable
-    private String getTaskManagerMemory(FlinkDeploymentSpec spec) {
-        if (spec == null
-                || spec.getTaskManager() == null
-                || spec.getTaskManager().getResource() == null) {
-            return null;
-        }
-        return spec.getTaskManager().getResource().getMemory();
-    }
-
-    /**
-     * Applies autoscaler overrides to the parent's in-memory spec. This is ephemeral — the parent's
-     * K8s spec is never modified. {@code prepareFlinkDeployment} deep-copies from the parent spec,
-     * so the new child will include these overrides in its K8s spec.
-     */
-    private void applyOverridesToParentSpec(
-            BlueGreenContext context,
-            Map<String, String> configOverrides,
-            @Nullable String tmMemoryOverride) {
-
-        var spec = context.getBgDeployment().getSpec().getTemplate().getSpec();
-
-        if (!configOverrides.isEmpty() && spec.getFlinkConfiguration() != null) {
-            configOverrides.forEach((k, v) -> spec.getFlinkConfiguration().put(k, v));
-        }
-
-        if (tmMemoryOverride != null) {
-            if (spec.getTaskManager() == null) {
-                spec.setTaskManager(
-                        new org.apache.flink.kubernetes.operator.api.spec.TaskManagerSpec());
-            }
-            if (spec.getTaskManager().getResource() == null) {
-                spec.getTaskManager()
-                        .setResource(new org.apache.flink.kubernetes.operator.api.spec.Resource());
-            }
-            spec.getTaskManager().getResource().setMemory(tmMemoryOverride);
-        }
+        return merged;
     }
 
     /**
@@ -1065,7 +1057,7 @@ public class BlueGreenDeploymentService {
             deploymentStatus.setError(null);
         }
 
-        deploymentStatus.setLastReconciledTimestamp(java.time.Instant.now().toString());
+        deploymentStatus.setLastReconciledTimestamp(Instant.now().toString());
         flinkBlueGreenDeployment.setStatus(deploymentStatus);
         return UpdateControl.patchStatus(flinkBlueGreenDeployment);
     }
