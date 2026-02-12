@@ -22,14 +22,21 @@ import org.apache.flink.kubernetes.operator.api.FlinkBlueGreenDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDeploymentType;
 import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDiffType;
+import org.apache.flink.kubernetes.operator.api.diff.DiffType;
 import org.apache.flink.kubernetes.operator.api.lifecycle.ResourceLifecycleState;
+import org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentSpec;
+import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentSpec;
+import org.apache.flink.kubernetes.operator.api.spec.JobState;
+import org.apache.flink.kubernetes.operator.api.spec.KubernetesDeploymentMode;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState;
 import org.apache.flink.kubernetes.operator.api.status.Savepoint;
 import org.apache.flink.kubernetes.operator.api.status.SavepointFormatType;
 import org.apache.flink.kubernetes.operator.api.status.SnapshotTriggerType;
+import org.apache.flink.kubernetes.operator.api.utils.SpecUtils;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.controller.FlinkBlueGreenDeployments;
 import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
+import org.apache.flink.kubernetes.operator.reconciler.diff.ReflectiveDiffBuilder;
 import org.apache.flink.kubernetes.operator.utils.IngressUtils;
 import org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils;
 import org.apache.flink.util.Preconditions;
@@ -53,7 +60,6 @@ import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGree
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.fetchSavepointInfo;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.getReconciliationReschedInterval;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.getSpecDiff;
-import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.hasSpecChanged;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.instantStrToMillis;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.isSavepointRequired;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.millisToInstantStr;
@@ -69,22 +75,33 @@ public class BlueGreenDeploymentService {
 
     // ==================== Deployment Initiation Methods ====================
 
-    /**
-     * Initiates a new Blue/Green deployment.
-     *
-     * @param context the transition context
-     * @param nextBlueGreenDeploymentType the type of deployment to create
-     * @param nextState the next state to transition to
-     * @param lastCheckpoint the checkpoint to restore from (can be null)
-     * @param isFirstDeployment whether this is the first deployment
-     * @return UpdateControl for the deployment
-     */
+    /** Convenience overload without spec override. */
     public UpdateControl<FlinkBlueGreenDeployment> initiateDeployment(
             BlueGreenContext context,
             BlueGreenDeploymentType nextBlueGreenDeploymentType,
             FlinkBlueGreenDeploymentState nextState,
             Savepoint lastCheckpoint,
             boolean isFirstDeployment) {
+        return initiateDeployment(
+                context,
+                nextBlueGreenDeploymentType,
+                nextState,
+                lastCheckpoint,
+                isFirstDeployment,
+                null);
+    }
+
+    /**
+     * Initiates a B/G deployment. If {@code specOverride} is non-null, the new child is created
+     * from it instead of the parent's current spec (used for autoscaler-triggered transitions).
+     */
+    private UpdateControl<FlinkBlueGreenDeployment> initiateDeployment(
+            BlueGreenContext context,
+            BlueGreenDeploymentType nextBlueGreenDeploymentType,
+            FlinkBlueGreenDeploymentState nextState,
+            Savepoint lastCheckpoint,
+            boolean isFirstDeployment,
+            @Nullable FlinkBlueGreenDeploymentSpec specOverride) {
         ObjectMeta bgMeta = context.getBgDeployment().getMetadata();
 
         FlinkDeployment flinkDeployment =
@@ -93,7 +110,8 @@ public class BlueGreenDeploymentService {
                         nextBlueGreenDeploymentType,
                         lastCheckpoint,
                         isFirstDeployment,
-                        bgMeta);
+                        bgMeta,
+                        specOverride);
 
         deployCluster(context, flinkDeployment);
 
@@ -113,6 +131,7 @@ public class BlueGreenDeploymentService {
     public UpdateControl<FlinkBlueGreenDeployment> checkAndInitiateDeployment(
             BlueGreenContext context, BlueGreenDeploymentType currentBlueGreenDeploymentType) {
 
+        // Check user spec changes first (takes precedence over autoscaler changes)
         BlueGreenDiffType specDiff = getSpecDiff(context);
 
         if (specDiff != BlueGreenDiffType.IGNORE) {
@@ -150,7 +169,7 @@ public class BlueGreenDeploymentService {
                         savepointTriggered = handleSavepoint(context, currentFlinkDeployment);
                     } catch (Exception e) {
                         var error = "Could not trigger Savepoint. Details: " + e.getMessage();
-                        return markDeploymentFailing(context, error);
+                        return markDeploymentFailing(context, error, e);
                     }
 
                     if (savepointTriggered) {
@@ -169,7 +188,7 @@ public class BlueGreenDeploymentService {
                     } catch (Exception e) {
                         var error = "Could not start Transition. Details: " + e.getMessage();
                         context.getDeploymentStatus().setSavepointTriggerId(null);
-                        return markDeploymentFailing(context, error);
+                        return markDeploymentFailing(context, error, e);
                     }
 
                 } else if (specDiff == BlueGreenDiffType.SAVEPOINT_REDEPLOY) {
@@ -188,7 +207,7 @@ public class BlueGreenDeploymentService {
                         var error =
                                 "Could not start Savepoint Redeploy Transition. Details: "
                                         + e.getMessage();
-                        return markDeploymentFailing(context, error);
+                        return markDeploymentFailing(context, error, e);
                     }
                 } else {
                     setLastReconciledSpec(context);
@@ -216,6 +235,20 @@ public class BlueGreenDeploymentService {
             }
         }
 
+        // No user spec changes — check if autoscaler produced overrides on the active child.
+        // If so, trigger a B/G transition with those overrides applied to the new child.
+        // Skip when FAILING to prevent an infinite loop: abort sets FAILING and rolls back
+        // to ACTIVE, but the old child still has the same autoscaler overrides → re-detected
+        // → new transition → abort → re-detected → ... A user spec change clears FAILING
+        // via the normal transition path above (sets RECONCILING in initiateDeployment).
+        if (context.getDeploymentStatus().getJobStatus().getState() != JobStatus.FAILING) {
+            var autoscalerResult =
+                    checkAutoscalerTriggeredTransition(context, currentBlueGreenDeploymentType);
+            if (autoscalerResult != null) {
+                return autoscalerResult;
+            }
+        }
+
         return UpdateControl.noUpdate();
     }
 
@@ -224,9 +257,7 @@ public class BlueGreenDeploymentService {
             return false;
         }
         var job = deployment.getSpec().getJob();
-        return job != null
-                && job.getState()
-                        == org.apache.flink.kubernetes.operator.api.spec.JobState.SUSPENDED;
+        return job != null && job.getState() == JobState.SUSPENDED;
     }
 
     private UpdateControl<FlinkBlueGreenDeployment> patchFlinkDeployment(
@@ -305,7 +336,29 @@ public class BlueGreenDeploymentService {
             BlueGreenContext context,
             BlueGreenDeploymentType currentBlueGreenDeploymentType,
             FlinkDeployment currentFlinkDeployment) {
+        return startTransition(
+                context, currentBlueGreenDeploymentType, currentFlinkDeployment, null);
+    }
+
+    /**
+     * Starts a B/G transition, optionally using a pre-built spec override for the new child.
+     *
+     * @param specOverride if non-null, passed through to {@code prepareFlinkDeployment} so the new
+     *     child is created from this spec instead of the parent's current spec.
+     */
+    private UpdateControl<FlinkBlueGreenDeployment> startTransition(
+            BlueGreenContext context,
+            BlueGreenDeploymentType currentBlueGreenDeploymentType,
+            FlinkDeployment currentFlinkDeployment,
+            @Nullable FlinkBlueGreenDeploymentSpec specOverride) {
         DeploymentTransition transition = calculateTransition(currentBlueGreenDeploymentType);
+
+        LOG.info(
+                "Starting Blue/Green transition for '{}': {} -> {} (from child '{}')",
+                context.getDeploymentName(),
+                currentBlueGreenDeploymentType,
+                transition.nextBlueGreenDeploymentType,
+                currentFlinkDeployment.getMetadata().getName());
 
         Savepoint lastCheckpoint = configureInitialSavepoint(context, currentFlinkDeployment);
 
@@ -314,7 +367,8 @@ public class BlueGreenDeploymentService {
                 transition.nextBlueGreenDeploymentType,
                 transition.nextState,
                 lastCheckpoint,
-                false);
+                false,
+                specOverride);
     }
 
     /**
@@ -436,7 +490,7 @@ public class BlueGreenDeploymentService {
 
         if (savepointTriggerId == null || savepointTriggerId.isEmpty()) {
             String triggerId = triggerSavepoint(ctx);
-            LOG.info("Savepoint requested (triggerId: {}", triggerId);
+            LOG.info("Savepoint requested (triggerId: {})", triggerId);
             context.getDeploymentStatus().setSavepointTriggerId(triggerId);
             return true;
         }
@@ -516,35 +570,32 @@ public class BlueGreenDeploymentService {
 
     private UpdateControl<FlinkBlueGreenDeployment> handleSpecChangesDuringTransition(
             BlueGreenContext context, BlueGreenDeploymentType currentBlueGreenDeploymentType) {
-        if (hasSpecChanged(context)) {
-            BlueGreenDiffType diffType = getSpecDiff(context);
 
-            // Block SUSPEND during transition - wait for transition to complete first
-            if (diffType == BlueGreenDiffType.SUSPEND) {
-                LOG.info(
-                        "Suspend requested during transition for '{}'. "
-                                + "Waiting for transition to complete before processing suspend.",
-                        context.getBgDeployment().getMetadata().getName());
-                return null;
-            }
+        // Parent spec is never persisted with autoscaler values,
+        // so getSpecDiff detects only user-initiated changes.
+        BlueGreenDiffType diffType = getSpecDiff(context);
 
-            if (diffType != BlueGreenDiffType.IGNORE) {
-                setLastReconciledSpec(context);
-                var oppositeDeploymentType =
-                        context.getOppositeDeploymentType(currentBlueGreenDeploymentType);
-                LOG.info(
-                        "Patching FlinkDeployment '{}' during handleSpecChangesDuringTransition",
-                        context.getDeploymentByType(oppositeDeploymentType)
-                                .getMetadata()
-                                .getName());
-                return patchFlinkDeployment(
-                        context,
-                        oppositeDeploymentType,
-                        diffType != BlueGreenDiffType.SAVEPOINT_REDEPLOY);
-            }
+        if (diffType == BlueGreenDiffType.IGNORE) {
+            return null;
         }
 
-        return null;
+        // Block SUSPEND during transition - wait for transition to complete first
+        if (diffType == BlueGreenDiffType.SUSPEND) {
+            LOG.info(
+                    "Suspend requested during transition for '{}'. "
+                            + "Waiting for transition to complete before processing suspend.",
+                    context.getBgDeployment().getMetadata().getName());
+            return null;
+        }
+
+        setLastReconciledSpec(context);
+        var oppositeDeploymentType =
+                context.getOppositeDeploymentType(currentBlueGreenDeploymentType);
+        LOG.info(
+                "Patching FlinkDeployment '{}' during handleSpecChangesDuringTransition",
+                context.getDeploymentByType(oppositeDeploymentType).getMetadata().getName());
+        return patchFlinkDeployment(
+                context, oppositeDeploymentType, diffType != BlueGreenDiffType.SAVEPOINT_REDEPLOY);
     }
 
     private TransitionState determineTransitionState(
@@ -632,9 +683,11 @@ public class BlueGreenDeploymentService {
         boolean deleted = deleteFlinkDeployment(currentDeployment, context);
 
         if (!deleted) {
-            LOG.info("FlinkDeployment '{}' not deleted, will retry", currentDeployment);
+            LOG.warn(
+                    "FlinkDeployment '{}' not deleted, will retry",
+                    currentDeployment.getMetadata().getName());
         } else {
-            LOG.info("FlinkDeployment '{}' deleted!", currentDeployment);
+            LOG.info("FlinkDeployment '{}' deleted!", currentDeployment.getMetadata().getName());
         }
 
         return UpdateControl.<FlinkBlueGreenDeployment>noUpdate().rescheduleAfter(RETRY_DELAY_MS);
@@ -682,6 +735,15 @@ public class BlueGreenDeploymentService {
 
         suspendFlinkDeployment(context, nextDeployment);
 
+        // Clear stale savepointTriggerId to prevent reuse after abort (defense-in-depth).
+        context.getDeploymentStatus().setSavepointTriggerId(null);
+
+        // Autoscaler overrides persist in the active child's lastReconciledSpec.
+        // They will NOT be re-detected immediately because markDeploymentFailing sets
+        // FAILING, and the FAILING guard in checkAndInitiateDeployment blocks autoscaler
+        // checks — preventing an infinite abort→re-trigger→abort loop.
+        // A user spec change is required to clear FAILING and unblock transitions.
+
         FlinkBlueGreenDeploymentState previousState =
                 getPreviousState(nextState, context.getDeployments());
         context.getDeploymentStatus().setBlueGreenState(previousState);
@@ -697,6 +759,13 @@ public class BlueGreenDeploymentService {
     private static UpdateControl<FlinkBlueGreenDeployment> markDeploymentFailing(
             BlueGreenContext context, String error) {
         LOG.error(error);
+        return patchStatusUpdateControl(context, null, JobStatus.FAILING, error);
+    }
+
+    @NotNull
+    private static UpdateControl<FlinkBlueGreenDeployment> markDeploymentFailing(
+            BlueGreenContext context, String error, Throwable cause) {
+        LOG.error(error, cause);
         return patchStatusUpdateControl(context, null, JobStatus.FAILING, error);
     }
 
@@ -812,6 +881,112 @@ public class BlueGreenDeploymentService {
                 blueGreenContext.getJosdkContext());
     }
 
+    // ==================== Autoscaler Detection for Blue/Green ====================
+
+    /**
+     * Detects autoscaler overrides on the active child and initiates a B/G transition if any are
+     * found. A merged spec copy (parent spec + overrides) is built and passed explicitly to the
+     * transition flow so the new child inherits the overrides without mutating the parent's
+     * in-memory spec.
+     *
+     * @return UpdateControl if a transition was initiated, or {@code null} if no overrides
+     */
+    @Nullable
+    private UpdateControl<FlinkBlueGreenDeployment> checkAutoscalerTriggeredTransition(
+            BlueGreenContext context, BlueGreenDeploymentType currentType) {
+
+        FlinkDeployment activeChild = context.getDeploymentByType(currentType);
+        if (activeChild == null || !isChildStableForAutoscalerPropagation(activeChild)) {
+            return null;
+        }
+
+        // Stability guarantees reconStatus is non-null and not before first deployment.
+        FlinkDeploymentSpec childLastReconciledSpec =
+                activeChild.getStatus().getReconciliationStatus().deserializeLastReconciledSpec();
+        if (childLastReconciledSpec == null) {
+            return null;
+        }
+
+        // Reuse the same ReflectiveDiffBuilder as the child reconciler — any field the
+        // autoscaler touches is detected automatically, including future capabilities.
+        var autoscalerDiff =
+                new ReflectiveDiffBuilder<>(
+                                KubernetesDeploymentMode.getDeploymentMode(activeChild),
+                                activeChild.getSpec(),
+                                childLastReconciledSpec)
+                        .build();
+
+        if (autoscalerDiff.getType() == DiffType.IGNORE) {
+            return null;
+        }
+
+        LOG.info(
+                "Autoscaler overrides detected on child '{}' (diffType: {}). "
+                        + "Initiating Blue/Green transition.",
+                activeChild.getMetadata().getName(),
+                autoscalerDiff.getType());
+
+        // Savepoint first if required. Don't setLastReconciledSpec yet — overrides
+        // must remain detectable from lastReconciledSpec after savepoint completes.
+        try {
+            boolean savepointTriggered = handleSavepoint(context, activeChild);
+            if (savepointTriggered) {
+                var savepointingState = calculateSavepointingState(currentType);
+                return patchStatusUpdateControl(context, savepointingState, null, null)
+                        .rescheduleAfter(getReconciliationReschedInterval(context));
+            }
+        } catch (Exception e) {
+            var error =
+                    "Could not trigger Savepoint for autoscaler transition. Details: "
+                            + e.getMessage();
+            return markDeploymentFailing(context, error, e);
+        }
+
+        setLastReconciledSpec(context);
+        FlinkBlueGreenDeploymentSpec mergedSpec = buildMergedSpec(context, childLastReconciledSpec);
+
+        try {
+            return startTransition(context, currentType, activeChild, mergedSpec);
+        } catch (Exception e) {
+            var error = "Could not start autoscaler transition. Details: " + e.getMessage();
+            context.getDeploymentStatus().setSavepointTriggerId(null);
+            return markDeploymentFailing(context, error, e);
+        }
+    }
+
+    /**
+     * Deep-copies the parent spec and overwrites the autoscaler-managed fields ({@code
+     * flinkConfiguration}, {@code taskManager}) wholesale from the child's {@code
+     * lastReconciledSpec}. We don't replace the entire {@code template.spec} because it contains
+     * deployment-specific transforms (e.g., ingress prefixing).
+     */
+    private FlinkBlueGreenDeploymentSpec buildMergedSpec(
+            BlueGreenContext context, FlinkDeploymentSpec childLastReconciledSpec) {
+        FlinkBlueGreenDeploymentSpec merged =
+                SpecUtils.readSpecFromJSON(
+                        SpecUtils.writeSpecAsJSON(context.getBgDeployment().getSpec(), "spec"),
+                        "spec",
+                        FlinkBlueGreenDeploymentSpec.class);
+        var parentFlinkSpec = merged.getTemplate().getSpec();
+        parentFlinkSpec.setFlinkConfiguration(childLastReconciledSpec.getFlinkConfiguration());
+        parentFlinkSpec.setTaskManager(childLastReconciledSpec.getTaskManager());
+        return merged;
+    }
+
+    /**
+     * Checks if a child FlinkDeployment has been stable long enough to trust autoscaler changes.
+     * Requires STABLE lifecycle state and lastReconciledSpecStable to prevent cascading
+     * transitions.
+     */
+    private boolean isChildStableForAutoscalerPropagation(FlinkDeployment child) {
+        if (child.getStatus() == null
+                || child.getStatus().getLifecycleState() != ResourceLifecycleState.STABLE) {
+            return false;
+        }
+        var reconStatus = child.getStatus().getReconciliationStatus();
+        return reconStatus != null && reconStatus.isLastReconciledSpecStable();
+    }
+
     // ==================== Common Utility Methods ====================
 
     public static UpdateControl<FlinkBlueGreenDeployment> patchStatusUpdateControl(
@@ -839,7 +1014,7 @@ public class BlueGreenDeploymentService {
             deploymentStatus.setError(null);
         }
 
-        deploymentStatus.setLastReconciledTimestamp(java.time.Instant.now().toString());
+        deploymentStatus.setLastReconciledTimestamp(Instant.now().toString());
         flinkBlueGreenDeployment.setStatus(deploymentStatus);
         return UpdateControl.patchStatus(flinkBlueGreenDeployment);
     }
