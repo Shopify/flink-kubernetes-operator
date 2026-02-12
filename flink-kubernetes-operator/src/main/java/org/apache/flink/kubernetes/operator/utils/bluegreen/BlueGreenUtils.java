@@ -300,17 +300,7 @@ public class BlueGreenUtils {
 
     // ==================== Deployment Preparation Utilities ====================
 
-    /**
-     * Creates a new FlinkDeployment resource for a Blue/Green deployment transition. This method
-     * prepares the deployment with proper metadata, specs, and savepoint configuration.
-     *
-     * @param context the Blue/Green transition context
-     * @param blueGreenDeploymentType the type of deployment (BLUE or GREEN)
-     * @param lastCheckpoint the savepoint/checkpoint to restore from (can be null)
-     * @param isFirstDeployment whether this is the initial deployment
-     * @param bgMeta the metadata of the parent Blue/Green deployment
-     * @return configured FlinkDeployment ready for deployment
-     */
+    /** Convenience overload without spec override. */
     public static FlinkDeployment prepareFlinkDeployment(
             BlueGreenContext context,
             BlueGreenDeploymentType blueGreenDeploymentType,
@@ -322,11 +312,9 @@ public class BlueGreenUtils {
     }
 
     /**
-     * Creates a new FlinkDeployment resource for a Blue/Green deployment transition, optionally
-     * using a pre-built spec override (e.g., with autoscaler overrides already applied).
-     *
-     * @param specOverride if non-null, used as the source spec instead of the parent's current
-     *     spec. This avoids mutating the parent's in-memory spec for ephemeral overrides.
+     * Creates a FlinkDeployment for a B/G transition. If {@code specOverride} is non-null, it is
+     * used as the source spec instead of the parent's current spec (e.g., for autoscaler
+     * overrides).
      */
     public static FlinkDeployment prepareFlinkDeployment(
             BlueGreenContext context,

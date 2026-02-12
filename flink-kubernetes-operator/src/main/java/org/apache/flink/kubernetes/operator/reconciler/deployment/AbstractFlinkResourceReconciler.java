@@ -130,21 +130,18 @@ public abstract class AbstractFlinkResourceReconciler<
                 cr.getStatus().getReconciliationStatus().deserializeLastReconciledSpec();
         SPEC currentDeploySpec = cr.getSpec();
 
-        // For B/G owned children, capture whether there's a user/parent-initiated spec change
-        // BEFORE the autoscaler modifies the in-memory spec. This lets us distinguish
-        // autoscaler-induced changes from parent-initiated changes.
+        // Snapshot pre-autoscaler diff for B/G children so we can distinguish
+        // autoscaler-only changes from parent-initiated ones after applyAutoscaler().
         boolean isBlueGreenOwned = isBlueGreenOwnedDeployment(ctx);
-        boolean hasPreAutoscalerSpecChange = false;
-        if (isBlueGreenOwned) {
-            hasPreAutoscalerSpecChange =
-                    DiffType.IGNORE
-                            != new ReflectiveDiffBuilder<>(
-                                            ctx.getDeploymentMode(),
-                                            lastReconciledSpec,
-                                            currentDeploySpec)
-                                    .build()
-                                    .getType();
-        }
+        boolean hasPreAutoscalerSpecChange =
+                isBlueGreenOwned
+                        && DiffType.IGNORE
+                                != new ReflectiveDiffBuilder<>(
+                                                ctx.getDeploymentMode(),
+                                                lastReconciledSpec,
+                                                currentDeploySpec)
+                                        .build()
+                                        .getType();
 
         applyAutoscaler(ctx);
 
@@ -170,15 +167,11 @@ public abstract class AbstractFlinkResourceReconciler<
                 return;
             }
 
-            // For B/G owned children: if the diff is PURELY from the autoscaler
-            // (no pre-existing spec change from parent), skip ALL in-place processing.
-            // This covers both horizontal (SCALE) and vertical (UPGRADE) autoscaler changes.
-            // The B/G parent controller will detect this via lastReconciledSpec and trigger
-            // a Blue/Green transition instead.
+            // Autoscaler-only diff on a B/G child → skip in-place processing.
+            // The B/G parent will detect this via lastReconciledSpec and trigger a transition.
             if (isBlueGreenOwned && !hasPreAutoscalerSpecChange) {
                 LOG.info(
-                        "Skipping autoscaler-induced spec change ({}) for B/G owned '{}'. "
-                                + "Changes will be handled via Blue/Green transition.",
+                        "Deferring autoscaler change ({}) on B/G child '{}' to parent transition.",
                         diffType,
                         cr.getMetadata().getName());
                 ReconciliationUtils.updateStatusForDeployedSpec(
