@@ -132,7 +132,10 @@ public abstract class AbstractFlinkResourceReconciler<
 
         // Snapshot pre-autoscaler diff for B/G children so we can distinguish
         // autoscaler-only changes from parent-initiated ones after applyAutoscaler().
-        boolean isBlueGreenOwned = isBlueGreenOwnedDeployment(ctx);
+        boolean isBlueGreenOwned =
+                cr instanceof FlinkDeployment
+                        && BlueGreenKubernetesService.isOwnedByBlueGreenDeployment(
+                                (FlinkDeployment) cr);
         boolean hasPreAutoscalerSpecChange =
                 isBlueGreenOwned
                         && DiffType.IGNORE
@@ -394,18 +397,6 @@ public abstract class AbstractFlinkResourceReconciler<
         }
 
         return scaled;
-    }
-
-    /**
-     * Checks if the current resource is a FlinkDeployment owned by a FlinkBlueGreenDeployment.
-     *
-     * @param ctx the resource context
-     * @return true if the resource is a B/G owned FlinkDeployment
-     */
-    private boolean isBlueGreenOwnedDeployment(FlinkResourceContext<CR> ctx) {
-        return ctx.getResource() instanceof FlinkDeployment
-                && BlueGreenKubernetesService.isOwnedByBlueGreenDeployment(
-                        (FlinkDeployment) ctx.getResource());
     }
 
     /**
