@@ -44,6 +44,12 @@ public class FlinkBlueGreenDeploymentStatus {
     /** Last reconciled (serialized) deployment spec. */
     private String lastReconciledSpec;
 
+    /**
+     * Last stable deployment spec. Tracks the last known-good spec where the active child was
+     * healthy. Restored to lastReconciledSpec when a transition is aborted.
+     */
+    private String lastStableSpec;
+
     /** Timestamp of last reconciliation. */
     private String lastReconciledTimestamp;
 

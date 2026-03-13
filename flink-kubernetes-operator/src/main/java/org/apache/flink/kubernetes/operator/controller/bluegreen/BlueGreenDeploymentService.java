@@ -57,7 +57,10 @@ import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtil
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.instantStrToMillis;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.isSavepointRequired;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.millisToInstantStr;
+import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.markLastReconciledSpecAsStable;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.prepareFlinkDeployment;
+import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.reconcileSpecAsStable;
+import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.restoreLastStableSpec;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.setLastReconciledSpec;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.triggerSavepoint;
 
@@ -113,6 +116,11 @@ public class BlueGreenDeploymentService {
     public UpdateControl<FlinkBlueGreenDeployment> checkAndInitiateDeployment(
             BlueGreenContext context, BlueGreenDeploymentType currentBlueGreenDeploymentType) {
 
+        if (context.getDeploymentStatus().getLastStableSpec() == null
+                && context.getDeploymentStatus().getLastReconciledSpec() != null) {
+            markLastReconciledSpecAsStable(context);
+        }
+
         BlueGreenDiffType specDiff = getSpecDiff(context);
 
         if (specDiff != BlueGreenDiffType.IGNORE) {
@@ -120,7 +128,7 @@ public class BlueGreenDeploymentService {
                     context.getDeploymentByType(currentBlueGreenDeploymentType);
 
             if (specDiff == BlueGreenDiffType.SUSPEND && currentFlinkDeployment != null) {
-                setLastReconciledSpec(context);
+                reconcileSpecAsStable(context);
                 LOG.info(
                         "In-place suspension for '{}'",
                         currentFlinkDeployment.getMetadata().getName());
@@ -128,7 +136,7 @@ public class BlueGreenDeploymentService {
             }
 
             if (specDiff == BlueGreenDiffType.RESUME && currentFlinkDeployment != null) {
-                setLastReconciledSpec(context);
+                reconcileSpecAsStable(context);
                 LOG.info(
                         "In-place resume for '{}'", currentFlinkDeployment.getMetadata().getName());
                 return patchFlinkDeployment(context, currentBlueGreenDeploymentType);
@@ -136,7 +144,7 @@ public class BlueGreenDeploymentService {
 
             // Check if child is currently suspended - if so, just patch specs without restart
             if (isChildSuspended(currentFlinkDeployment)) {
-                setLastReconciledSpec(context);
+                reconcileSpecAsStable(context);
                 LOG.info(
                         "Spec change while suspended for '{}'",
                         currentFlinkDeployment.getMetadata().getName());
@@ -168,6 +176,7 @@ public class BlueGreenDeploymentService {
                                 context, currentBlueGreenDeploymentType, currentFlinkDeployment);
                     } catch (Exception e) {
                         var error = "Could not start Transition. Details: " + e.getMessage();
+                        restoreLastStableSpec(context);
                         context.getDeploymentStatus().setSavepointTriggerId(null);
                         return markDeploymentFailing(context, error);
                     }
@@ -188,10 +197,11 @@ public class BlueGreenDeploymentService {
                         var error =
                                 "Could not start Savepoint Redeploy Transition. Details: "
                                         + e.getMessage();
+                        restoreLastStableSpec(context);
                         return markDeploymentFailing(context, error);
                     }
                 } else {
-                    setLastReconciledSpec(context);
+                    reconcileSpecAsStable(context);
                     LOG.info(
                             "Patching FlinkDeployment '{}' during checkAndInitiateDeployment",
                             currentFlinkDeployment.getMetadata().getName());
@@ -509,6 +519,7 @@ public class BlueGreenDeploymentService {
         context.getDeploymentStatus().setDeploymentReadyTimestamp(millisToInstantStr(0));
         context.getDeploymentStatus().setAbortTimestamp(millisToInstantStr(0));
         context.getDeploymentStatus().setSavepointTriggerId(null);
+        markLastReconciledSpecAsStable(context);
 
         return patchStatusUpdateControl(context, nextState, JobStatus.SUSPENDED, null)
                 .rescheduleAfter(0);
@@ -685,6 +696,7 @@ public class BlueGreenDeploymentService {
         FlinkBlueGreenDeploymentState previousState =
                 getPreviousState(nextState, context.getDeployments());
         context.getDeploymentStatus().setBlueGreenState(previousState);
+        restoreLastStableSpec(context);
 
         var error =
                 String.format(
@@ -733,6 +745,7 @@ public class BlueGreenDeploymentService {
         context.getDeploymentStatus().setDeploymentReadyTimestamp(millisToInstantStr(0));
         context.getDeploymentStatus().setAbortTimestamp(millisToInstantStr(0));
         context.getDeploymentStatus().setSavepointTriggerId(null);
+        markLastReconciledSpecAsStable(context);
 
         updateBlueGreenIngress(context, nextState);
 

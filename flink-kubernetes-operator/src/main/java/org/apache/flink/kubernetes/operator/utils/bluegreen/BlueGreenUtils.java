@@ -94,6 +94,36 @@ public class BlueGreenUtils {
         deploymentStatus.setLastReconciledTimestamp(Instant.now().toString());
     }
 
+    /**
+     * Sets lastReconciledSpec AND marks it as stable. Use for non-transition operations
+     * (PATCH_CHILD, SUSPEND, RESUME, etc.) where the active child absorbs the change immediately.
+     */
+    public static void reconcileSpecAsStable(BlueGreenContext context) {
+        setLastReconciledSpec(context);
+        markLastReconciledSpecAsStable(context);
+    }
+
+    /**
+     * Promotes the current lastReconciledSpec to lastStableSpec. Use at transition finalization
+     * when the new child is confirmed healthy.
+     */
+    public static void markLastReconciledSpecAsStable(BlueGreenContext context) {
+        context.getDeploymentStatus()
+                .setLastStableSpec(context.getDeploymentStatus().getLastReconciledSpec());
+    }
+
+    /**
+     * Restores lastReconciledSpec from lastStableSpec. Use when a transition is aborted or fails
+     * to start, so that the BG controller's view of the reconciled spec matches the active child.
+     */
+    public static void restoreLastStableSpec(BlueGreenContext context) {
+        String stableSpec = context.getDeploymentStatus().getLastStableSpec();
+        if (stableSpec != null) {
+            context.getDeploymentStatus().setLastReconciledSpec(stableSpec);
+            LOG.info("Restored lastReconciledSpec from lastStableSpec after transition failure");
+        }
+    }
+
     public static void revertToLastSpec(BlueGreenContext context) {
         context.getBgDeployment()
                 .setSpec(
