@@ -1540,6 +1540,164 @@ public class FlinkBlueGreenDeploymentControllerTest {
         return new FlinkBlueGreenDeploymentSpec(configuration, null, flinkDeploymentTemplateSpec);
     }
 
+    // ==================== Abort + Ignore-field Drift Tests ====================
+
+    /**
+     * Reproduces the bug where lastReconciledSpec is not reverted during abort, causing a
+     * subsequent IGNORE-only spec change to trigger an unintended in-place restart of the active
+     * child.
+     *
+     * <p>Scenario:
+     *
+     * <ol>
+     *   <li>Blue is ACTIVE with spec v1
+     *   <li>User applies v2 (UPGRADE-level change via custom-configuration-field) → transition to
+     *       Green starts
+     *   <li>Green fails to start → abort grace period expires → abort rolls back to ACTIVE_BLUE
+     *   <li>lastReconciledSpec is now v2 (the bug: it should be v1)
+     *   <li>User applies v3 that differs from v2 only in IGNORE-level fields (e.g.,
+     *       kubernetes.operator.reconcile.interval)
+     *   <li>BG controller diffs lastReconciledSpec(v2) vs v3 → PATCH_CHILD (only IGNORE fields
+     *       changed)
+     *   <li>PATCH_CHILD pushes v3 to Blue child, but Blue's FDC lastReconciledSpec is still v1
+     *   <li>FDC diffs v1 vs v3 → sees UPGRADE-level changes from the original v1→v2 transition →
+     *       unintended in-place restart
+     * </ol>
+     */
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyIgnoreFieldChangeAfterAbortCausesUnintendedRestart(FlinkVersion flinkVersion)
+            throws Exception {
+        // ---- Phase 1: Deploy Blue with v1 spec ----
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        null,
+                        UpgradeMode.STATELESS);
+
+        var abortGracePeriodMs = 1200;
+        var reconciliationReschedulingIntervalMs = 3000;
+        Map<String, String> configuration = blueGreenDeployment.getSpec().getConfiguration();
+        configuration.put(ABORT_GRACE_PERIOD.key(), String.valueOf(abortGracePeriodMs));
+        configuration.put(
+                RECONCILIATION_RESCHEDULING_INTERVAL.key(),
+                String.valueOf(reconciliationReschedulingIntervalMs));
+
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE, rs.reconciledStatus.getBlueGreenState());
+        assertEquals(1, getFlinkDeployments().size());
+
+        // Capture Blue child's FDC lastReconciledSpec (v1)
+        var blueChild = getFlinkDeployments().get(0);
+        var blueChildLastReconciledSpecV1 =
+                blueChild.getStatus().getReconciliationStatus().getLastReconciledSpec();
+        assertNotNull(blueChildLastReconciledSpecV1, "Blue child should have lastReconciledSpec");
+
+        // Capture BG lastReconciledSpec (v1)
+        var bgLastReconciledSpecV1 = rs.reconciledStatus.getLastReconciledSpec();
+        assertNotNull(bgLastReconciledSpecV1, "BG should have lastReconciledSpec after deploy");
+
+        // ---- Phase 2: Apply v2 (UPGRADE-level change) → trigger transition to Green ----
+        String v2CustomValue = UUID.randomUUID().toString();
+        simulateChangeInSpec(rs.deployment, v2CustomValue, 0, null);
+
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+        assertEquals(2, getFlinkDeployments().size());
+
+        // BG lastReconciledSpec is now v2
+        var bgLastReconciledSpecV2 = rs.reconciledStatus.getLastReconciledSpec();
+        assertNotEquals(
+                bgLastReconciledSpecV1,
+                bgLastReconciledSpecV2,
+                "BG lastReconciledSpec should have changed to v2");
+
+        // ---- Phase 3: Green fails to start → abort ----
+        // Simulating the Green deployment doesn't start (status remains unchanged)
+        Long reschedDelayMs = 0L;
+        for (int i = 0; i < 2; i++) {
+            rs = reconcile(rs.deployment);
+            assertTrue(rs.updateControl.isPatchStatus());
+            reschedDelayMs = rs.updateControl.getScheduleDelay().get();
+        }
+
+        // Wait for abort grace period to expire
+        Thread.sleep(reschedDelayMs);
+
+        // Abort should fire
+        rs = reconcile(rs.deployment);
+        assertTrue(rs.updateControl.isPatchStatus());
+        assertFailingJobStatus(rs);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE,
+                rs.reconciledStatus.getBlueGreenState(),
+                "Should roll back to ACTIVE_BLUE after abort");
+
+        // After abort, lastReconciledSpec SHOULD be reverted to match what the active
+        // Blue child is actually running (v1). This ensures subsequent diffs are correct.
+        var bgLastReconciledSpecAfterAbort = rs.reconciledStatus.getLastReconciledSpec();
+        assertEquals(
+                bgLastReconciledSpecV1,
+                bgLastReconciledSpecAfterAbort,
+                "After abort, BG lastReconciledSpec should be reverted to v1 (the active "
+                        + "child's spec), not left as v2 (the failed transition spec)");
+
+        // Verify Blue child is still running v1 (unchanged by the abort)
+        var flinkDeployments = getFlinkDeployments();
+        blueChild =
+                flinkDeployments.stream()
+                        .filter(fd -> fd.getMetadata().getName().endsWith("-blue"))
+                        .findFirst()
+                        .orElseThrow();
+        assertEquals(
+                JobStatus.RUNNING,
+                blueChild.getStatus().getJobStatus().getState(),
+                "Blue child should still be RUNNING");
+        assertEquals(
+                blueChildLastReconciledSpecV1,
+                blueChild.getStatus().getReconciliationStatus().getLastReconciledSpec(),
+                "Blue child FDC lastReconciledSpec should still be v1");
+
+        // ---- Phase 4: Apply v3 with ONLY IGNORE-level field changes relative to v2 ----
+        // Change only kubernetes.operator.* config (DiffType.IGNORE) — no UPGRADE-level changes
+        FlinkDeploymentSpec spec = rs.deployment.getSpec().getTemplate().getSpec();
+        spec.getFlinkConfiguration().put("kubernetes.operator.reconcile.interval", "999 SECONDS");
+        rs.deployment.getSpec().getTemplate().setSpec(spec);
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+
+        // ---- Phase 5: Reconcile — with correct lastReconciledSpec (v1), the BG controller
+        // should detect the UPGRADE-level changes from v1→v3 and trigger a proper TRANSITION,
+        // NOT a PATCH_CHILD that would cause an unintended in-place restart. ----
+        rs = reconcile(rs.deployment);
+
+        // With lastReconciledSpec correctly reverted to v1, the diff v1→v3 includes
+        // UPGRADE-level changes (custom-configuration-field). This should trigger a full
+        // blue-green TRANSITION, not a PATCH_CHILD.
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState(),
+                "v1→v3 contains UPGRADE-level changes (custom-configuration-field from v2), "
+                        + "so BG controller should trigger a TRANSITION, not PATCH_CHILD");
+
+        // Verify Green was created for the transition (2 deployments = transition in progress)
+        flinkDeployments = getFlinkDeployments();
+        assertEquals(
+                2,
+                flinkDeployments.stream()
+                        .filter(
+                                fd ->
+                                        fd.getMetadata().getName().endsWith("-blue")
+                                                || fd.getMetadata().getName().endsWith("-green"))
+                        .count(),
+                "A proper transition should create a Green deployment alongside Blue");
+    }
+
     // ==================== Ingress Helper Methods ====================
 
     private void assertIngressPointsToService(String expectedServiceName) {
