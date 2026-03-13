@@ -116,6 +116,11 @@ public class BlueGreenDeploymentService {
     public UpdateControl<FlinkBlueGreenDeployment> checkAndInitiateDeployment(
             BlueGreenContext context, BlueGreenDeploymentType currentBlueGreenDeploymentType) {
 
+        if (context.getDeploymentStatus().getLastStableSpec() == null
+                && context.getDeploymentStatus().getLastReconciledSpec() != null) {
+            markLastReconciledSpecAsStable(context);
+        }
+
         BlueGreenDiffType specDiff = getSpecDiff(context);
 
         if (specDiff != BlueGreenDiffType.IGNORE) {
