@@ -44,7 +44,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.time.Instant;
+import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.deleteFlinkDeployment;
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.deployCluster;
@@ -58,7 +60,7 @@ import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtil
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.isSavepointRequired;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.millisToInstantStr;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.prepareFlinkDeployment;
-import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.revertLastReconciledSpec;
+import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.revertToLastSpec;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.setLastReconciledSpec;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.triggerSavepoint;
 
@@ -67,6 +69,15 @@ public class BlueGreenDeploymentService {
 
     private static final Logger LOG = LoggerFactory.getLogger(BlueGreenDeploymentService.class);
     private static final long RETRY_DELAY_MS = 500;
+
+    /**
+     * In-memory cache of the pre-transition lastReconciledSpec, keyed by namespace. Saved before
+     * setLastReconciledSpec overwrites it during a transition, restored on abort so
+     * lastReconciledSpec stays consistent with the active child. Lost on operator restart, which
+     * falls back to pre-fix behavior (no revert) — acceptable since restart during the abort window
+     * is rare and not a regression.
+     */
+    private final Map<String, String> previousReconciledSpecs = new ConcurrentHashMap<>();
 
     // ==================== Deployment Initiation Methods ====================
 
@@ -164,6 +175,8 @@ public class BlueGreenDeploymentService {
                     }
 
                     try {
+                        // Save pre-transition lastReconciledSpec so we can restore on abort
+                        savePreTransitionSpec(context);
                         var result =
                                 startTransition(
                                         context,
@@ -186,6 +199,8 @@ public class BlueGreenDeploymentService {
                             context.getBgDeployment().getMetadata().getName(),
                             Objects.toString(jobSpec.getInitialSavepointPath(), "<none>"));
                     try {
+                        // Save pre-transition lastReconciledSpec so we can restore on abort
+                        savePreTransitionSpec(context);
                         var result =
                                 startSavepointRedeployTransition(
                                         context, currentBlueGreenDeploymentType);
@@ -694,15 +709,26 @@ public class BlueGreenDeploymentService {
         context.getDeploymentStatus().setBlueGreenState(previousState);
         context.getDeploymentStatus().setSavepointTriggerId(null);
 
-        // Revert lastReconciledSpec to the pre-transition spec so it stays
-        // consistent with the active child that is still running
-        revertLastReconciledSpec(context);
+        // Restore lastReconciledSpec and the B/G CR spec to the pre-transition state
+        // so they stay consistent with the active child that is still running.
+        String namespace = context.getBgDeployment().getMetadata().getNamespace();
+        String previousSpec = previousReconciledSpecs.remove(namespace);
+        if (previousSpec != null) {
+            context.getDeploymentStatus().setLastReconciledSpec(previousSpec);
+            revertToLastSpec(context);
+        }
 
         var error =
                 String.format(
                         "Aborting deployment '%s', rolling B/G deployment back to %s",
                         deploymentName, previousState);
         return markDeploymentFailing(context, error);
+    }
+
+    private void savePreTransitionSpec(BlueGreenContext context) {
+        String namespace = context.getBgDeployment().getMetadata().getNamespace();
+        previousReconciledSpecs.put(
+                namespace, context.getDeploymentStatus().getLastReconciledSpec());
     }
 
     @NotNull
@@ -745,6 +771,7 @@ public class BlueGreenDeploymentService {
         context.getDeploymentStatus().setDeploymentReadyTimestamp(millisToInstantStr(0));
         context.getDeploymentStatus().setAbortTimestamp(millisToInstantStr(0));
         context.getDeploymentStatus().setSavepointTriggerId(null);
+        previousReconciledSpecs.remove(context.getBgDeployment().getMetadata().getNamespace());
 
         updateBlueGreenIngress(context, nextState);
 

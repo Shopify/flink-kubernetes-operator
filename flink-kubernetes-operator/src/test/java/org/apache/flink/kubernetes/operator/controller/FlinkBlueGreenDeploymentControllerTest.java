@@ -555,7 +555,6 @@ public class FlinkBlueGreenDeploymentControllerTest {
         assertFalse(
                 rs.reconciledStatus.getLastReconciledSpec().contains(customValue),
                 "lastReconciledSpec should be reverted on abort to match the active child");
-        assertNull(rs.reconciledStatus.getPreviousReconciledSpec());
 
         // Simulate another change in the spec to trigger a redeployment
         customValue = UUID.randomUUID().toString();

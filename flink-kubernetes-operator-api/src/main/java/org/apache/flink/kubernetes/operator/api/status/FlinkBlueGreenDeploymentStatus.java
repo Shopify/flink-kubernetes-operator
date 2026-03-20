@@ -44,12 +44,6 @@ public class FlinkBlueGreenDeploymentStatus {
     /** Last reconciled (serialized) deployment spec. */
     private String lastReconciledSpec;
 
-    /**
-     * Previous reconciled spec, saved before a transition overwrites lastReconciledSpec. Used to
-     * restore lastReconciledSpec on abort so it stays consistent with the active child.
-     */
-    private String previousReconciledSpec;
-
     /** Timestamp of last reconciliation. */
     private String lastReconciledTimestamp;
 
