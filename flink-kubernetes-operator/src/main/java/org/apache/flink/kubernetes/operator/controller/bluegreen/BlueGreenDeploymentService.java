@@ -58,6 +58,7 @@ import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtil
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.isSavepointRequired;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.millisToInstantStr;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.prepareFlinkDeployment;
+import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.revertLastReconciledSpec;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.setLastReconciledSpec;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.triggerSavepoint;
 
@@ -696,6 +697,10 @@ public class BlueGreenDeploymentService {
                 getPreviousState(nextState, context.getDeployments());
         context.getDeploymentStatus().setBlueGreenState(previousState);
         context.getDeploymentStatus().setSavepointTriggerId(null);
+
+        // Revert lastReconciledSpec to the pre-transition spec so it stays
+        // consistent with the active child that is still running
+        revertLastReconciledSpec(context);
 
         var error =
                 String.format(

@@ -89,6 +89,8 @@ public class BlueGreenUtils {
 
     public static void setLastReconciledSpec(BlueGreenContext context) {
         FlinkBlueGreenDeploymentStatus deploymentStatus = context.getDeploymentStatus();
+        // Save the current lastReconciledSpec so it can be restored on abort
+        deploymentStatus.setPreviousReconciledSpec(deploymentStatus.getLastReconciledSpec());
         deploymentStatus.setLastReconciledSpec(
                 SpecUtils.writeSpecAsJSON(context.getBgDeployment().getSpec(), "spec"));
         deploymentStatus.setLastReconciledTimestamp(Instant.now().toString());
@@ -102,6 +104,20 @@ public class BlueGreenUtils {
                                 "spec",
                                 FlinkBlueGreenDeploymentSpec.class));
         replaceFlinkBlueGreenDeployment(context);
+    }
+
+    /**
+     * Restores lastReconciledSpec from previousReconciledSpec and reverts the B/G CR's live spec to
+     * match. Called on abort so lastReconciledSpec stays consistent with the active child.
+     */
+    public static void revertLastReconciledSpec(BlueGreenContext context) {
+        FlinkBlueGreenDeploymentStatus deploymentStatus = context.getDeploymentStatus();
+        String previousSpec = deploymentStatus.getPreviousReconciledSpec();
+        if (previousSpec != null) {
+            deploymentStatus.setLastReconciledSpec(previousSpec);
+            deploymentStatus.setPreviousReconciledSpec(null);
+            revertToLastSpec(context);
+        }
     }
 
     /**
