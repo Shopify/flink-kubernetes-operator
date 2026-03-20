@@ -49,6 +49,7 @@ import java.util.Objects;
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.deleteFlinkDeployment;
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.deployCluster;
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.isFlinkDeploymentReady;
+import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.replaceFlinkBlueGreenDeployment;
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.suspendFlinkDeployment;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.fetchSavepointInfo;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.getReconciliationReschedInterval;
@@ -58,7 +59,6 @@ import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtil
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.isSavepointRequired;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.millisToInstantStr;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.prepareFlinkDeployment;
-import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.revertLastReconciledSpec;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.setLastReconciledSpec;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.triggerSavepoint;
 
@@ -694,9 +694,20 @@ public class BlueGreenDeploymentService {
         context.getDeploymentStatus().setBlueGreenState(previousState);
         context.getDeploymentStatus().setSavepointTriggerId(null);
 
-        // Revert lastReconciledSpec to the pre-transition spec so it stays
-        // consistent with the active child that is still running
-        revertLastReconciledSpec(context);
+        // Revert lastReconciledSpec to match the active child that is still running.
+        // Read the active child's spec and write it back to the B/G CR so
+        // lastReconciledSpec stays consistent and the next reconciliation sees the
+        // correct diff.
+        BlueGreenDeploymentType activeType =
+                previousState == FlinkBlueGreenDeploymentState.ACTIVE_BLUE
+                        ? BlueGreenDeploymentType.BLUE
+                        : BlueGreenDeploymentType.GREEN;
+        FlinkDeployment activeChild = context.getDeploymentByType(activeType);
+        if (activeChild != null) {
+            context.getBgDeployment().getSpec().getTemplate().setSpec(activeChild.getSpec());
+            setLastReconciledSpec(context);
+            replaceFlinkBlueGreenDeployment(context);
+        }
 
         var error =
                 String.format(
