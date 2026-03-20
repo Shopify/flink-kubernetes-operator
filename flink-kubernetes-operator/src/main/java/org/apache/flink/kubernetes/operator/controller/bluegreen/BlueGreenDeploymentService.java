@@ -169,10 +169,6 @@ public class BlueGreenDeploymentService {
                                         context,
                                         currentBlueGreenDeploymentType,
                                         currentFlinkDeployment);
-                        // Only stamp lastReconciledSpec after the transition
-                        // succeeds. If stamped before and the transition
-                        // fails/aborts, lastReconciledSpec drifts from the
-                        // active child's actual spec
                         setLastReconciledSpec(context);
                         return result;
                     } catch (Exception e) {
