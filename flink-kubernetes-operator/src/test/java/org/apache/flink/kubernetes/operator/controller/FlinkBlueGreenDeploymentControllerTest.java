@@ -549,6 +549,12 @@ public class FlinkBlueGreenDeploymentControllerTest {
         // savepointTriggerId must be cleared on abort so the next transition
         // triggers a fresh savepoint instead of reusing a stale triggerId
         assertNull(rs.reconciledStatus.getSavepointTriggerId());
+        // lastReconciledSpec must NOT contain the failed spec change — on abort
+        // it should be reverted to the pre-transition spec so it stays consistent
+        // with the active child that is still running
+        assertFalse(
+                rs.reconciledStatus.getLastReconciledSpec().contains(customValue),
+                "lastReconciledSpec should be reverted on abort to match the active child");
 
         // Simulate another change in the spec to trigger a redeployment
         customValue = UUID.randomUUID().toString();
