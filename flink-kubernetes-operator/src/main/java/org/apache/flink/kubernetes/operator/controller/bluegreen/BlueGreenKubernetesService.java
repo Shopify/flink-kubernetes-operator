@@ -116,4 +116,29 @@ public class BlueGreenKubernetesService {
         return deletedStatus.size() == 1
                 && deletedStatus.get(0).getKind().equals("FlinkDeployment");
     }
+
+    /**
+     * Checks if a FlinkDeployment is owned by a FlinkBlueGreenDeployment.
+     *
+     * <p>This is used to determine whether in-place scaling should be skipped for this deployment,
+     * as Blue/Green deployments handle scaling through full transitions instead.
+     *
+     * @param deployment the FlinkDeployment to check
+     * @return true if the deployment is owned by a FlinkBlueGreenDeployment, false otherwise
+     */
+    public static boolean isOwnedByBlueGreenDeployment(FlinkDeployment deployment) {
+        if (deployment == null || deployment.getMetadata() == null) {
+            return false;
+        }
+        var ownerReferences = deployment.getMetadata().getOwnerReferences();
+        if (ownerReferences == null || ownerReferences.isEmpty()) {
+            return false;
+        }
+        return ownerReferences.stream()
+                .anyMatch(
+                        ref ->
+                                FlinkBlueGreenDeployment.class
+                                        .getSimpleName()
+                                        .equals(ref.getKind()));
+    }
 }
