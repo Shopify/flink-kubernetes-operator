@@ -27,6 +27,7 @@ import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDeploymentTyp
 import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDiffType;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentSpec;
 import org.apache.flink.kubernetes.operator.api.spec.IngressSpec;
+import org.apache.flink.kubernetes.operator.api.spec.JobState;
 import org.apache.flink.kubernetes.operator.api.spec.KubernetesDeploymentMode;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentStatus;
@@ -40,6 +41,7 @@ import org.apache.flink.kubernetes.operator.reconciler.diff.FlinkBlueGreenDeploy
 import org.apache.flink.util.Preconditions;
 
 import io.fabric8.kubernetes.api.model.ObjectMeta;
+import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -179,9 +181,7 @@ public class BlueGreenUtils {
      * @return abort grace period in milliseconds
      */
     public static long getAbortGracePeriod(BlueGreenContext context) {
-        long abortGracePeriod =
-                getConfigOption(context.getBgDeployment(), ABORT_GRACE_PERIOD).toMillis();
-        return abortGracePeriod;
+        return getConfigOption(context.getBgDeployment(), ABORT_GRACE_PERIOD).toMillis();
     }
 
     /**
@@ -213,9 +213,7 @@ public class BlueGreenUtils {
                         .getSpec()
                         .getJob()
                         .getUpgradeMode();
-        //        return UpgradeMode.SAVEPOINT == upgradeMode;
         // Currently taking savepoints for all modes except STATELESS
-        // (previously only SAVEPOINT mode required savepoints)
         return UpgradeMode.STATELESS != upgradeMode;
     }
 
@@ -302,26 +300,33 @@ public class BlueGreenUtils {
 
     // ==================== Deployment Preparation Utilities ====================
 
-    /**
-     * Creates a new FlinkDeployment resource for a Blue/Green deployment transition. This method
-     * prepares the deployment with proper metadata, specs, and savepoint configuration.
-     *
-     * @param context the Blue/Green transition context
-     * @param blueGreenDeploymentType the type of deployment (BLUE or GREEN)
-     * @param lastCheckpoint the savepoint/checkpoint to restore from (can be null)
-     * @param isFirstDeployment whether this is the initial deployment
-     * @param bgMeta the metadata of the parent Blue/Green deployment
-     * @return configured FlinkDeployment ready for deployment
-     */
+    /** Convenience overload without spec override. */
     public static FlinkDeployment prepareFlinkDeployment(
             BlueGreenContext context,
             BlueGreenDeploymentType blueGreenDeploymentType,
             Savepoint lastCheckpoint,
             boolean isFirstDeployment,
             ObjectMeta bgMeta) {
+        return prepareFlinkDeployment(
+                context, blueGreenDeploymentType, lastCheckpoint, isFirstDeployment, bgMeta, null);
+    }
+
+    /**
+     * Creates a FlinkDeployment for a B/G transition. If {@code specOverride} is non-null, it is
+     * used as the source spec instead of the parent's current spec (e.g., for autoscaler
+     * overrides).
+     */
+    public static FlinkDeployment prepareFlinkDeployment(
+            BlueGreenContext context,
+            BlueGreenDeploymentType blueGreenDeploymentType,
+            Savepoint lastCheckpoint,
+            boolean isFirstDeployment,
+            ObjectMeta bgMeta,
+            @Nullable FlinkBlueGreenDeploymentSpec specOverride) {
         // Deployment
         FlinkDeployment flinkDeployment = new FlinkDeployment();
-        FlinkBlueGreenDeploymentSpec originalSpec = context.getBgDeployment().getSpec();
+        FlinkBlueGreenDeploymentSpec originalSpec =
+                specOverride != null ? specOverride : context.getBgDeployment().getSpec();
 
         String childDeploymentName =
                 bgMeta.getName() + "-" + blueGreenDeploymentType.toString().toLowerCase();
@@ -343,14 +348,13 @@ public class BlueGreenUtils {
             String initialSavepointPath =
                     spec.getTemplate().getSpec().getJob().getInitialSavepointPath();
             if (initialSavepointPath != null && !initialSavepointPath.isEmpty()) {
-                LOG.info("Using initialSavepointPath: " + initialSavepointPath);
-                spec.getTemplate().getSpec().getJob().setInitialSavepointPath(initialSavepointPath);
+                LOG.info("Using initialSavepointPath: {}", initialSavepointPath);
             } else {
                 LOG.info("Clean startup with no checkpoint/savepoint restoration");
             }
         } else if (lastCheckpoint != null) {
             String location = lastCheckpoint.getLocation().replace("file:", "");
-            LOG.info("Using Blue/Green savepoint/checkpoint: " + location);
+            LOG.info("Using Blue/Green savepoint/checkpoint: {}", location);
             spec.getTemplate().getSpec().getJob().setInitialSavepointPath(location);
         } else {
             String initialSavepointPath =
@@ -365,6 +369,16 @@ public class BlueGreenUtils {
         }
 
         flinkDeployment.setSpec(spec.getTemplate().getSpec());
+
+        // Ensure job.state is never null (which could cause merge issues downstream).
+        // The spec was already copied on the line above, so this only needs to handle the
+        // null-state defensive case.
+        if (flinkDeployment.getSpec().getJob().getState() == null) {
+            flinkDeployment.getSpec().getJob().setState(JobState.RUNNING);
+            LOG.warn(
+                    "Job state was null on parent spec for '{}', defaulting to RUNNING",
+                    flinkDeployment.getMetadata().getName());
+        }
 
         // Update Ingress template if exists to prevent path collision between Blue and Green
         IngressSpec ingress = flinkDeployment.getSpec().getIngress();

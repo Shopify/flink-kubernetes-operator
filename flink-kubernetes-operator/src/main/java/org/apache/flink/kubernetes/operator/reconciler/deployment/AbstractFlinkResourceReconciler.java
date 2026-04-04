@@ -34,6 +34,7 @@ import org.apache.flink.kubernetes.operator.api.status.ReconciliationState;
 import org.apache.flink.kubernetes.operator.autoscaler.KubernetesJobAutoScalerContext;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
+import org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService;
 import org.apache.flink.kubernetes.operator.reconciler.Reconciler;
 import org.apache.flink.kubernetes.operator.reconciler.ReconciliationUtils;
 import org.apache.flink.kubernetes.operator.reconciler.diff.DiffResult;
@@ -129,6 +130,22 @@ public abstract class AbstractFlinkResourceReconciler<
                 cr.getStatus().getReconciliationStatus().deserializeLastReconciledSpec();
         SPEC currentDeploySpec = cr.getSpec();
 
+        // Snapshot pre-autoscaler diff for B/G children so we can distinguish
+        // autoscaler-only changes from parent-initiated ones after applyAutoscaler().
+        boolean isBlueGreenOwned =
+                cr instanceof FlinkDeployment
+                        && BlueGreenKubernetesService.isOwnedByBlueGreenDeployment(
+                                (FlinkDeployment) cr);
+        boolean hasPreAutoscalerSpecChange =
+                isBlueGreenOwned
+                        && DiffType.IGNORE
+                                != new ReflectiveDiffBuilder<>(
+                                                ctx.getDeploymentMode(),
+                                                lastReconciledSpec,
+                                                currentDeploySpec)
+                                        .build()
+                                        .getType();
+
         applyAutoscaler(ctx);
 
         var reconciliationState = reconciliationStatus.getState();
@@ -152,6 +169,19 @@ public abstract class AbstractFlinkResourceReconciler<
             if (checkNewSpecAlreadyDeployed(cr, deployConfig)) {
                 return;
             }
+
+            // Autoscaler-only diff on a B/G child → skip in-place processing.
+            // The B/G parent will detect this via lastReconciledSpec and trigger a transition.
+            if (isBlueGreenOwned && !hasPreAutoscalerSpecChange) {
+                LOG.info(
+                        "Deferring autoscaler change ({}) on B/G child '{}' to parent transition.",
+                        diffType,
+                        cr.getMetadata().getName());
+                ReconciliationUtils.updateStatusForDeployedSpec(
+                        ctx.getResource(), deployConfig, clock);
+                return;
+            }
+
             triggerSpecChangeEvent(cr, specDiff, ctx.getKubernetesClient());
 
             // Try scaling if this is not an upgrade/redeploy change
