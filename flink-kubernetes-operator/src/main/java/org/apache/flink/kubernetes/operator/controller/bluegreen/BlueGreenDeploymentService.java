@@ -775,6 +775,8 @@ public class BlueGreenDeploymentService {
 
         updateBlueGreenIngress(context, nextState);
 
+        updateBlueGreenIngress(context, nextState);
+
         // Finalize status and reschedule immediately so any pending spec changes
         // (e.g., suspend requested during transition) are picked up on next reconcile
         return patchStatusUpdateControl(context, nextState, JobStatus.RUNNING, null)
