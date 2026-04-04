@@ -1,0 +1,140 @@
+################################################################################
+#  Licensed to the Apache Software Foundation (ASF) under one
+#  or more contributor license agreements.  See the NOTICE file
+#  distributed with this work for additional information
+#  regarding copyright ownership.  The ASF licenses this file
+#  to you under the Apache License, Version 2.0 (the
+#  "License"); you may not use this file except in compliance
+#  with the License.  You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+#  Unless required by applicable law or agreed to in writing, software
+#  distributed under the License is distributed on an "AS IS" BASIS,
+#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# limitations under the License.
+################################################################################
+
+suite: Test BlueGreen ValidatingAdmissionPolicy
+
+templates:
+- policies/bluegreen_admission_policy.yaml
+
+release:
+  name: flink-operator
+  namespace: flink-operator
+
+tests:
+- it: Should not create admission policy if `blueGreenAdmissionPolicy.create` is `false`
+  set:
+    blueGreenAdmissionPolicy:
+      create: false
+  asserts:
+  - hasDocuments:
+      count: 0
+
+- it: Should create ValidatingAdmissionPolicy and binding if `blueGreenAdmissionPolicy.create` is `true`
+  set:
+    blueGreenAdmissionPolicy:
+      create: true
+      failurePolicy: Fail
+      validationActions:
+        - Deny
+  asserts:
+  - hasDocuments:
+      count: 2
+  - containsDocument:
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicy
+      name: flink-kubernetes-operator-block-bluegreen-direct-updates
+  - containsDocument:
+      apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingAdmissionPolicyBinding
+      name: flink-kubernetes-operator-block-bluegreen-direct-updates-binding
+
+- it: Should have correct CEL expression in policy
+  set:
+    blueGreenAdmissionPolicy:
+      create: true
+      failurePolicy: Fail
+      validationActions:
+        - Deny
+  asserts:
+  - equal:
+      path: spec.validations[0].expression
+      value: |
+        !has(object.metadata.ownerReferences) ||
+        !object.metadata.ownerReferences.exists(ref, ref.kind == 'FlinkBlueGreenDeployment') ||
+        request.userInfo.username == 'system:serviceaccount:flink-operator:flink-operator'
+    documentIndex: 0
+
+- it: Should set correct failurePolicy
+  set:
+    blueGreenAdmissionPolicy:
+      create: true
+      failurePolicy: Ignore
+      validationActions:
+        - Deny
+  asserts:
+  - equal:
+      path: spec.failurePolicy
+      value: Ignore
+    documentIndex: 0
+
+- it: Should set correct validationActions in binding
+  set:
+    blueGreenAdmissionPolicy:
+      create: true
+      failurePolicy: Fail
+      validationActions:
+        - Deny
+  asserts:
+  - equal:
+      path: spec.validationActions
+      value:
+        - Deny
+    documentIndex: 1
+
+- it: Should only match UPDATE operations on flinkdeployments
+  set:
+    blueGreenAdmissionPolicy:
+      create: true
+      failurePolicy: Fail
+      validationActions:
+        - Deny
+  asserts:
+  - equal:
+      path: spec.matchConstraints.resourceRules[0].apiGroups
+      value:
+        - flink.apache.org
+    documentIndex: 0
+  - equal:
+      path: spec.matchConstraints.resourceRules[0].operations
+      value:
+        - UPDATE
+    documentIndex: 0
+  - equal:
+      path: spec.matchConstraints.resourceRules[0].resources
+      value:
+        - flinkdeployments
+    documentIndex: 0
+
+- it: Should use custom service account name in CEL expression
+  set:
+    blueGreenAdmissionPolicy:
+      create: true
+      failurePolicy: Fail
+      validationActions:
+        - Deny
+    operatorServiceAccount:
+      create: true
+      name: "custom-operator-sa"
+  asserts:
+  - equal:
+      path: spec.validations[0].expression
+      value: |
+        !has(object.metadata.ownerReferences) ||
+        !object.metadata.ownerReferences.exists(ref, ref.kind == 'FlinkBlueGreenDeployment') ||
+        request.userInfo.username == 'system:serviceaccount:flink-operator:custom-operator-sa'
+    documentIndex: 0
+
