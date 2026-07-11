@@ -361,6 +361,8 @@ This serves as a full reference for FlinkDeployment and FlinkSessionJob custom r
 | ----------| ---- | ---- |
 | jobStatus | org.apache.flink.kubernetes.operator.api.status.JobStatus |  |
 | blueGreenState | org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState | The state of the blue/green transition. |
+| observedGeneration | java.lang.Long | Last observed generation of the FlinkBlueGreenDeployment. |
+| lastStableGeneration | java.lang.Long | Last generation that reached a stable terminal state. |
 | lastReconciledSpec | java.lang.String | Last reconciled (serialized) deployment spec. |
 | lastReconciledTimestamp | java.lang.String | Timestamp of last reconciliation. |
 | abortTimestamp | java.lang.String | Computed from abortGracePeriodMs, timestamp after which the deployment should be aborted. |

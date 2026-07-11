@@ -859,6 +859,18 @@ public class BlueGreenDeploymentService {
         status.setSavepointTriggerId(null);
     }
 
+    public static boolean isGenerationObserved(BlueGreenContext context) {
+        return Objects.equals(
+                context.getDeploymentStatus().getObservedGeneration(),
+                context.getBgDeployment().getMetadata().getGeneration());
+    }
+
+    public static boolean isGenerationStable(BlueGreenContext context) {
+        return Objects.equals(
+                context.getDeploymentStatus().getLastStableGeneration(),
+                context.getBgDeployment().getMetadata().getGeneration());
+    }
+
     public static UpdateControl<FlinkBlueGreenDeployment> patchStatusUpdateControl(
             BlueGreenContext context,
             FlinkBlueGreenDeploymentState deploymentState,
@@ -884,6 +896,13 @@ public class BlueGreenDeploymentService {
             deploymentStatus.setError(null);
         }
 
+        if (jobState == JobStatus.RUNNING || jobState == JobStatus.SUSPENDED) {
+            deploymentStatus.setLastStableGeneration(
+                    flinkBlueGreenDeployment.getMetadata().getGeneration());
+        }
+
+        deploymentStatus.setObservedGeneration(
+                flinkBlueGreenDeployment.getMetadata().getGeneration());
         deploymentStatus.setLastReconciledTimestamp(java.time.Instant.now().toString());
         flinkBlueGreenDeployment.setStatus(deploymentStatus);
         return UpdateControl.patchStatus(flinkBlueGreenDeployment);

@@ -17,6 +17,7 @@
 
 package org.apache.flink.kubernetes.operator.controller;
 
+import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.kubernetes.operator.api.FlinkBlueGreenDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState;
@@ -45,6 +46,8 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.ACTIVE_BLUE;
+import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.ACTIVE_GREEN;
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.INITIALIZING_BLUE;
 
 /**
@@ -151,6 +154,30 @@ public class FlinkBlueGreenDeploymentController implements Reconciler<FlinkBlueG
 
             BlueGreenStateHandler handler = handlerRegistry.getHandler(currentState);
             UpdateControl<FlinkBlueGreenDeployment> updateControl = handler.handle(context);
+
+            var isActiveState = currentState == ACTIVE_BLUE || currentState == ACTIVE_GREEN;
+            var jobStatus = deploymentStatus.getJobStatus();
+            var jobState = jobStatus == null ? null : jobStatus.getState();
+            var isTerminalJobState =
+                    jobState == JobStatus.RUNNING
+                            || jobState == JobStatus.FINISHED
+                            || jobState == JobStatus.SUSPENDED;
+            if (updateControl.isNoUpdate()
+                    && (!BlueGreenDeploymentService.isGenerationObserved(context)
+                            || (isActiveState
+                                    && isTerminalJobState
+                                    && !BlueGreenDeploymentService.isGenerationStable(context)))) {
+                if (isActiveState && isTerminalJobState) {
+                    deploymentStatus.setLastStableGeneration(
+                            bgDeployment.getMetadata().getGeneration());
+                }
+                var statusUpdateControl =
+                        BlueGreenDeploymentService.patchStatusUpdateControl(
+                                context, null, null, null);
+                updateControl.getScheduleDelay().ifPresent(statusUpdateControl::rescheduleAfter);
+                updateControl = statusUpdateControl;
+            }
+
             statusRecorder.patchAndCacheStatus(bgDeployment, josdkContext.getClient());
             return updateControl;
         }

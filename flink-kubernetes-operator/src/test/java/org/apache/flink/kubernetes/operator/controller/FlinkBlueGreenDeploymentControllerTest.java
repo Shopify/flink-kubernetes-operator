@@ -52,6 +52,7 @@ import io.javaoperatorsdk.operator.api.reconciler.Context;
 import io.javaoperatorsdk.operator.api.reconciler.UpdateControl;
 import org.jetbrains.annotations.NotNull;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -126,6 +127,118 @@ public class FlinkBlueGreenDeploymentControllerTest {
                         initialSavepointPath,
                         UpgradeMode.STATELESS);
         executeBasicDeployment(flinkVersion, blueGreenDeployment, true, initialSavepointPath);
+    }
+
+    @Test
+    public void verifyObservedGenerationUpdatedWhenNewSpecObserved() throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        FlinkVersion.v1_20,
+                        null,
+                        UpgradeMode.STATELESS);
+        var rs = executeBasicDeployment(FlinkVersion.v1_20, blueGreenDeployment, false, null);
+
+        Long previousGeneration = rs.deployment.getMetadata().getGeneration();
+        assertNotNull(previousGeneration);
+        assertEquals(previousGeneration, rs.reconciledStatus.getObservedGeneration());
+        assertEquals(previousGeneration, rs.reconciledStatus.getLastStableGeneration());
+
+        simulateSpecChange(rs.deployment, UUID.randomUUID().toString());
+        Long newGeneration = previousGeneration + 1;
+        rs.deployment.getMetadata().setGeneration(newGeneration);
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+
+        rs = reconcile(rs.deployment);
+
+        assertEquals(newGeneration, rs.reconciledStatus.getObservedGeneration());
+        assertEquals(previousGeneration, rs.reconciledStatus.getLastStableGeneration());
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+        assertEquals(JobStatus.RECONCILING, rs.reconciledStatus.getJobStatus().getState());
+    }
+
+    @Test
+    public void verifyObservedGenerationBackfilledForExistingStatus() throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        FlinkVersion.v1_20,
+                        null,
+                        UpgradeMode.STATELESS);
+        var rs = executeBasicDeployment(FlinkVersion.v1_20, blueGreenDeployment, false, null);
+
+        rs.deployment.getStatus().setObservedGeneration(null);
+        rs.deployment.getStatus().setLastStableGeneration(null);
+
+        rs = reconcile(rs.deployment);
+
+        assertTrue(rs.updateControl.isPatchStatus());
+        assertEquals(
+                rs.deployment.getMetadata().getGeneration(),
+                rs.reconciledStatus.getObservedGeneration());
+        assertEquals(
+                rs.deployment.getMetadata().getGeneration(),
+                rs.reconciledStatus.getLastStableGeneration());
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE, rs.reconciledStatus.getBlueGreenState());
+        assertEquals(JobStatus.RUNNING, rs.reconciledStatus.getJobStatus().getState());
+    }
+
+    @Test
+    public void verifyStableGenerationNotUpdatedWhenTransitionFailsBeforeStart() throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        FlinkVersion.v1_20,
+                        null,
+                        UpgradeMode.STATELESS);
+        var rs = executeBasicDeployment(FlinkVersion.v1_20, blueGreenDeployment, false, null);
+
+        Long previousGeneration = rs.deployment.getMetadata().getGeneration();
+        simulateSpecChange(rs.deployment, UUID.randomUUID().toString());
+        Long newGeneration = previousGeneration + 1;
+        rs.deployment.getMetadata().setGeneration(newGeneration);
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        simulateJobFailure(getFlinkDeployments().get(0));
+
+        rs = reconcile(rs.deployment);
+
+        assertEquals(newGeneration, rs.reconciledStatus.getObservedGeneration());
+        assertEquals(previousGeneration, rs.reconciledStatus.getLastStableGeneration());
+        assertEquals(JobStatus.FAILING, rs.reconciledStatus.getJobStatus().getState());
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE, rs.reconciledStatus.getBlueGreenState());
+    }
+
+    @Test
+    public void verifyStableGenerationNotUpdatedDuringSavepointHandoff() throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        FlinkVersion.v1_20,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+        var rs = executeBasicDeployment(FlinkVersion.v1_20, blueGreenDeployment, false, null);
+
+        Long previousGeneration = rs.deployment.getMetadata().getGeneration();
+        simulateSpecChange(rs.deployment, UUID.randomUUID().toString());
+        Long newGeneration = previousGeneration + 1;
+        rs.deployment.getMetadata().setGeneration(newGeneration);
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+
+        rs = handleSavepoint(rs);
+
+        assertEquals(newGeneration, rs.reconciledStatus.getObservedGeneration());
+        assertEquals(previousGeneration, rs.reconciledStatus.getLastStableGeneration());
+        assertEquals(
+                FlinkBlueGreenDeploymentState.ACTIVE_BLUE, rs.reconciledStatus.getBlueGreenState());
+        assertEquals(JobStatus.RUNNING, rs.reconciledStatus.getJobStatus().getState());
     }
 
     @ParameterizedTest
@@ -1181,6 +1294,12 @@ public class FlinkBlueGreenDeploymentControllerTest {
                 JobStatus.SUSPENDED,
                 rs.reconciledStatus.getJobStatus().getState(),
                 "Job status should be SUSPENDED when initial deployment is blocked");
+        assertEquals(
+                rs.deployment.getMetadata().getGeneration(),
+                rs.reconciledStatus.getObservedGeneration());
+        assertEquals(
+                rs.deployment.getMetadata().getGeneration(),
+                rs.reconciledStatus.getLastStableGeneration());
 
         // Flip to RUNNING and reconcile again
         bg = rs.deployment;
@@ -1507,6 +1626,12 @@ public class FlinkBlueGreenDeploymentControllerTest {
                 rs.reconciledStatus.getLastReconciledSpec());
         assertEquals(expectedBGDeploymentState, rs.reconciledStatus.getBlueGreenState());
         assertEquals(JobStatus.RUNNING, rs.reconciledStatus.getJobStatus().getState());
+        assertEquals(
+                rs.deployment.getMetadata().getGeneration(),
+                rs.reconciledStatus.getObservedGeneration());
+        assertEquals(
+                rs.deployment.getMetadata().getGeneration(),
+                rs.reconciledStatus.getLastStableGeneration());
         assertEquals(0, instantStrToMillis(rs.reconciledStatus.getDeploymentReadyTimestamp()));
         assertEquals(0, instantStrToMillis(rs.reconciledStatus.getAbortTimestamp()));
 
@@ -1796,6 +1921,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
                         .withCreationTimestamp(Instant.now().toString())
                         .withUid(UUID.randomUUID().toString())
                         .withResourceVersion("1")
+                        .withGeneration(1L)
                         .build());
         var bgDeploymentSpec = getTestFlinkDeploymentSpec(version);
 
