@@ -161,7 +161,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
     }
 
     @Test
-    public void verifyObservedGenerationBackfilledForExistingStatus() throws Exception {
+    public void verifyGenerationStatusSyncedForExistingStableStatus() throws Exception {
         var blueGreenDeployment =
                 buildSessionCluster(
                         TEST_DEPLOYMENT_NAME,
