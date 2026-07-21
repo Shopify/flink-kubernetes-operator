@@ -17,6 +17,7 @@
 
 package org.apache.flink.kubernetes.operator.controller;
 
+import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.kubernetes.operator.api.FlinkBlueGreenDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState;
@@ -45,6 +46,8 @@ import org.slf4j.LoggerFactory;
 import java.util.ArrayList;
 import java.util.List;
 
+import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.ACTIVE_BLUE;
+import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.ACTIVE_GREEN;
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.INITIALIZING_BLUE;
 
 /**
@@ -151,9 +154,59 @@ public class FlinkBlueGreenDeploymentController implements Reconciler<FlinkBlueG
 
             BlueGreenStateHandler handler = handlerRegistry.getHandler(currentState);
             UpdateControl<FlinkBlueGreenDeployment> updateControl = handler.handle(context);
+            updateControl =
+                    syncGenerationStatusIfNeeded(
+                            bgDeployment, context, currentState, deploymentStatus, updateControl);
+
             statusRecorder.patchAndCacheStatus(bgDeployment, josdkContext.getClient());
             return updateControl;
         }
+    }
+
+    private static UpdateControl<FlinkBlueGreenDeployment> syncGenerationStatusIfNeeded(
+            FlinkBlueGreenDeployment bgDeployment,
+            BlueGreenContext context,
+            FlinkBlueGreenDeploymentState currentState,
+            FlinkBlueGreenDeploymentStatus deploymentStatus,
+            UpdateControl<FlinkBlueGreenDeployment> updateControl) {
+
+        // Migration/no-op path: kapp may reconcile an existing stable CR without rollout work when
+        // the rendered BlueGreen spec is unchanged, or when only non-spec resources/metadata
+        // changed. Handlers return noUpdate() in those cases, so sync generation status here.
+        if (updateControl.isNoUpdate()) {
+            var needsSync = !BlueGreenDeploymentService.isGenerationObserved(context);
+
+            if (!BlueGreenDeploymentService.isGenerationStable(context)
+                    && isStableBlueGreenJobStatus(currentState, deploymentStatus)) {
+                deploymentStatus.setLastStableGeneration(
+                        bgDeployment.getMetadata().getGeneration());
+                needsSync = true;
+            }
+
+            if (needsSync) {
+                var statusUpdateControl =
+                        BlueGreenDeploymentService.patchStatusUpdateControl(
+                                context, null, null, null);
+                updateControl.getScheduleDelay().ifPresent(statusUpdateControl::rescheduleAfter);
+                return statusUpdateControl;
+            }
+        }
+
+        return updateControl;
+    }
+
+    private static boolean isStableBlueGreenJobStatus(
+            FlinkBlueGreenDeploymentState currentState,
+            FlinkBlueGreenDeploymentStatus deploymentStatus) {
+        // Suspension is represented as ACTIVE_* with parent jobStatus SUSPENDED, not as a separate
+        // BlueGreen state. Transitional or failing states must continue waiting for finalization.
+        if (currentState != ACTIVE_BLUE && currentState != ACTIVE_GREEN) {
+            return false;
+        }
+
+        var jobStatus = deploymentStatus.getJobStatus();
+        var jobState = jobStatus == null ? null : jobStatus.getState();
+        return jobState == JobStatus.RUNNING || jobState == JobStatus.SUSPENDED;
     }
 
     public static void logAndThrow(String message) {

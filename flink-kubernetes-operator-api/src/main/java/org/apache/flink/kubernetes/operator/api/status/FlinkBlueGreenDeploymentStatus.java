@@ -41,6 +41,12 @@ public class FlinkBlueGreenDeploymentStatus {
     /** The state of the blue/green transition. */
     private FlinkBlueGreenDeploymentState blueGreenState;
 
+    /** Last observed generation of the FlinkBlueGreenDeployment. */
+    private Long observedGeneration;
+
+    /** Last generation that reached a stable terminal state. */
+    private Long lastStableGeneration;
+
     /** Last reconciled (serialized) deployment spec. */
     private String lastReconciledSpec;
 
