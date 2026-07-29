@@ -892,7 +892,9 @@ public class ApplicationReconcilerTest extends OperatorTestBase {
 
                     @Override
                     protected Map<JobVertexID, JobVertexResourceRequirements> getVertexResources(
-                            RestClusterClient<String> c, AbstractFlinkResource<?, ?> r) {
+                            RestClusterClient<String> c,
+                            AbstractFlinkResource<?, ?> r,
+                            Duration restClientTimeout) {
                         return submitted;
                     }
 
@@ -900,6 +902,7 @@ public class ApplicationReconcilerTest extends OperatorTestBase {
                     protected void updateVertexResources(
                             RestClusterClient<String> c,
                             AbstractFlinkResource<?, ?> r,
+                            Duration restClientTimeout,
                             Map<JobVertexID, JobVertexResourceRequirements> req) {
                         submitted = req;
                         rescaleCounter.incrementAndGet();

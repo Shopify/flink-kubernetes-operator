@@ -19,6 +19,7 @@ package org.apache.flink.kubernetes.operator.service;
 
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
+import org.apache.flink.autoscaler.config.AutoScalerOptions;
 import org.apache.flink.client.program.rest.RestClusterClient;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.JobManagerOptions;
@@ -260,7 +261,8 @@ public class NativeFlinkServiceTest {
                     @Override
                     protected Map<JobVertexID, JobVertexResourceRequirements> getVertexResources(
                             RestClusterClient<String> client,
-                            AbstractFlinkResource<?, ?> resource) {
+                            AbstractFlinkResource<?, ?> resource,
+                            Duration restClientTimeout) {
                         return current.get();
                     }
 
@@ -268,6 +270,7 @@ public class NativeFlinkServiceTest {
                     protected void updateVertexResources(
                             RestClusterClient<String> client,
                             AbstractFlinkResource<?, ?> resource,
+                            Duration restClientTimeout,
                             Map<JobVertexID, JobVertexResourceRequirements> newReqs) {
                         updated.set(newReqs);
                     }
@@ -552,11 +555,45 @@ public class NativeFlinkServiceTest {
 
         var deployment = TestUtils.buildApplicationCluster();
         deployment.getStatus().getJobStatus().setJobId(jobId.toString());
+        var restClientTimeout = service.getRescaleRestClientTimeout(configuration);
         assertEquals(
                 reqs.getJobVertexParallelisms(),
-                service.getVertexResources(testingClusterClient, deployment));
+                service.getVertexResources(testingClusterClient, deployment, restClientTimeout));
         service.updateVertexResources(
-                testingClusterClient, deployment, reqs.getJobVertexParallelisms());
+                testingClusterClient,
+                deployment,
+                restClientTimeout,
+                reqs.getJobVertexParallelisms());
+    }
+
+    @Test
+    public void testRescaleRestClientTimeoutFallsBackToOperatorTimeout() {
+        var service = createServiceWithOperatorClientTimeout(Duration.ofSeconds(60));
+
+        // Key unset -> the operator-global timeout keeps governing the rescale REST calls.
+        assertEquals(
+                Duration.ofSeconds(60), service.getRescaleRestClientTimeout(new Configuration()));
+    }
+
+    @Test
+    public void testRescaleRestClientTimeoutHonoursDeploymentOverride() {
+        var service = createServiceWithOperatorClientTimeout(Duration.ofSeconds(60));
+
+        var deployConf = new Configuration();
+        deployConf.set(AutoScalerOptions.FLINK_CLIENT_TIMEOUT, Duration.ofSeconds(30));
+
+        // Key explicitly set -> the deployment value wins over the operator-global timeout.
+        assertEquals(Duration.ofSeconds(30), service.getRescaleRestClientTimeout(deployConf));
+    }
+
+    private NativeFlinkService createServiceWithOperatorClientTimeout(Duration timeout) {
+        configuration.set(KubernetesOperatorConfigOptions.OPERATOR_FLINK_CLIENT_TIMEOUT, timeout);
+        return new NativeFlinkService(
+                client,
+                null,
+                executorService,
+                FlinkOperatorConfiguration.fromConfiguration(configuration),
+                eventRecorder);
     }
 
     class TestingNativeFlinkService extends NativeFlinkService {

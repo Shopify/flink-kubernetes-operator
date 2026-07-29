@@ -20,6 +20,7 @@ package org.apache.flink.kubernetes.operator.service;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
+import org.apache.flink.autoscaler.config.AutoScalerOptions;
 import org.apache.flink.client.cli.ApplicationDeployer;
 import org.apache.flink.client.deployment.ClusterClientFactory;
 import org.apache.flink.client.deployment.ClusterClientServiceLoader;
@@ -187,8 +188,11 @@ public class NativeFlinkService extends AbstractFlinkService {
             return false;
         }
 
+        var restClientTimeout = getRescaleRestClientTimeout(observeConfig);
+
         try (var client = getClusterClient(observeConfig)) {
-            var requirements = new HashMap<>(getVertexResources(client, resource));
+            var requirements =
+                    new HashMap<>(getVertexResources(client, resource, restClientTimeout));
             var alreadyScaled = true;
 
             for (Map.Entry<JobVertexID, JobVertexResourceRequirements> entry :
@@ -224,7 +228,7 @@ public class NativeFlinkService extends AbstractFlinkService {
             if (alreadyScaled) {
                 LOG.info("Vertex resources requirements already match target, nothing to do...");
             } else {
-                updateVertexResources(client, resource, requirements);
+                updateVertexResources(client, resource, restClientTimeout, requirements);
                 eventRecorder.triggerEvent(
                         resource,
                         EventRecorder.Type.Normal,
@@ -269,10 +273,26 @@ public class NativeFlinkService extends AbstractFlinkService {
         return true;
     }
 
+    /**
+     * Timeout for the resource requirement REST calls made against the running JobManager during
+     * in-place scaling. Deployments may raise it through {@link
+     * AutoScalerOptions#FLINK_CLIENT_TIMEOUT}, otherwise the operator-global {@code
+     * kubernetes.operator.flink.client.timeout} is used as before.
+     *
+     * @param conf Config of the deployment being rescaled.
+     * @return Timeout to apply to the in-place scaling REST calls.
+     */
+    @VisibleForTesting
+    protected Duration getRescaleRestClientTimeout(Configuration conf) {
+        return conf.getOptional(AutoScalerOptions.FLINK_CLIENT_TIMEOUT)
+                .orElseGet(operatorConfig::getFlinkClientTimeout);
+    }
+
     @VisibleForTesting
     protected void updateVertexResources(
             RestClusterClient<String> client,
             AbstractFlinkResource<?, ?> resource,
+            Duration restClientTimeout,
             Map<JobVertexID, JobVertexResourceRequirements> newReqs)
             throws Exception {
         var jobParameters = new JobMessageParameters();
@@ -282,12 +302,14 @@ public class NativeFlinkService extends AbstractFlinkService {
         var requestBody = new JobResourceRequirementsBody(new JobResourceRequirements(newReqs));
 
         client.sendRequest(new JobResourcesRequirementsUpdateHeaders(), jobParameters, requestBody)
-                .get(operatorConfig.getFlinkClientTimeout().toSeconds(), TimeUnit.SECONDS);
+                .get(restClientTimeout.toSeconds(), TimeUnit.SECONDS);
     }
 
     @VisibleForTesting
     protected Map<JobVertexID, JobVertexResourceRequirements> getVertexResources(
-            RestClusterClient<String> client, AbstractFlinkResource<?, ?> resource)
+            RestClusterClient<String> client,
+            AbstractFlinkResource<?, ?> resource,
+            Duration restClientTimeout)
             throws Exception {
         var jobParameters = new JobMessageParameters();
         jobParameters.jobPathParameter.resolve(
@@ -298,7 +320,7 @@ public class NativeFlinkService extends AbstractFlinkService {
                                 new JobResourceRequirementsHeaders(),
                                 jobParameters,
                                 EmptyRequestBody.getInstance())
-                        .get(operatorConfig.getFlinkClientTimeout().toSeconds(), TimeUnit.SECONDS);
+                        .get(restClientTimeout.toSeconds(), TimeUnit.SECONDS);
 
         return currentRequirements.asJobResourceRequirements().get().getJobVertexParallelisms();
     }
