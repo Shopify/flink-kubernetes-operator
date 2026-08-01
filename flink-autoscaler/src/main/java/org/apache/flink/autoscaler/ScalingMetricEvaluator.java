@@ -158,7 +158,12 @@ public class ScalingMetricEvaluator {
                 TRUE_PROCESSING_RATE,
                 EvaluatedScalingMetric.avg(
                         computeTrueProcessingRate(
-                                busyTimeAvg, inputRateAvg, metricsHistory, vertex, conf)));
+                                busyTimeAvg,
+                                inputRateAvg,
+                                metricsHistory,
+                                vertex,
+                                conf,
+                                vertexInfo.getParallelism())));
 
         evaluatedMetrics.put(LOAD, EvaluatedScalingMetric.avg(busyTimeAvg / 1000.));
 
@@ -218,6 +223,7 @@ public class ScalingMetricEvaluator {
      * @param metricsHistory
      * @param vertex
      * @param conf
+     * @param parallelism
      * @return Average true processing rate over metric window.
      */
     protected static double computeTrueProcessingRate(
@@ -225,9 +231,15 @@ public class ScalingMetricEvaluator {
             double inputRateAvg,
             SortedMap<Instant, CollectedMetrics> metricsHistory,
             JobVertexID vertex,
-            Configuration conf) {
+            Configuration conf,
+            int parallelism) {
 
-        var busyTimeTpr = computeTprFromBusyTime(busyTimeAvg, inputRateAvg);
+        var busyTimeTpr =
+                computeTprFromBusyTime(
+                        busyTimeAvg,
+                        inputRateAvg,
+                        parallelism,
+                        conf.get(AutoScalerOptions.VERTEX_IDLE_INPUT_RATE_THRESHOLD));
         var observedTprAvg =
                 getAverage(
                         OBSERVED_TPR,
@@ -239,10 +251,28 @@ public class ScalingMetricEvaluator {
         return tprMetric == OBSERVED_TPR ? observedTprAvg : busyTimeTpr;
     }
 
-    private static double computeTprFromBusyTime(double busyMsPerSecond, double rate) {
+    private static double computeTprFromBusyTime(
+            double busyMsPerSecond, double rate, int parallelism, double idleInputRateThreshold) {
         if (rate == 0) {
             // Nothing is coming in, we assume infinite processing power
             // until we can sample the true processing rate (i.e. data flows).
+            return Double.POSITIVE_INFINITY;
+        }
+        if (parallelism > 0 && rate / parallelism < idleInputRateThreshold) {
+            // Next to nothing is coming in, but not exactly nothing, so the guard above does not
+            // catch it. busyMsPerSecond can still read close to saturated here: with the default
+            // MAX aggregator a single briefly-busy subtask reports for the whole vertex, so on a
+            // wide and almost idle vertex the aggregated busy time approaches 1000 ms/s while
+            // nearly every subtask is doing nothing. rate / busyTime is then a ratio of two
+            // noise-floor numbers, and the resulting scale factor saturates the scale-up and
+            // scale-down clamps on alternating evaluations, so the vertex oscillates between min
+            // and max parallelism indefinitely instead of converging.
+            //
+            // Below the threshold there are too few records per subtask in a metric window to
+            // estimate a processing rate at all, so treat the vertex as idle exactly as we do
+            // when the rate is precisely zero. If the vertex is in fact backlogged, OBSERVED_TPR
+            // is measured during catch-up and selectTprMetric prefers it over an infinite
+            // busy-time TPR, so genuine scale-ups are still driven by the observed rate.
             return Double.POSITIVE_INFINITY;
         }
         return rate / (busyMsPerSecond / 1000);

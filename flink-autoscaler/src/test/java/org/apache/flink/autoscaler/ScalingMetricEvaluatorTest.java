@@ -427,7 +427,7 @@ public class ScalingMetricEvaluatorTest {
         assertEquals(
                 350,
                 ScalingMetricEvaluator.computeTrueProcessingRate(
-                        100, 35, metricHistory, source, conf));
+                        100, 35, metricHistory, source, conf, 1));
 
         // Set diff threshold to 10% -> outside threshold
         conf.set(AutoScalerOptions.OBSERVED_TRUE_PROCESSING_RATE_SWITCH_THRESHOLD, 0.1);
@@ -436,14 +436,14 @@ public class ScalingMetricEvaluatorTest {
         assertEquals(
                 300,
                 ScalingMetricEvaluator.computeTrueProcessingRate(
-                        100, 35, metricHistory, source, conf));
+                        100, 35, metricHistory, source, conf, 1));
 
         // Test that observed tpr min observations are respected. If less, use busy time
         conf.set(AutoScalerOptions.OBSERVED_TRUE_PROCESSING_RATE_MIN_OBSERVATIONS, 3);
         assertEquals(
                 350,
                 ScalingMetricEvaluator.computeTrueProcessingRate(
-                        100, 35, metricHistory, source, conf));
+                        100, 35, metricHistory, source, conf, 1));
     }
 
     @Test
@@ -456,22 +456,22 @@ public class ScalingMetricEvaluatorTest {
         assertEquals(
                 350.,
                 ScalingMetricEvaluator.computeTrueProcessingRate(
-                        100, 35, metricHistory, source, conf));
+                        100, 35, metricHistory, source, conf, 1));
 
         assertEquals(
                 Double.POSITIVE_INFINITY,
                 ScalingMetricEvaluator.computeTrueProcessingRate(
-                        0, 100, metricHistory, source, conf));
+                        0, 100, metricHistory, source, conf, 1));
 
         assertEquals(
                 Double.POSITIVE_INFINITY,
                 ScalingMetricEvaluator.computeTrueProcessingRate(
-                        0, 0, metricHistory, source, conf));
+                        0, 0, metricHistory, source, conf, 1));
 
         assertEquals(
                 Double.NaN,
                 ScalingMetricEvaluator.computeTrueProcessingRate(
-                        Double.NaN, Double.NaN, metricHistory, source, conf));
+                        Double.NaN, Double.NaN, metricHistory, source, conf, 1));
     }
 
     @Test
@@ -490,7 +490,7 @@ public class ScalingMetricEvaluatorTest {
         assertEquals(
                 300.,
                 ScalingMetricEvaluator.computeTrueProcessingRate(
-                        Double.NaN, 1., metricHistory, source, new Configuration()));
+                        Double.NaN, 1., metricHistory, source, new Configuration(), 1));
     }
 
     @Test
@@ -595,7 +595,85 @@ public class ScalingMetricEvaluatorTest {
                         inputRate,
                         new TreeMap<>(),
                         new JobVertexID(),
-                        new Configuration()));
+                        new Configuration(),
+                        1));
+    }
+
+    @Test
+    public void testIdleWideVertexIsNotScaledOnNoiseFloorTpr() {
+        // A processing-failure / dead-letter sink: 100 subtasks handling ~0.03 records per second
+        // between them, so 0.0003 records per subtask per second. Meanwhile a single subtask is
+        // briefly busy each window (checkpoint-aligned committer work) and with the default MAX
+        // aggregator that one subtask reports 1000 ms/s for the whole vertex.
+        var v = new JobVertexID();
+        var conf = new Configuration();
+        var metricHistory = new TreeMap<Instant, CollectedMetrics>();
+
+        // Without the guard the ratio would be 0.03 / 1.0 = 0.03 rec/s, a number built from two
+        // noise floors, which is what makes the scale factor saturate the clamps.
+        assertEquals(
+                Double.POSITIVE_INFINITY,
+                ScalingMetricEvaluator.computeTrueProcessingRate(
+                        1000., 0.03, metricHistory, v, conf, 100));
+
+        // Setting the threshold to 0 restores the previous behaviour.
+        conf.set(AutoScalerOptions.VERTEX_IDLE_INPUT_RATE_THRESHOLD, 0.0);
+        assertEquals(
+                0.03,
+                ScalingMetricEvaluator.computeTrueProcessingRate(
+                        1000., 0.03, metricHistory, v, conf, 100));
+    }
+
+    @Test
+    public void testSlowButSaturatedVertexIsStillScaled() {
+        // The case the guard must not break: parallelism 1, half a record per second, but each
+        // record takes ~2s so the single subtask is fully busy. 0.5 rec/subtask/s is 50x the
+        // default threshold, so this keeps its real true processing rate.
+        var v = new JobVertexID();
+        var conf = new Configuration();
+        var metricHistory = new TreeMap<Instant, CollectedMetrics>();
+
+        assertEquals(
+                0.5,
+                ScalingMetricEvaluator.computeTrueProcessingRate(
+                        1000., 0.5, metricHistory, v, conf, 1));
+
+        // The same total rate spread over 100 subtasks is idle by the same measure.
+        assertEquals(
+                Double.POSITIVE_INFINITY,
+                ScalingMetricEvaluator.computeTrueProcessingRate(
+                        1000., 0.5, metricHistory, v, conf, 100));
+    }
+
+    @Test
+    public void testIdleGuardIsSkippedForUnknownParallelism() {
+        // Parallelism is not always known. Rather than divide by zero, fall through to the
+        // existing behaviour.
+        var v = new JobVertexID();
+        var conf = new Configuration();
+        var metricHistory = new TreeMap<Instant, CollectedMetrics>();
+
+        assertEquals(
+                0.03,
+                ScalingMetricEvaluator.computeTrueProcessingRate(
+                        1000., 0.03, metricHistory, v, conf, 0));
+    }
+
+    @Test
+    public void testIdleGuardBoundary() {
+        var v = new JobVertexID();
+        var conf = new Configuration();
+        var metricHistory = new TreeMap<Instant, CollectedMetrics>();
+
+        // Exactly at the threshold is not idle, just below it is.
+        assertEquals(
+                0.1,
+                ScalingMetricEvaluator.computeTrueProcessingRate(
+                        1000., 0.1, metricHistory, v, conf, 10));
+        assertEquals(
+                Double.POSITIVE_INFINITY,
+                ScalingMetricEvaluator.computeTrueProcessingRate(
+                        1000., 0.09, metricHistory, v, conf, 10));
     }
 
     @Test

@@ -332,6 +332,14 @@ public class AutoScalerOptions {
                     .withDescription(
                             "Metric aggregator to use for busyTime metrics. This affects how true processing/output rate will be computed. Using max allows us to handle jobs with data skew more robustly, while avg may provide better stability when we know that the load distribution is even.");
 
+    public static final ConfigOption<Double> VERTEX_IDLE_INPUT_RATE_THRESHOLD =
+            autoScalerConfig("vertex.idle-input-rate-threshold")
+                    .doubleType()
+                    .defaultValue(0.01)
+                    .withFallbackKeys(oldOperatorConfigKey("vertex.idle-input-rate-threshold"))
+                    .withDescription(
+                            "Per-subtask input rate, in records per second averaged over the metric window, below which a vertex is treated as idle and its busy time based true processing rate is not trusted. Below this rate there are too few records per subtask to estimate a processing rate, while the aggregated busy time can still read close to saturated (with the default MAX aggregator a single briefly-busy subtask reports for the whole vertex). That combination makes the scale factor saturate the scale-up and scale-down clamps on alternating evaluations, so the vertex oscillates between min and max parallelism. Such vertices are treated the same as ones with an input rate of exactly zero. Set to 0 to restore the previous behaviour of only special-casing an exactly-zero rate.");
+
     public static final ConfigOption<List<String>> VERTEX_EXCLUDE_IDS =
             autoScalerConfig("vertex.exclude.ids")
                     .stringType()
