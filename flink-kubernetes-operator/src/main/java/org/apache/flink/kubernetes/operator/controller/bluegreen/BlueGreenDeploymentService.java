@@ -705,6 +705,11 @@ public class BlueGreenDeploymentService {
             String deploymentName) {
 
         suspendFlinkDeployment(context, nextDeployment);
+        if (!deleteFlinkDeployment(nextDeployment, context)) {
+            LOG.info("FlinkDeployment '{}' not deleted, will retry", deploymentName);
+            return UpdateControl.<FlinkBlueGreenDeployment>noUpdate()
+                    .rescheduleAfter(RETRY_DELAY_MS);
+        }
 
         FlinkBlueGreenDeploymentState previousState =
                 getPreviousState(nextState, context.getDeployments());
