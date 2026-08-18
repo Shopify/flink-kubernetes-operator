@@ -339,6 +339,7 @@ public class BlueGreenUtils {
         // 3. Redeploy scenarios (lastCheckpoint is null): use initialSavepointPath from spec
         //    - savepointRedeployNonce changed
         //    - upgradeMode is STATELESS
+        String stateSpot;
         if (isFirstDeployment) {
             String initialSavepointPath =
                     spec.getTemplate().getSpec().getJob().getInitialSavepointPath();
@@ -365,7 +366,8 @@ public class BlueGreenUtils {
         }
 
         flinkDeployment.setSpec(spec.getTemplate().getSpec());
-
+        // set the upgradeSavepointPath for the job as well
+        flinkDeployment.getStatus().getJobStatus().setUpgradeSavepointPath(spec.getTemplate().getSpec().getJob().getInitialSavepointPath());
         // Update Ingress template if exists to prevent path collision between Blue and Green
         IngressSpec ingress = flinkDeployment.getSpec().getIngress();
         if (ingress != null) {
