@@ -704,7 +704,16 @@ public class BlueGreenDeploymentService {
             FlinkBlueGreenDeploymentState nextState,
             String deploymentName) {
 
-        suspendFlinkDeployment(context, nextDeployment);
+        // Only delete failed CR on blue-green transition
+        if (context.getDeployments().getNumberOfDeployments() == 2) {
+            if (!deleteFlinkDeployment(nextDeployment, context)) {
+                LOG.info("FlinkDeployment '{}' not deleted, will retry", deploymentName);
+                return UpdateControl.<FlinkBlueGreenDeployment>noUpdate()
+                        .rescheduleAfter(RETRY_DELAY_MS);
+            }
+        } else {
+            suspendFlinkDeployment(context, nextDeployment);
+        }
 
         FlinkBlueGreenDeploymentState previousState =
                 getPreviousState(nextState, context.getDeployments());

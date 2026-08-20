@@ -459,6 +459,34 @@ public class FlinkBlueGreenDeploymentControllerTest {
 
     @ParameterizedTest
     @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyTimedOutInPlaceTransitionRetainsOnlyChild(FlinkVersion flinkVersion)
+            throws Exception {
+        var rs = setupActiveBlueDeployment(flinkVersion);
+        var deployment = rs.deployment;
+        deployment.getSpec().getTemplate().getSpec().getJob().setState(JobState.SUSPENDED);
+        kubernetesClient.resource(deployment).createOrReplace();
+
+        rs = reconcile(deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_BLUE,
+                rs.reconciledStatus.getBlueGreenState());
+
+        // Expire the in-place transition before the child controller finishes suspending Blue.
+        rs.deployment.getStatus().setAbortTimestamp(Instant.ofEpochMilli(1).toString());
+        rs = reconcile(rs.deployment);
+
+        assertFailingJobStatus(rs);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.INITIALIZING_BLUE,
+                rs.reconciledStatus.getBlueGreenState());
+        var flinkDeployments = getFlinkDeployments();
+        assertEquals(1, flinkDeployments.size(), "The only child must be retained");
+        assertEquals(BLUE_CLUSTER_ID, flinkDeployments.get(0).getMetadata().getName());
+        assertEquals(JobState.SUSPENDED, flinkDeployments.get(0).getSpec().getJob().getState());
+    }
+
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
     public void verifySuspendDuringTransitionIsBlockedUntilComplete(FlinkVersion flinkVersion)
             throws Exception {
         // Start with a running Blue deployment with longer abort grace period
@@ -644,24 +672,19 @@ public class FlinkBlueGreenDeploymentControllerTest {
 
         assertTrue(rs.updateControl.isPatchStatus());
 
-        // The first job should be RUNNING, the second should be SUSPENDED
+        // The failed target is deleted and the original Blue deployment remains running.
         assertFailingJobStatus(rs);
         // No longer TRANSITIONING_TO_GREEN and rolled back to ACTIVE_BLUE
         assertEquals(
                 FlinkBlueGreenDeploymentState.ACTIVE_BLUE, rs.reconciledStatus.getBlueGreenState());
         var flinkDeployments = getFlinkDeployments();
-        assertEquals(2, flinkDeployments.size());
+        assertEquals(1, flinkDeployments.size());
+        assertEquals(BLUE_CLUSTER_ID, flinkDeployments.get(0).getMetadata().getName());
         assertEquals(
                 JobStatus.RUNNING, flinkDeployments.get(0).getStatus().getJobStatus().getState());
         assertEquals(
                 ReconciliationState.DEPLOYED,
                 flinkDeployments.get(0).getStatus().getReconciliationStatus().getState());
-        // The B/G controller changes the State = SUSPENDED, the actual suspension is done by the
-        // FlinkDeploymentController
-        assertEquals(JobState.SUSPENDED, flinkDeployments.get(1).getSpec().getJob().getState());
-        assertEquals(
-                ReconciliationState.UPGRADING,
-                flinkDeployments.get(1).getStatus().getReconciliationStatus().getState());
         assertEquals(0, instantStrToMillis(rs.reconciledStatus.getAbortTimestamp()));
         // savepointTriggerId must be cleared on abort so the next transition
         // triggers a fresh savepoint instead of reusing a stale triggerId
@@ -679,6 +702,96 @@ public class FlinkBlueGreenDeploymentControllerTest {
 
         // Initiate the redeployment
         testTransitionToGreen(rs, customValue, null);
+    }
+
+    @Test
+    public void verifyRetryAfterFailedTransitionUsesFreshSavepoint() throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        FlinkVersion.v1_20,
+                        null,
+                        UpgradeMode.SAVEPOINT);
+        var rs = executeBasicDeployment(FlinkVersion.v1_20, blueGreenDeployment, false, null);
+
+        // Start the first Blue -> Green transition with a savepoint produced from Blue.
+        simulateSpecChange(rs.deployment, UUID.randomUUID().toString());
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+
+        var green = getFlinkDeploymentByName(GREEN_CLUSTER_ID);
+        var firstTransitionSavepoint = green.getSpec().getJob().getInitialSavepointPath();
+        assertNotNull(firstTransitionSavepoint);
+
+        // Reconcile Green through the real FlinkDeployment controller so its restore state is
+        // recorded exactly as it would be in Kubernetes.
+        var greenFlinkService = new TestingFlinkService(kubernetesClient);
+        var childController =
+                new TestingFlinkDeploymentController(configManager, greenFlinkService);
+        Context<FlinkDeployment> childContext = greenFlinkService.getContext();
+        // First child reconciliation submits Green and records the JM as DEPLOYING.
+        childController.reconcile(green, childContext);
+        // Status patches advance resourceVersion, so each reconciliation uses the latest object.
+        green = getFlinkDeploymentByName(GREEN_CLUSTER_ID);
+
+        // Second child reconciliation observes the JM port and records DEPLOYED_NOT_READY.
+        childController.reconcile(green, childContext);
+        green = getFlinkDeploymentByName(GREEN_CLUSTER_ID);
+
+        // Third child reconciliation marks the JM READY and observes the Flink job as RUNNING.
+        childController.reconcile(green, childContext);
+        green = getFlinkDeploymentByName(GREEN_CLUSTER_ID);
+        assertEquals(JobStatus.RUNNING, green.getStatus().getJobStatus().getState());
+        assertEquals(
+                firstTransitionSavepoint,
+                green.getStatus().getJobStatus().getUpgradeSavepointPath());
+
+        // Keep Green below the B/G readiness threshold while retaining its observed running job,
+        // reproducing a target that times out before becoming stable.
+        green.getStatus().getReconciliationStatus().setState(ReconciliationState.UPGRADING);
+        kubernetesClient.resource(green).updateStatus();
+
+        // Expire the transition and let the B/G controller perform its configured abort cleanup.
+        rs.deployment.getStatus().setAbortTimestamp(Instant.ofEpochMilli(1).toString());
+        rs = reconcile(rs.deployment);
+
+        // If abort retains Green, let the child controller reconcile the state chosen by B/G. If
+        // abort deletes Green, use a fresh child controller for the replacement deployment below.
+        var greenAfterAbort =
+                getFlinkDeployments().stream()
+                        .filter(d -> GREEN_CLUSTER_ID.equals(d.getMetadata().getName()))
+                        .findFirst();
+        if (greenAfterAbort.isPresent()) {
+            childController.reconcile(greenAfterAbort.get(), childContext);
+        } else {
+            greenFlinkService = new TestingFlinkService(kubernetesClient);
+            childController =
+                    new TestingFlinkDeploymentController(configManager, greenFlinkService);
+            childContext = greenFlinkService.getContext();
+        }
+
+        // Start a second Blue -> Green transition
+        simulateSpecChange(rs.deployment, UUID.randomUUID().toString());
+        rs = handleSavepoint(rs);
+        rs = reconcile(rs.deployment);
+
+        green = getFlinkDeploymentByName(GREEN_CLUSTER_ID);
+        var freshSavepoint = green.getSpec().getJob().getInitialSavepointPath();
+        assertNotNull(freshSavepoint);
+        assertNotEquals(firstTransitionSavepoint, freshSavepoint);
+
+        // Regardless of whether abort retained or deleted the first Green resource, the actual
+        // submission for the next Green attempt must use the fresh B/G hand-off savepoint.
+        childController.reconcile(green, childContext);
+        assertEquals(
+                freshSavepoint,
+                greenFlinkService.listJobs().get(0).f0,
+                "Green restored from an earlier savepoint instead of the fresh Blue/Green "
+                        + "initialSavepointPath");
     }
 
     @ParameterizedTest
@@ -852,13 +965,13 @@ public class FlinkBlueGreenDeploymentControllerTest {
         assertEquals(
                 FlinkBlueGreenDeploymentState.ACTIVE_BLUE, rs.reconciledStatus.getBlueGreenState());
         assertEquals(
+                1,
+                getFlinkDeployments().size(),
+                "the failed Green target must be deleted after the abort");
+        assertEquals(
                 JobState.RUNNING,
                 getFlinkDeployments().get(0).getSpec().getJob().getState(),
                 "Blue must keep running after the abort");
-        assertEquals(
-                JobState.SUSPENDED,
-                getFlinkDeployments().get(1).getSpec().getJob().getState(),
-                "Green must be suspended on abort while Blue keeps running");
         assertEquals(
                 0,
                 instantStrToMillis(rs.reconciledStatus.getDeploymentReadyTimestamp()),
@@ -1025,14 +1138,13 @@ public class FlinkBlueGreenDeploymentControllerTest {
 
         assertFailingJobStatus(rs);
 
-        // No longer TRANSITIONING_TO_GREEN and rolled back to INITIALIZING_BLUE
+        // No longer TRANSITIONING_TO_BLUE and rolled back to INITIALIZING_BLUE.
         assertEquals(
                 FlinkBlueGreenDeploymentState.INITIALIZING_BLUE,
                 rs.reconciledStatus.getBlueGreenState());
         var flinkDeployments = getFlinkDeployments();
         assertEquals(1, flinkDeployments.size());
-        // The B/G controller changes the State = SUSPENDED, the actual suspension is done by the
-        // FlinkDeploymentController
+        assertEquals(BLUE_CLUSTER_ID, flinkDeployments.get(0).getMetadata().getName());
         assertEquals(JobState.SUSPENDED, flinkDeployments.get(0).getSpec().getJob().getState());
 
         // No-op if the spec remains the same
