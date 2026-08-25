@@ -44,6 +44,7 @@ class FlinkVersionTest {
         assertEquals(FlinkVersion.fromMajorMinor(1, 18), FlinkVersion.v1_18);
         assertEquals(FlinkVersion.fromMajorMinor(1, 19), FlinkVersion.v1_19);
         assertEquals(FlinkVersion.fromMajorMinor(1, 20), FlinkVersion.v1_20);
+        assertEquals(FlinkVersion.fromMajorMinor(2, 3), FlinkVersion.v2_3);
         assertThrows(IllegalArgumentException.class, () -> FlinkVersion.fromMajorMinor(0, 1));
     }
 }

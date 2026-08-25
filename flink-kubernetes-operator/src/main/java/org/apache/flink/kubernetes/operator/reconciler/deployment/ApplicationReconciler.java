@@ -26,6 +26,7 @@ import org.apache.flink.configuration.PipelineOptionsInternal;
 import org.apache.flink.kubernetes.configuration.KubernetesConfigOptions;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentSpec;
+import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.api.status.FlinkDeploymentStatus;
 import org.apache.flink.kubernetes.operator.api.status.JobManagerDeploymentStatus;
@@ -71,6 +72,10 @@ public class ApplicationReconciler
     private static final Logger LOG = LoggerFactory.getLogger(ApplicationReconciler.class);
     static final String MSG_RECOVERY = "Recovering lost deployment";
     static final String MSG_RESTART_UNHEALTHY = "Restarting unhealthy job";
+    static final String APPLICATION_RESULT_STORE_STORAGE_PATH =
+            "application-result-store.storage-path";
+    static final String APPLICATION_RESULT_STORE_DELETE_ON_COMMIT =
+            "application-result-store.delete-on-commit";
 
     public ApplicationReconciler(
             EventRecorder eventRecorder,
@@ -168,6 +173,7 @@ public class ApplicationReconciler
 
         setOwnerReference(relatedResource, deployConfig);
         setRandomJobResultStorePath(deployConfig);
+        setRandomApplicationResultStorePath(deployConfig, spec.getFlinkVersion());
 
         if (status.getJobManagerDeploymentStatus() != JobManagerDeploymentStatus.MISSING) {
             Preconditions.checkArgument(ReconciliationUtils.isJobInTerminalState(status));
@@ -260,6 +266,27 @@ public class ApplicationReconciler
                     JobResultStoreOptions.STORAGE_PATH,
                     effectiveConfig.getString(HighAvailabilityOptions.HA_STORAGE_PATH)
                             + "/job-result-store/"
+                            + effectiveConfig.getString(KubernetesConfigOptions.CLUSTER_ID)
+                            + "/"
+                            + UUID.randomUUID());
+        }
+    }
+
+    private static void setRandomApplicationResultStorePath(
+            Configuration effectiveConfig, FlinkVersion flinkVersion) {
+        if (flinkVersion == null || !flinkVersion.isEqualOrNewer(FlinkVersion.v2_3)) {
+            return;
+        }
+
+        if (effectiveConfig.contains(HighAvailabilityOptions.HA_STORAGE_PATH)) {
+            if (!effectiveConfig.containsKey(APPLICATION_RESULT_STORE_DELETE_ON_COMMIT)) {
+                effectiveConfig.setString(APPLICATION_RESULT_STORE_DELETE_ON_COMMIT, "false");
+            }
+
+            effectiveConfig.setString(
+                    APPLICATION_RESULT_STORE_STORAGE_PATH,
+                    effectiveConfig.getString(HighAvailabilityOptions.HA_STORAGE_PATH)
+                            + "/application-result-store/"
                             + effectiveConfig.getString(KubernetesConfigOptions.CLUSTER_ID)
                             + "/"
                             + UUID.randomUUID());
