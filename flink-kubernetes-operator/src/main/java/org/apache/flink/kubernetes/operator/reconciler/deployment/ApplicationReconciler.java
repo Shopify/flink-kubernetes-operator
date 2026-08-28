@@ -272,6 +272,7 @@ public class ApplicationReconciler
         }
     }
 
+    // Workaround for https://issues.apache.org/jira/browse/FLINK-40467
     private static void setRandomApplicationResultStorePath(
             Configuration effectiveConfig, FlinkVersion flinkVersion) {
         if (flinkVersion == null || !flinkVersion.isEqualOrNewer(FlinkVersion.v2_3)) {
