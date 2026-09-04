@@ -165,6 +165,7 @@ This serves as a full reference for FlinkDeployment and FlinkSessionJob custom r
 | v2_0 |  |
 | v2_1 |  |
 | v2_2 |  |
+| v2_3 |  |
 | majorVersion | int | The major integer from the Flink semver. For example for Flink 1.18.1 this would be 1. |
 | minorVersion | int | The minor integer from the Flink semver. For example for Flink 1.18.1 this would be 18. |
 

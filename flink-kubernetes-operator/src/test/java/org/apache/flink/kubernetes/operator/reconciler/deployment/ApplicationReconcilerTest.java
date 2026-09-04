@@ -802,6 +802,73 @@ public class ApplicationReconcilerTest extends OperatorTestBase {
     }
 
     @Test
+    public void testRandomApplicationResultStorePathForFlink23() throws Exception {
+        FlinkDeployment flinkApp = TestUtils.buildApplicationCluster(FlinkVersion.v2_3);
+        final String haStoragePath = "file:///flink-data/ha";
+        flinkApp.getSpec()
+                .getFlinkConfiguration()
+                .put(HighAvailabilityOptions.HA_STORAGE_PATH.key(), haStoragePath);
+
+        ObjectMeta deployMeta = flinkApp.getMetadata();
+        FlinkDeploymentStatus status = flinkApp.getStatus();
+        FlinkDeploymentSpec spec = flinkApp.getSpec();
+        Configuration deployConfig = configManager.getDeployConfig(deployMeta, spec);
+
+        status.getJobStatus().setState(org.apache.flink.api.common.JobStatus.FINISHED);
+        status.setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+        reconciler
+                .getReconciler()
+                .deploy(getResourceContext(flinkApp), spec, deployConfig, Optional.empty(), false);
+
+        String path1 =
+                deployConfig.getString(
+                        ApplicationReconciler.APPLICATION_RESULT_STORE_STORAGE_PATH, null);
+        assertEquals(
+                "false",
+                deployConfig.getString(
+                        ApplicationReconciler.APPLICATION_RESULT_STORE_DELETE_ON_COMMIT, null));
+        assertTrue(path1.startsWith(haStoragePath));
+
+        status.getJobStatus().setState(org.apache.flink.api.common.JobStatus.FINISHED);
+        status.setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+        reconciler
+                .getReconciler()
+                .deploy(getResourceContext(flinkApp), spec, deployConfig, Optional.empty(), false);
+        String path2 =
+                deployConfig.getString(
+                        ApplicationReconciler.APPLICATION_RESULT_STORE_STORAGE_PATH, null);
+        assertTrue(path2.startsWith(haStoragePath));
+        assertNotEquals(path1, path2);
+    }
+
+    @Test
+    public void testApplicationResultStorePathNotSetBeforeFlink23() throws Exception {
+        FlinkDeployment flinkApp = TestUtils.buildApplicationCluster(FlinkVersion.v2_2);
+        final String haStoragePath = "file:///flink-data/ha";
+        flinkApp.getSpec()
+                .getFlinkConfiguration()
+                .put(HighAvailabilityOptions.HA_STORAGE_PATH.key(), haStoragePath);
+
+        ObjectMeta deployMeta = flinkApp.getMetadata();
+        FlinkDeploymentStatus status = flinkApp.getStatus();
+        FlinkDeploymentSpec spec = flinkApp.getSpec();
+        Configuration deployConfig = configManager.getDeployConfig(deployMeta, spec);
+
+        status.getJobStatus().setState(org.apache.flink.api.common.JobStatus.FINISHED);
+        status.setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+        reconciler
+                .getReconciler()
+                .deploy(getResourceContext(flinkApp), spec, deployConfig, Optional.empty(), false);
+
+        assertFalse(
+                deployConfig.containsKey(
+                        ApplicationReconciler.APPLICATION_RESULT_STORE_STORAGE_PATH));
+        assertFalse(
+                deployConfig.containsKey(
+                        ApplicationReconciler.APPLICATION_RESULT_STORE_DELETE_ON_COMMIT));
+    }
+
+    @Test
     public void testAlwaysSavepointOnFlinkVersionChange() throws Exception {
         var deployment = TestUtils.buildApplicationCluster(FlinkVersion.v1_18);
         getJobSpec(deployment).setUpgradeMode(UpgradeMode.LAST_STATE);

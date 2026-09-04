@@ -106,6 +106,9 @@ drwxr-xr-x 2 9999 9999 60 May 12 09:46 a6031ec7-ab3e-4b30-ba77-6498e58e6b7f
 drwxr-xr-x 2 9999 9999 60 May 11 15:11 b6fb2a9c-d1cd-4e65-a9a1-e825c4b47543
 ```
 
+### ApplicationResultStore Resource Leak
+When an application finishes, Flink 2.3 and above records a terminal result for it and refuses to run an application that already has one. An application cluster only ever runs a single application, but its identity is derived from the cluster id (the CR name), so every redeployment of the same resource looks like that same application to Flink, and a result left behind by one deployment stops the next one from submitting its job. To mitigate [FLINK-40467](https://issues.apache.org/jira/browse/FLINK-40467) the operator therefore sets `application-result-store.delete-on-commit=false` and a unique value for `application-result-store.storage-path` for every cluster launch. As with the job result store above, the storage path for older runs must be cleaned up manually, keeping the latest directory always.
+
 ### AuditUtils can log sensitive information present in the custom resources
 As reported in [FLINK-30306](https://issues.apache.org/jira/browse/FLINK-30306) when Flink custom resources change the operator logs the change, which could include sensitive information. We suggest ingesting secrets to Flink containers during runtime to mitigate this.
 Also note that anyone who has access to the custom resources already had access to the potentially sensitive information in question, but folks who only have access to the logs could also see them now. We are planning to introduce redaction rules to AuditUtils to improve this in a later release.
