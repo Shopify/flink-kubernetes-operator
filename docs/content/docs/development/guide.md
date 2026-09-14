@@ -77,6 +77,12 @@ eval $(minikube docker-env)
 DOCKER_BUILDKIT=1 docker build . -t <repo>/flink-kubernetes-operator:latest
 ```
 
+minikube 1.39 and later default to containerd, which does not support building images through `minikube docker-env`. Building through `docker-env` needs a cluster on the Docker runtime, as used by the end-to-end tests, and minikube cannot change the runtime of an existing cluster. The recommended approach is to remove the existing cluster with `minikube delete` and to start a new one with:
+
+```bash
+minikube start --kubernetes-version=v1.28.0 --container-runtime=docker
+```
+
 When you want to reset your environment to the defaults you can do the following:
 ```bash
 eval $(minikube docker-env --unset)
