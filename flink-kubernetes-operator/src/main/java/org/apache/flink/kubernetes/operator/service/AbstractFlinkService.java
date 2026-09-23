@@ -373,7 +373,10 @@ public abstract class AbstractFlinkService implements FlinkService {
         try (var clusterClient = getClusterClient(conf)) {
             switch (suspendMode) {
                 case STATELESS:
-                    if (!cancelJobOrError(clusterClient, status, true)) {
+                    // A job that already terminated is gone. Cancelling it again would be
+                    // acknowledged by Flink for CANCELED jobs and look like a pending cancel.
+                    if (!ReconciliationUtils.isJobInTerminalState(status)
+                            && !cancelJobOrError(clusterClient, status, true)) {
                         // This is async we need to return and re-observe
                         return CancelResult.pending();
                     }

@@ -122,6 +122,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.testcontainers.shaded.com.google.common.collect.ImmutableMap;
@@ -400,6 +401,38 @@ public class AbstractFlinkServiceTest {
         var jobStatus = job.getStatus().getJobStatus();
         jobStatus.setJobId(null);
         jobStatus.setState(FINISHED);
+        ReconciliationUtils.updateStatusForDeployedSpec(job, new Configuration());
+
+        var result = flinkService.cancelSessionJob(job, SuspendMode.STATELESS, new Configuration());
+        assertFalse(result.isPending());
+        assertEquals(FINISHED, jobStatus.getState());
+        assertNull(jobStatus.getJobId());
+    }
+
+    /**
+     * Cancelling a session job that already reached a terminal state must complete immediately.
+     * Flink acknowledges the cancellation of an already CANCELED job, which would otherwise be
+     * reported as a pending cancellation over and over again.
+     */
+    @ParameterizedTest
+    @EnumSource(
+            value = org.apache.flink.api.common.JobStatus.class,
+            names = {"CANCELED", "FAILED", "FINISHED"})
+    public void cancelSessionJobWithStatelessModeAndTerminalJob(
+            org.apache.flink.api.common.JobStatus terminalState) throws Exception {
+        var testingClusterClient =
+                new TestingClusterClient<>(configuration, TestUtils.TEST_DEPLOYMENT_NAME);
+        testingClusterClient.setCancelFunction(
+                jobID -> {
+                    fail("cancel should not be called for a terminated job");
+                    return null;
+                });
+        var flinkService = new TestingService(testingClusterClient);
+
+        var job = TestUtils.buildSessionJob();
+        var jobStatus = job.getStatus().getJobStatus();
+        jobStatus.setJobId(JobID.generate().toHexString());
+        jobStatus.setState(terminalState);
         ReconciliationUtils.updateStatusForDeployedSpec(job, new Configuration());
 
         var result = flinkService.cancelSessionJob(job, SuspendMode.STATELESS, new Configuration());
