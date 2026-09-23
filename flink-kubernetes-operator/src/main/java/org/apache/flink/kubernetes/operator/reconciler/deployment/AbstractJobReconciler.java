@@ -39,6 +39,7 @@ import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptio
 import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
 import org.apache.flink.kubernetes.operator.exception.UpgradeFailureException;
 import org.apache.flink.kubernetes.operator.reconciler.ReconciliationUtils;
+import org.apache.flink.kubernetes.operator.reconciler.RedeployRequest;
 import org.apache.flink.kubernetes.operator.reconciler.SnapshotTriggerTimestampStore;
 import org.apache.flink.kubernetes.operator.reconciler.SnapshotType;
 import org.apache.flink.kubernetes.operator.service.CheckpointHistoryWrapper;
@@ -79,6 +80,11 @@ public abstract class AbstractJobReconciler<
     private static final Logger LOG = LoggerFactory.getLogger(AbstractJobReconciler.class);
 
     public static final String LAST_STATE_DUMMY_SP_PATH = "KUBERNETES_OPERATOR_LAST_STATE";
+
+    public static final String MSG_REDEPLOY_STATELESS =
+            "Redeploying job without state, discarding the current job state.";
+    public static final String MSG_REDEPLOY_FROM_SAVEPOINT =
+            "Redeploying job from savepoint %s, discarding the current job state.";
 
     private final SnapshotTriggerTimestampStore snapshotTriggerTimestampStore =
             new SnapshotTriggerTimestampStore();
@@ -125,9 +131,13 @@ public abstract class AbstractJobReconciler<
         JobState desiredJobState = currentDeploySpec.getJob().getState();
 
         if (diffType == DiffType.SAVEPOINT_REDEPLOY) {
-            redeployWithSavepoint(
-                    ctx, deployConfig, resource, status, currentDeploySpec, desiredJobState);
-            return true;
+            var request =
+                    RedeployRequest.resolve(lastReconciledSpec.getJob(), currentDeploySpec.getJob())
+                            .orElseThrow(
+                                    () ->
+                                            new IllegalStateException(
+                                                    "Redeploy diff without redeploy request"));
+            return redeploy(ctx, deployConfig, request);
         }
 
         if (currentJobState == JobState.RUNNING) {
@@ -587,32 +597,52 @@ public abstract class AbstractJobReconciler<
         restoreJob(ctx, specToRecover, ctx.getObserveConfig(), requireHaMetadata);
     }
 
-    private void redeployWithSavepoint(
-            FlinkResourceContext<CR> ctx,
-            Configuration deployConfig,
-            CR resource,
-            STATUS status,
-            SPEC currentDeploySpec,
-            JobState desiredJobState)
+    /**
+     * Redeploys the job, discarding its current state: the job and its HA metadata are removed, the
+     * redeploy target becomes the only known state of the job, and the job is restored through the
+     * regular restore path. The request is only consumed (recorded in the last reconciled spec)
+     * once the previous job is gone, so an asynchronous cancellation simply retries on the next
+     * reconciliation.
+     */
+    private boolean redeploy(
+            FlinkResourceContext<CR> ctx, Configuration deployConfig, RedeployRequest request)
             throws Exception {
-        LOG.info("Redeploying from savepoint");
-        cancelJob(ctx, SuspendMode.STATELESS);
-        currentDeploySpec.getJob().setUpgradeMode(UpgradeMode.SAVEPOINT);
+        var resource = ctx.getResource();
+        var status = resource.getStatus();
+        var spec = resource.getSpec();
 
-        Optional<String> savepointPath =
-                Optional.ofNullable(currentDeploySpec.getJob().getInitialSavepointPath());
-        status.getJobStatus().setUpgradeSavepointPath(savepointPath.orElse(null));
+        if (cancelJob(ctx, SuspendMode.STATELESS)) {
+            LOG.info("Waiting for the job to be cancelled before redeploying");
+            return true;
+        }
 
-        if (desiredJobState == JobState.RUNNING) {
-            deploy(
-                    ctx,
-                    currentDeploySpec,
-                    ctx.getDeployConfig(currentDeploySpec),
-                    savepointPath,
-                    false);
+        var jobStatus = status.getJobStatus();
+        jobStatus.setUpgradeSavepointPath(request.getSavepointPath());
+        // Clear the legacy savepoint info, it would otherwise be used as a restore fallback
+        jobStatus.getSavepointInfo().setLastSavepoint(null);
+        spec.getJob().setUpgradeMode(request.getRestoreMode());
+
+        var message =
+                request.getSavepointPath() == null
+                        ? MSG_REDEPLOY_STATELESS
+                        : String.format(MSG_REDEPLOY_FROM_SAVEPOINT, request.getSavepointPath());
+        LOG.info(message);
+        eventRecorder.triggerEvent(
+                resource,
+                EventRecorder.Type.Normal,
+                EventRecorder.Reason.Suspended,
+                EventRecorder.Component.JobManagerDeployment,
+                message,
+                ctx.getKubernetesClient());
+
+        if (spec.getJob().getState() == JobState.RUNNING) {
+            ReconciliationUtils.updateStatusBeforeDeploymentAttempt(resource, deployConfig, clock);
+            statusRecorder.patchAndCacheStatus(resource, ctx.getKubernetesClient());
+            restoreJob(ctx, spec, deployConfig, false);
         }
         ReconciliationUtils.updateStatusForDeployedSpec(resource, deployConfig, clock);
         status.getReconciliationStatus().markReconciledSpecAsStable();
+        return true;
     }
 
     /**

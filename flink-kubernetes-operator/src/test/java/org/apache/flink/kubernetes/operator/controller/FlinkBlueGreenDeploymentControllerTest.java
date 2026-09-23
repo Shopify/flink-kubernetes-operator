@@ -34,6 +34,7 @@ import org.apache.flink.kubernetes.operator.api.spec.IngressSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobManagerSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobState;
+import org.apache.flink.kubernetes.operator.api.spec.RedeploySpec;
 import org.apache.flink.kubernetes.operator.api.spec.Resource;
 import org.apache.flink.kubernetes.operator.api.spec.TaskManagerSpec;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
@@ -372,6 +373,39 @@ public class FlinkBlueGreenDeploymentControllerTest {
         assertEquals(
                 FlinkBlueGreenDeploymentState.ACTIVE_GREEN,
                 rs.reconciledStatus.getBlueGreenState());
+    }
+
+    @ParameterizedTest
+    @MethodSource("org.apache.flink.kubernetes.operator.TestUtils#flinkVersions")
+    public void verifyRedeployNonceTriggersTransitionWithRequestedState(FlinkVersion flinkVersion)
+            throws Exception {
+        var blueGreenDeployment =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        flinkVersion,
+                        "s3://bucket/initial-savepoint",
+                        UpgradeMode.SAVEPOINT);
+        var rs = executeBasicDeployment(flinkVersion, blueGreenDeployment, false, null);
+
+        // Stateless redeploy: the initialSavepointPath of the template must not be used
+        rs.deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getJob()
+                .setRedeploy(RedeploySpec.builder().nonce(1L).build());
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+
+        // Reconcile - should skip savepointing and go directly to transition
+        rs = reconcile(rs.deployment);
+        assertEquals(
+                FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN,
+                rs.reconciledStatus.getBlueGreenState());
+
+        var flinkDeployments = getFlinkDeployments();
+        assertEquals(2, flinkDeployments.size());
+        assertNull(flinkDeployments.get(1).getSpec().getJob().getInitialSavepointPath());
     }
 
     @ParameterizedTest

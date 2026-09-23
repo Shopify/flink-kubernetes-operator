@@ -36,12 +36,15 @@ import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptio
 import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
 import org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenContext;
 import org.apache.flink.kubernetes.operator.observer.SavepointFetchResult;
+import org.apache.flink.kubernetes.operator.reconciler.RedeployRequest;
 import org.apache.flink.kubernetes.operator.reconciler.diff.FlinkBlueGreenDeploymentSpecDiff;
 import org.apache.flink.util.Preconditions;
 
 import io.fabric8.kubernetes.api.model.ObjectMeta;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.annotation.Nullable;
 
 import java.time.Instant;
 import java.util.Map;
@@ -85,6 +88,24 @@ public class BlueGreenUtils {
                         context.getBgDeployment().getSpec());
 
         return diff.compare();
+    }
+
+    /**
+     * Resolves the redeploy requested by the pending spec change of the Blue/Green deployment, if
+     * any. Must be called before the current spec is recorded as last reconciled.
+     *
+     * @param context the Blue/Green transition context
+     * @return the requested redeploy, or empty if the spec change does not request one
+     */
+    public static Optional<RedeployRequest> getRedeployRequest(BlueGreenContext context) {
+        FlinkBlueGreenDeploymentSpec lastSpec =
+                SpecUtils.readSpecFromJSON(
+                        context.getDeploymentStatus().getLastReconciledSpec(),
+                        "spec",
+                        FlinkBlueGreenDeploymentSpec.class);
+        return RedeployRequest.resolve(
+                lastSpec.getTemplate().getSpec().getJob(),
+                context.getBgDeployment().getSpec().getTemplate().getSpec().getJob());
     }
 
     public static void setLastReconciledSpec(BlueGreenContext context) {
@@ -311,6 +332,8 @@ public class BlueGreenUtils {
      * @param lastCheckpoint the savepoint/checkpoint to restore from (can be null)
      * @param isFirstDeployment whether this is the initial deployment
      * @param bgMeta the metadata of the parent Blue/Green deployment
+     * @param redeploy the redeploy requested by the spec change, determines the state of the new
+     *     deployment when set (can be null)
      * @return configured FlinkDeployment ready for deployment
      */
     public static FlinkDeployment prepareFlinkDeployment(
@@ -318,7 +341,8 @@ public class BlueGreenUtils {
             BlueGreenDeploymentType blueGreenDeploymentType,
             Savepoint lastCheckpoint,
             boolean isFirstDeployment,
-            ObjectMeta bgMeta) {
+            ObjectMeta bgMeta,
+            @Nullable RedeployRequest redeploy) {
         // Deployment
         FlinkDeployment flinkDeployment = new FlinkDeployment();
         FlinkBlueGreenDeploymentSpec originalSpec = context.getBgDeployment().getSpec();
@@ -335,10 +359,10 @@ public class BlueGreenUtils {
 
         // Determine which savepoint/checkpoint to restore from:
         // 1. First-time deployments: use initialSavepointPath from spec (if set)
-        // 2. Normal transitions: use lastCheckpoint from previous deployment
-        // 3. Redeploy scenarios (lastCheckpoint is null): use initialSavepointPath from spec
-        //    - savepointRedeployNonce changed
-        //    - upgradeMode is STATELESS
+        // 2. Redeploys: use the savepoint of the redeploy request, or no state
+        // 3. Normal transitions: use lastCheckpoint from previous deployment
+        // 4. Otherwise (lastCheckpoint is null, e.g. upgradeMode is STATELESS): use
+        //    initialSavepointPath from spec
         if (isFirstDeployment) {
             String initialSavepointPath =
                     spec.getTemplate().getSpec().getJob().getInitialSavepointPath();
@@ -348,6 +372,16 @@ public class BlueGreenUtils {
             } else {
                 LOG.info("Clean startup with no checkpoint/savepoint restoration");
             }
+        } else if (redeploy != null) {
+            if (redeploy.getSavepointPath() != null) {
+                LOG.info("Redeploying from savepoint: {}", redeploy.getSavepointPath());
+            } else {
+                LOG.info("Redeploying without state");
+            }
+            spec.getTemplate()
+                    .getSpec()
+                    .getJob()
+                    .setInitialSavepointPath(redeploy.getSavepointPath());
         } else if (lastCheckpoint != null) {
             String location = lastCheckpoint.getLocation().replace("file:", "");
             LOG.info("Using Blue/Green savepoint/checkpoint: " + location);

@@ -32,7 +32,10 @@ public enum DiffType {
     SCALE,
     /** Upgradable spec change. */
     UPGRADE,
-    /** Full redeploy from new state. */
+    /**
+     * Full redeploy discarding the current job state, from a user-specified savepoint or without
+     * state.
+     */
     SAVEPOINT_REDEPLOY;
 
     /**

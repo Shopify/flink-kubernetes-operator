@@ -27,10 +27,12 @@ import org.apache.flink.kubernetes.operator.api.CrdConstants;
 import org.apache.flink.kubernetes.operator.api.FlinkSessionJob;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkSessionJobSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobState;
+import org.apache.flink.kubernetes.operator.api.spec.RedeploySpec;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.api.status.FlinkSessionJobStatus;
 import org.apache.flink.kubernetes.operator.api.status.JobStatus;
 import org.apache.flink.kubernetes.operator.api.status.ReconciliationState;
+import org.apache.flink.kubernetes.operator.api.status.Savepoint;
 import org.apache.flink.kubernetes.operator.api.status.SnapshotTriggerType;
 import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
@@ -860,5 +862,51 @@ public class SessionJobReconcilerTest extends OperatorTestBase {
                 sessionJob.getStatus().getReconciliationStatus().getState());
         // New jobID recorded despite failure
         Assertions.assertNotEquals(jobID, sessionJob.getStatus().getJobStatus().getJobId());
+    }
+
+    @Test
+    public void testRedeployWaitsForCancellation() throws Exception {
+        var readyCtx = TestUtils.createContextWithReadyFlinkDeployment(kubernetesClient);
+        FlinkSessionJob sessionJob = TestUtils.buildSessionJob();
+        sessionJob.getSpec().getJob().setUpgradeMode(UpgradeMode.SAVEPOINT);
+
+        reconciler.reconcile(sessionJob, readyCtx);
+        verifyAndSetRunningJobsToStatus(
+                sessionJob, JobState.RUNNING, RECONCILING, null, flinkService.listJobs());
+        var oldJobId = sessionJob.getStatus().getJobStatus().getJobId();
+        sessionJob
+                .getStatus()
+                .getJobStatus()
+                .getSavepointInfo()
+                .updateLastSavepoint(Savepoint.of("previous-sp", SnapshotTriggerType.PERIODIC));
+
+        // Stateless redeploy, the cancellation completes asynchronously
+        sessionJob.getSpec().getJob().setRedeploy(RedeploySpec.builder().nonce(1L).build());
+        reconciler.reconcile(sessionJob, readyCtx);
+        assertEquals(CANCELLING, sessionJob.getStatus().getJobStatus().getState());
+        assertEquals(1, flinkService.listJobs().size());
+        assertNull(getReconciledJobSpec(sessionJob).getRedeploy());
+
+        // Nothing is submitted while the job is cancelling
+        reconciler.reconcile(sessionJob, readyCtx);
+        assertEquals(CANCELLING, sessionJob.getStatus().getJobStatus().getState());
+        assertEquals(1, flinkService.listJobs().size());
+
+        // The observer records the cancellation and marks the job suspended
+        sessionJob.getStatus().getJobStatus().setState(CANCELED);
+        ReconciliationUtils.updateLastReconciledSpec(
+                sessionJob, (spec, meta) -> spec.getJob().setState(JobState.SUSPENDED));
+
+        // The redeploy completes without cancelling the terminated job again
+        reconciler.reconcile(sessionJob, readyCtx);
+        assertEquals(2, flinkService.listJobs().size());
+        var newJob = verifyAndReturnTheSubmittedJob(sessionJob, flinkService.listJobs());
+        Assertions.assertNotEquals(oldJobId, newJob.f1.getJobId().toHexString());
+        assertNull(newJob.f0);
+        verifyJobState(sessionJob, JobState.RUNNING, RECONCILING);
+        assertEquals(1L, getReconciledJobSpec(sessionJob).getRedeploy().getNonce());
+        assertEquals(UpgradeMode.STATELESS, getReconciledJobSpec(sessionJob).getUpgradeMode());
+        assertNull(sessionJob.getStatus().getJobStatus().getSavepointInfo().getLastSavepoint());
+        assertTrue(sessionJob.getStatus().getReconciliationStatus().isLastReconciledSpecStable());
     }
 }

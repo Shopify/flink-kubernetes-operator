@@ -124,11 +124,12 @@ This page serves as a full reference for FlinkDeployment custom resource definit
 | args | java.lang.String[] | Arguments for the Flink job main class. |
 | state | org.apache.flink.kubernetes.operator.api.spec.JobState | Desired state for the job. |
 | savepointTriggerNonce | java.lang.Long | Nonce used to manually trigger savepoint for the running job. In order to trigger a savepoint, change the number to a different non-null value. |
-| initialSavepointPath | java.lang.String | Savepoint path used by the job the first time it is deployed or during savepoint redeployments (triggered by changing the savepointRedeployNonce). |
+| initialSavepointPath | java.lang.String | Savepoint path used by the job the first time it is deployed. Also used by redeployments triggered through the deprecated savepointRedeployNonce. |
 | checkpointTriggerNonce | java.lang.Long | Nonce used to manually trigger checkpoint for the running job. In order to trigger a checkpoint, change the number to a different non-null value. |
 | upgradeMode | org.apache.flink.kubernetes.operator.api.spec.UpgradeMode | Upgrade mode of the Flink job. |
 | allowNonRestoredState | java.lang.Boolean | Allow checkpoint state that cannot be mapped to any job vertex in tasks. |
-| savepointRedeployNonce | java.lang.Long | Nonce used to trigger a full redeployment of the job from the savepoint path specified in initialSavepointPath. In order to trigger redeployment, change the number to a different non-null value. Rollback is not possible after redeployment. |
+| savepointRedeployNonce | java.lang.Long | Nonce used to trigger a full redeployment of the job from the savepoint path specified in initialSavepointPath. In order to trigger redeployment, change the number to a different non-null value. Rollback is not possible after redeployment.@deprecated use redeploy.nonce together with redeploy.savepointPath instead |
+| redeploy | org.apache.flink.kubernetes.operator.api.spec.RedeploySpec | One-shot redeployment of the job. Changing redeploy.nonce to a new non-null value cancels the job, discards its current state and deploys it again from redeploy.savepointPath, or without state if no path is set. Has no effect on the first deployment. Rollback is not possible after redeployment. |
 
 ### JobState
 **Class**: org.apache.flink.kubernetes.operator.api.spec.JobState
@@ -149,6 +150,16 @@ This page serves as a full reference for FlinkDeployment custom resource definit
 | ----- | ---- |
 | native | Deploys Flink using Flinks native Kubernetes support. Only supported for newer versions of Flink |
 | standalone | Deploys Flink on-top of kubernetes in standalone mode. |
+
+### RedeploySpec
+**Class**: org.apache.flink.kubernetes.operator.api.spec.RedeploySpec
+
+**Description**: One-shot redeployment of a Flink job, discarding its current state.
+
+| Parameter | Type | Docs |
+| ----------| ---- | ---- |
+| nonce | java.lang.Long | Nonce used to trigger a redeployment of the job. In order to trigger a redeployment, change the number to a different non-null value. Has no effect on the first deployment. |
+| savepointPath | java.lang.String | Savepoint or retained checkpoint path to restore the redeployed job from. If not set, the job is redeployed without state. Only read when the nonce changes. |
 
 ### Resource
 **Class**: org.apache.flink.kubernetes.operator.api.spec.Resource

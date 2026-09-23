@@ -43,6 +43,7 @@ import org.apache.flink.kubernetes.operator.config.FlinkConfigBuilder;
 import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.exception.ReconciliationException;
+import org.apache.flink.kubernetes.operator.reconciler.RedeployRequest;
 import org.apache.flink.kubernetes.operator.utils.FlinkStateSnapshotUtils;
 import org.apache.flink.kubernetes.operator.utils.IngressUtils;
 import org.apache.flink.kubernetes.utils.Constants;
@@ -443,17 +444,40 @@ public class DefaultValidator implements FlinkResourceValidator {
                     "Cannot switch from standalone kubernetes to native kubernetes cluster");
         }
 
-        JobSpec oldJob = oldSpec.getJob();
-        JobSpec newJob = newSpec.getJob();
-        if (oldJob != null && newJob != null) {
-            if (newJob.getSavepointRedeployNonce() != null
-                    && !newJob.getSavepointRedeployNonce()
-                            .equals(oldJob.getSavepointRedeployNonce())) {
-                if (StringUtils.isNullOrWhitespaceOnly(newJob.getInitialSavepointPath())) {
-                    return Optional.of(
-                            "InitialSavepointPath must not be empty for savepoint redeployment");
-                }
+        return validateRedeploy(oldSpec.getJob(), newSpec.getJob());
+    }
+
+    /**
+     * Validates the redeploy triggers of a job spec change.
+     *
+     * @param oldJob Last reconciled job spec.
+     * @param newJob New job spec.
+     * @return Optional error string.
+     */
+    private static Optional<String> validateRedeploy(JobSpec oldJob, JobSpec newJob) {
+        if (oldJob == null || newJob == null) {
+            return Optional.empty();
+        }
+
+        boolean redeploy = RedeployRequest.isRedeployNonceChanged(oldJob, newJob);
+        boolean legacyRedeploy = RedeployRequest.isLegacyNonceChanged(oldJob, newJob);
+
+        if (redeploy && legacyRedeploy) {
+            return Optional.of(
+                    "Cannot change redeploy.nonce and the deprecated savepointRedeployNonce at the same time");
+        }
+
+        if (redeploy) {
+            var savepointPath = newJob.getRedeploy().getSavepointPath();
+            if (savepointPath != null && savepointPath.isBlank()) {
+                return Optional.of(
+                        "redeploy.savepointPath must not be blank, leave it unset to redeploy without state");
             }
+        }
+
+        if (legacyRedeploy
+                && StringUtils.isNullOrWhitespaceOnly(newJob.getInitialSavepointPath())) {
+            return Optional.of("InitialSavepointPath must not be empty for savepoint redeployment");
         }
 
         return Optional.empty();
@@ -569,20 +593,17 @@ public class DefaultValidator implements FlinkResourceValidator {
     private Optional<String> validateSpecChange(FlinkSessionJob sessionJob) {
         if (sessionJob.getStatus().getReconciliationStatus().isBeforeFirstDeployment()) {
             return Optional.empty();
-        } else {
-            var lastReconciledSpec =
-                    sessionJob
-                            .getStatus()
-                            .getReconciliationStatus()
-                            .deserializeLastReconciledSpec();
-            if (!lastReconciledSpec
-                    .getDeploymentName()
-                    .equals(sessionJob.getSpec().getDeploymentName())) {
-                return Optional.of("The deploymentName can't be changed");
-            }
         }
 
-        return Optional.empty();
+        var lastReconciledSpec =
+                sessionJob.getStatus().getReconciliationStatus().deserializeLastReconciledSpec();
+        if (!lastReconciledSpec
+                .getDeploymentName()
+                .equals(sessionJob.getSpec().getDeploymentName())) {
+            return Optional.of("The deploymentName can't be changed");
+        }
+
+        return validateRedeploy(lastReconciledSpec.getJob(), sessionJob.getSpec().getJob());
     }
 
     private Optional<String> validateServiceAccount(String serviceAccount) {

@@ -239,23 +239,44 @@ There are cases when manual intervention is required from the user to recover a 
 In most of these situations the main reason for this is that the deployment got into a state where the operator cannot determine the health of the application or the latest checkpoint information to be used for recovery.
 While these cases are not common, we need to be prepared to handle them.
 
-Users have two options to restore a job from a target savepoint / checkpoint
+Users have two options to restore a job from a target savepoint / checkpoint, or to start it again from empty state
 
-### Redeploy using the savepointRedeployNonce
+### Redeploying a Job
 
-It is possible to redeploy a `FlinkDeployment` or `FlinkSessionJob` resource from a target savepoint by using the combination of `savepointRedeployNonce` and `initialSavepointPath` in the job spec:
+A `FlinkDeployment` or `FlinkSessionJob` resource can be redeployed with `spec.job.redeploy`, discarding the current state of the job. This is a one-shot operation, it leaves the `upgradeMode` of the job untouched, so the following upgrades keep using it.
+
+To redeploy the job without state:
 
 ```yaml
  job:
-   initialSavepointPath: file://redeploy-target-savepoint
-   # If not set previously, set to 1, otherwise increment, e.g. 2
-   savepointRedeployNonce: 1
+   upgradeMode: savepoint
+   redeploy:
+     # If not set previously, set to 1, otherwise increment, e.g. 2
+     nonce: 1
 ```
 
-When changing the `savepointRedeployNonce` the operator will redeploy the job to the savepoint defined in the `initialSavepointPath`. The savepoint path must not be empty. 
+To redeploy the job from a target savepoint or retained checkpoint:
+
+```yaml
+ job:
+   upgradeMode: savepoint
+   redeploy:
+     nonce: 2
+     savepointPath: s3://bucket/savepoints/savepoint-123
+```
+
+When `redeploy.nonce` changes to a new non-null value, the operator cancels the job without taking a savepoint, removes its HA metadata, and deploys it again from `redeploy.savepointPath`, or from empty state if no path is set. The redeployment takes the rest of the spec as it is, so it can be combined with other spec changes. If the job is suspended, the redeployment is recorded and the job is restored from the requested state when resumed, unless it uses the `stateless` upgrade mode, which always resumes from empty state.
+
+- Only a change of `redeploy.nonce` triggers a redeployment: changing `redeploy.savepointPath` alone, clearing the nonce or removing the `redeploy` block has no effect.
+- A redeployment is never triggered by the first deployment of a resource, which always starts from `initialSavepointPath`.
+- The autoscaler state is not reset by a redeployment, change `spec.job.autoscalerResetNonce` together with the redeploy nonce to reset it as well.
 
 {{< hint warning >}}
 Rollbacks are not supported after redeployments.
+{{< /hint >}}
+
+{{< hint info >}}
+The `spec.job.savepointRedeployNonce` field is deprecated. Changing it redeploys the job from `spec.job.initialSavepointPath`, which must not be empty, same as a change of `redeploy.nonce` with `redeploy.savepointPath` set to that path. To migrate, remove `savepointRedeployNonce` and set `redeploy.nonce` and `redeploy.savepointPath` instead, both fields must not be changed in the same update.
 {{< /hint >}}
 
 ### Delete and recreate the custom resource 
