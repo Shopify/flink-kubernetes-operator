@@ -32,6 +32,7 @@ import org.apache.flink.kubernetes.operator.api.status.SavepointFormatType;
 import org.apache.flink.kubernetes.operator.api.status.SnapshotTriggerType;
 import org.apache.flink.kubernetes.operator.api.utils.SpecUtils;
 import org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenContext;
+import org.apache.flink.kubernetes.operator.reconciler.RedeployRequest;
 
 import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
 import org.junit.jupiter.api.Test;
@@ -43,6 +44,7 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Tests for {@link BlueGreenUtils}. */
@@ -74,7 +76,8 @@ public class BlueGreenUtilsTest {
                         BlueGreenDeploymentType.BLUE,
                         null,
                         true,
-                        bgDeployment.getMetadata());
+                        bgDeployment.getMetadata(),
+                        null);
 
         // Verify child deployment name is correctly set in metadata
         String expectedChildName = parentDeploymentName + "-blue";
@@ -149,7 +152,8 @@ public class BlueGreenUtilsTest {
                         BlueGreenDeploymentType.GREEN,
                         null, // No lastCheckpoint
                         false, // Not first deployment
-                        bgDeployment.getMetadata());
+                        bgDeployment.getMetadata(),
+                        null);
 
         // Assert: initialSavepointPath should be used for STATELESS
         assertNotNull(result.getSpec().getJob().getInitialSavepointPath());
@@ -180,9 +184,10 @@ public class BlueGreenUtilsTest {
                 BlueGreenUtils.prepareFlinkDeployment(
                         context,
                         BlueGreenDeploymentType.GREEN,
-                        null, // null = nonce changed, no new savepoint taken
+                        null, // nonce changed, no new savepoint taken
                         false,
-                        bgDeployment.getMetadata());
+                        bgDeployment.getMetadata(),
+                        new RedeployRequest(initialPath, true));
 
         assertEquals(initialPath, result.getSpec().getJob().getInitialSavepointPath());
     }
@@ -219,9 +224,52 @@ public class BlueGreenUtilsTest {
                         BlueGreenDeploymentType.GREEN,
                         triggered, // Fresh savepoint provided
                         false,
-                        bgDeployment.getMetadata());
+                        bgDeployment.getMetadata(),
+                        null);
 
         assertEquals(freshSavepoint, result.getSpec().getJob().getInitialSavepointPath());
+    }
+
+    @Test
+    public void testStatelessRedeployIgnoresInitialSavepointPath() {
+        FlinkBlueGreenDeployment bgDeployment =
+                buildBlueGreenDeployment("test-app", TEST_NAMESPACE);
+        var job = bgDeployment.getSpec().getTemplate().getSpec().getJob();
+        job.setUpgradeMode(UpgradeMode.SAVEPOINT);
+        job.setInitialSavepointPath("s3://bucket/original-savepoint");
+
+        FlinkDeployment result =
+                BlueGreenUtils.prepareFlinkDeployment(
+                        createContext(bgDeployment),
+                        BlueGreenDeploymentType.GREEN,
+                        null,
+                        false,
+                        bgDeployment.getMetadata(),
+                        new RedeployRequest(null, false));
+
+        assertNull(result.getSpec().getJob().getInitialSavepointPath());
+    }
+
+    @Test
+    public void testRedeployUsesRequestedSavepoint() {
+        FlinkBlueGreenDeployment bgDeployment =
+                buildBlueGreenDeployment("test-app", TEST_NAMESPACE);
+        var job = bgDeployment.getSpec().getTemplate().getSpec().getJob();
+        job.setUpgradeMode(UpgradeMode.SAVEPOINT);
+        job.setInitialSavepointPath("s3://bucket/original-savepoint");
+
+        FlinkDeployment result =
+                BlueGreenUtils.prepareFlinkDeployment(
+                        createContext(bgDeployment),
+                        BlueGreenDeploymentType.GREEN,
+                        null,
+                        false,
+                        bgDeployment.getMetadata(),
+                        new RedeployRequest("s3://bucket/redeploy-savepoint", false));
+
+        assertEquals(
+                "s3://bucket/redeploy-savepoint",
+                result.getSpec().getJob().getInitialSavepointPath());
     }
 
     private static FlinkBlueGreenDeployment buildBlueGreenDeployment(

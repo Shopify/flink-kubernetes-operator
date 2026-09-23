@@ -29,8 +29,9 @@ public enum BlueGreenDiffType {
     PATCH_CHILD,
 
     /**
-     * Full redeploy from user-specified savepoint. Triggered when savepointRedeployNonce changes.
-     * Uses the initialSavepointPath from spec instead of taking a new savepoint.
+     * Full redeploy discarding the current job state. Triggered when redeploy.nonce (or the
+     * deprecated savepointRedeployNonce) changes. Uses the requested savepoint, or no state,
+     * instead of taking a new savepoint.
      */
     SAVEPOINT_REDEPLOY,
 

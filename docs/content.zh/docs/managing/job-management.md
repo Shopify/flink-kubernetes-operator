@@ -181,7 +181,7 @@ spec:
   restartNonce: 123
 ```
 
-Restarts work exactly like other upgrades and follow the semantics of the current `upgradeMode`.
+Restarts work exactly like other upgrades and follow the semantics of the current `upgradeMode`. To restart a stateful job from empty state or from a specific savepoint without changing its `upgradeMode`, use a redeployment, described under [Redeploying a Job](#redeploying-a-job).
 
 ### Scaling Without a Spec Change
 
@@ -244,23 +244,45 @@ A terminally failed job stays failed until acted upon. It can be restarted autom
 
 ## Manual Recovery
 
-Some situations require manual intervention to recover a job or to restore it to a user-specified state. In most of them the deployment got into a state where the operator can no longer determine the health of the application or the latest checkpoint information to use for recovery. These cases are not common, but they must be recoverable. There are two ways to restore a job from a target savepoint or checkpoint.
+Some situations require manual intervention to recover a job or to restore it to a user-specified state. In most of them the deployment got into a state where the operator can no longer determine the health of the application or the latest checkpoint information to use for recovery. These cases are not common, but they must be recoverable. There are two ways to restore a job from a target savepoint or checkpoint, or to start it again from empty state.
 
-### Redeploying from a Savepoint
+### Redeploying a Job
 
-A `FlinkDeployment` or `FlinkSessionJob` resource can be redeployed from a target savepoint by using the combination of `spec.job.savepointRedeployNonce` and `spec.job.initialSavepointPath`:
+A `FlinkDeployment` or `FlinkSessionJob` resource can be redeployed with `spec.job.redeploy`, discarding the current state of the job. This is a one-shot operation, it leaves the `upgradeMode` of the job untouched, so the following upgrades keep using it.
+
+To redeploy the job without state:
 
 ```yaml
 job:
-  initialSavepointPath: file://redeploy-target-savepoint
-  # If not set previously, set to 1, otherwise increment, e.g. 2
-  savepointRedeployNonce: 1
+  upgradeMode: savepoint
+  redeploy:
+    # If not set previously, set to 1, otherwise increment, e.g. 2
+    nonce: 1
 ```
 
-When the `savepointRedeployNonce` changes, the operator redeploys the job to the savepoint defined in `initialSavepointPath`. The savepoint path must not be empty.
+To redeploy the job from a target savepoint or retained checkpoint:
+
+```yaml
+job:
+  upgradeMode: savepoint
+  redeploy:
+    nonce: 2
+    savepointPath: s3://bucket/savepoints/savepoint-123
+```
+
+When `redeploy.nonce` changes to a new non-null value, the operator cancels the job without taking a savepoint, removes the HA metadata of an application cluster, and deploys the job again from `redeploy.savepointPath`, or from empty state if no path is set. Discarding the state only means that the operator forgets the checkpoints and savepoints of the previous job for restores, no savepoint files or `FlinkStateSnapshot` resources are deleted. The redeployment takes the rest of the spec as it is, so it can be combined with other spec changes. If the job is suspended, the redeployment is recorded and the job is restored from the requested state when resumed, unless it uses the `stateless` upgrade mode, which always resumes from empty state.
+
+- Only a change of `redeploy.nonce` triggers a redeployment: changing `redeploy.savepointPath` alone, clearing the nonce or removing the `redeploy` block has no effect.
+- A redeployment is never triggered by the first deployment of a resource, which always starts from `initialSavepointPath`.
+- The autoscaler state is not reset by a redeployment, change `spec.job.autoscalerResetNonce` together with the redeploy nonce to reset it as well.
+- A redeployment requested while an operator version without this feature is running is executed once the operator is upgraded. Conversely, remove the `redeploy` block before downgrading the operator to such a version, otherwise the redeployment is executed again after the next operator upgrade.
 
 {{< hint warning >}}
 Rollbacks are not supported after redeployments.
+{{< /hint >}}
+
+{{< hint info >}}
+The `spec.job.savepointRedeployNonce` field is deprecated. Changing it redeploys the job from `spec.job.initialSavepointPath`, which must not be empty, same as a change of `redeploy.nonce` with `redeploy.savepointPath` set to that path. This is now also validated for `FlinkSessionJob` resources, which previously silently redeployed without state when the path was missing, use `redeploy.nonce` without a `redeploy.savepointPath` for that. To migrate, remove `savepointRedeployNonce` and set `redeploy.nonce` and `redeploy.savepointPath` instead, both fields must not be changed in the same update. Using the deprecated field raises a Warning event on the resource.
 {{< /hint >}}
 
 ### Deleting and Recreating the Resource
@@ -309,5 +331,5 @@ Every operation on this page is accompanied by Kubernetes events on the resource
 ### Rollbacks
 
 - Rollbacks are experimental: only `FlinkDeployment` resources are supported, HA is required, and only the Flink resource itself is restored, surrounding Kubernetes resources are not reverted.
-- No rollback is performed after a redeployment through `savepointRedeployNonce`, or when the resource was suspended before the upgrade.
+- No rollback is performed after a redeployment through `redeploy.nonce` or `savepointRedeployNonce`, or when the resource was suspended before the upgrade.
 - The stability condition behind rollbacks is currently simple, a job counts as stable once observed running, so subtler failures go undetected.

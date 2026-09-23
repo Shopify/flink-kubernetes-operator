@@ -29,6 +29,7 @@ import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
 import org.apache.flink.kubernetes.operator.api.spec.IngressSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobState;
 import org.apache.flink.kubernetes.operator.api.spec.KubernetesDeploymentMode;
+import org.apache.flink.kubernetes.operator.api.spec.RedeploySpec;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.api.utils.BaseTestUtils;
 import org.apache.flink.kubernetes.operator.api.utils.SpecUtils;
@@ -403,6 +404,48 @@ public class SpecDiffTest {
         diff = new ReflectiveDiffBuilder<>(KubernetesDeploymentMode.NATIVE, left, right).build();
         assertEquals(DiffType.IGNORE, diff.getType());
         assertEquals(0, diff.getNumDiffs());
+    }
+
+    @Test
+    public void testRedeployNonceDiff() {
+        var left = TestUtils.buildApplicationCluster().getSpec();
+        var right = SpecUtils.clone(left);
+
+        // Adding the redeploy block for the first time triggers a redeploy
+        right.getJob().setRedeploy(RedeploySpec.builder().nonce(1L).build());
+        var diff =
+                new ReflectiveDiffBuilder<>(KubernetesDeploymentMode.NATIVE, left, right).build();
+        assertEquals(DiffType.SAVEPOINT_REDEPLOY, diff.getType());
+        assertEquals(1, diff.getNumDiffs());
+        assertEquals("job.redeploy.nonce", diff.getDiffList().get(0).getFieldName());
+
+        // Changing only the savepoint path is ignored
+        left = SpecUtils.clone(right);
+        right.getJob().getRedeploy().setSavepointPath("s3://sp");
+        diff = new ReflectiveDiffBuilder<>(KubernetesDeploymentMode.NATIVE, left, right).build();
+        assertEquals(DiffType.IGNORE, diff.getType());
+
+        // Bumping the nonce triggers a redeploy
+        left = SpecUtils.clone(right);
+        right.getJob().getRedeploy().setNonce(2L);
+        diff = new ReflectiveDiffBuilder<>(KubernetesDeploymentMode.NATIVE, left, right).build();
+        assertEquals(DiffType.SAVEPOINT_REDEPLOY, diff.getType());
+
+        // Clearing the nonce or removing the redeploy block is ignored
+        left = SpecUtils.clone(right);
+        right.getJob().getRedeploy().setNonce(null);
+        diff = new ReflectiveDiffBuilder<>(KubernetesDeploymentMode.NATIVE, left, right).build();
+        assertEquals(DiffType.IGNORE, diff.getType());
+
+        right.getJob().setRedeploy(null);
+        diff = new ReflectiveDiffBuilder<>(KubernetesDeploymentMode.NATIVE, left, right).build();
+        assertEquals(DiffType.IGNORE, diff.getType());
+
+        // A redeploy block without a nonce is ignored
+        left.getJob().setRedeploy(null);
+        right.getJob().setRedeploy(RedeploySpec.builder().savepointPath("s3://sp").build());
+        diff = new ReflectiveDiffBuilder<>(KubernetesDeploymentMode.NATIVE, left, right).build();
+        assertEquals(DiffType.IGNORE, diff.getType());
     }
 
     @Test
