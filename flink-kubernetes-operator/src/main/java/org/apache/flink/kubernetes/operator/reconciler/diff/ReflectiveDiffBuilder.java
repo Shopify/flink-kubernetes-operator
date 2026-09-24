@@ -129,6 +129,15 @@ public class ReflectiveDiffBuilder<T> implements Builder<DiffResult<T>> {
                                 new ReflectiveDiffBuilder<T>(
                                                 deploymentMode, (T) leftField, (T) rightField)
                                         .build());
+                    } else if (Diffable.class.isAssignableFrom(field.getType())
+                            && field.isAnnotationPresent(SpecDiff.NullAsEmpty.class)) {
+                        diffBuilder.append(
+                                field.getName(),
+                                new ReflectiveDiffBuilder<T>(
+                                                deploymentMode,
+                                                (T) orEmpty(field, leftField),
+                                                (T) orEmpty(field, rightField))
+                                        .build());
 
                     } else {
                         diffBuilder.append(field.getName(), leftField, rightField, UPGRADE);
@@ -139,6 +148,21 @@ public class ReflectiveDiffBuilder<T> implements Builder<DiffResult<T>> {
                             "Unexpected IllegalAccessException: " + ex.getMessage(), ex);
                 }
             }
+        }
+    }
+
+    private static Object orEmpty(Field field, Object value) {
+        if (value != null) {
+            return value;
+        }
+        try {
+            return field.getType().getDeclaredConstructor().newInstance();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(
+                    "@SpecDiff.NullAsEmpty field "
+                            + field.getName()
+                            + " must have a no-arg constructor",
+                    e);
         }
     }
 

@@ -135,7 +135,7 @@ Every check runs against the effective configuration, the operator defaults merg
 | JobManager                     | Memory must be defined and parse, replicas at least `1`, and standby replicas require high availability                                                                                                                                              |
 | TaskManager                    | Memory must be defined and parse, replicas at least `1`                                                                                                                                                                                              |
 | Resources                      | Memory and ephemeral storage quantities must parse                                                                                                                                                                                                   |
-| Spec transitions               | No switch between session and application, or between Native and Standalone mode, and a changed `savepointRedeployNonce` requires an `initialSavepointPath`                                                                                          |
+| Spec transitions               | No switch between session and application, or between Native and Standalone mode, a changed `savepointRedeployNonce` requires an `initialSavepointPath`, and it cannot change together with `redeploy.nonce`                                         |
 | Service account and autoscaler | A service account must be set, and the autoscaler options are cross-checked                                                                                                                                                                          |
 
 For a `FlinkSessionJob`:
@@ -181,7 +181,7 @@ The base flow forks on whether the resource has ever been deployed:
              └─ IGNORE                      ─► rollback checks, savepoints, recovery, restarts
 ```
 
-- The first deployment is the only flow reading `initialSavepointPath` besides a savepoint redeploy, and a resource submitted in `suspended` state is not deployed at all until resumed.
+- The first deployment is the only flow reading `initialSavepointPath` besides a redeploy through the deprecated `savepointRedeployNonce`, and a resource submitted in `suspended` state is not deployed at all until resumed.
 - The autoscaler runs before the diff, its decisions mutate the desired spec so the very same pass picks them up, as described under [Autoscaler → Operator Integration]({{< ref "docs/internals/autoscaler#operator-integration" >}}).
 - An in-place scale patches the TaskManager replica count in Standalone reactive mode, or applies the new per-vertex resource requirements over the REST API with the adaptive scheduler. When neither is possible, the change follows the upgrade logic.
 - The diff classification is covered under [Spec Diff and Upgrade Decisions](#spec-diff-and-upgrade-decisions), and without any spec change the pass ensures full reconciliation: rolling back a spec that failed to stabilize, triggering savepoints, recovering missing deployments, restarting unhealthy clusters.
@@ -203,7 +203,7 @@ The job layer executes stateful updates safely for the job-carrying resources. S
 
 A cancellation that completes asynchronously ends the pass early at the second step, and the upgrade continues on a later pass once the job reaches its terminal state, picking up any spec changes that arrived in the meantime.
 
-A `SAVEPOINT_REDEPLOY` change bypasses this machinery: the job is cancelled without any state capture and redeployed from the spec's `initialSavepointPath`, as described under [Job Management → Redeploying from a Savepoint]({{< ref "docs/managing/job-management#redeploying-from-a-savepoint" >}}).
+A `SAVEPOINT_REDEPLOY` change skips the upgrade decision: the job is cancelled without any state capture, together with its HA metadata, and the requested state, `redeploy.savepointPath` or the `initialSavepointPath` of the deprecated `savepointRedeployNonce`, becomes the only state recorded in the status, the savepoint to restore from or none. The restore then follows the steps above. An asynchronous cancellation marks the resource UPGRADING without recording the new spec, so the redeploy request is simply re-evaluated once the job has terminated. Once recorded, an in-flight upgrade always completes with the restore mode it was recorded with, even if the spec asks for `stateless` upgrades, so a retried deployment attempt cannot lose the requested state. See [Job Management → Redeploying a Job]({{< ref "docs/managing/job-management#redeploying-a-job" >}}).
 
 #### Upgrade Decision
 
@@ -253,7 +253,7 @@ What a reconciler does is decided by the spec diff: the incoming spec is compare
 | `IGNORE`             | The on-demand fields `upgradeMode`, `initialSavepointPath`, `allowNonRestoredState`, `autoscalerResetNonce`, the legacy trigger nonces, and the `job.autoscaler.*`, `parallelism.default`, and `kubernetes.operator.*` configuration keys |
 | `SCALE`              | `job.parallelism` and `taskManager.replicas` in Standalone mode, the `pipeline.jobvertex-parallelism-overrides` configuration key in Native mode                                                                                          |
 | `UPGRADE`            | Every field without its own rule: image, Flink version, pod templates, the job's `jarURI` and `state`, any unlisted `flinkConfiguration` key, and `restartNonce` (ignored when cleared back to null)                                      |
-| `SAVEPOINT_REDEPLOY` | `savepointRedeployNonce` (ignored when cleared back to null)                                                                                                                                                                              |
+| `SAVEPOINT_REDEPLOY` | `redeploy.nonce` and the deprecated `savepointRedeployNonce` (ignored when cleared back to null), a changed `redeploy.savepointPath` alone is ignored                                                                                     |
 
 Two rules refine the classification:
 
@@ -319,7 +319,7 @@ org.apache.flink.kubernetes.operator.api.spec
                                    ingress
 ```
 
-`JobSpec` carries the job-level fields (`jarURI`, `parallelism`, `upgradeMode`, `state`, `initialSavepointPath`, `savepointRedeployNonce`), `JobManagerSpec` and `TaskManagerSpec` pair resources and replicas with a pod template, and `IngressSpec` (`template`, `className`, `annotations`, `labels`, `tls`) declares the REST endpoint exposure. On the snapshot side, the `savepoint` variant carries `path`, `formatType`, `alreadyExists`, and `disposeOnDelete`, while `checkpoint` has no fields of its own. The blue/green `configuration` map holds the `kubernetes.operator.bluegreen.*` options.
+`JobSpec` carries the job-level fields (`jarURI`, `parallelism`, `upgradeMode`, `state`, `initialSavepointPath`, `redeploy`), `JobManagerSpec` and `TaskManagerSpec` pair resources and replicas with a pod template, and `IngressSpec` (`template`, `className`, `annotations`, `labels`, `tls`) declares the REST endpoint exposure. On the snapshot side, the `savepoint` variant carries `path`, `formatType`, `alreadyExists`, and `disposeOnDelete`, while `checkpoint` has no fields of its own. The blue/green `configuration` map holds the `kubernetes.operator.bluegreen.*` options.
 
 This static structure is what every section above observes, diffs, and acts on. The exhaustive field list lives in the [Reference]({{< ref "docs/custom-resource/reference" >}}).
 
@@ -366,7 +366,7 @@ The controller delegates every state to a dedicated handler:
 Blue/green spec changes are classified into a diff type of their own, evaluated in precedence order:
 
 1. `SUSPEND` and `RESUME`: a `spec.job.state` flip between running and suspended, acted on in place on the active deployment.
-2. `SAVEPOINT_REDEPLOY`: a changed `savepointRedeployNonce`, redeploying from the spec's `initialSavepointPath` instead of a fresh savepoint.
+2. `SAVEPOINT_REDEPLOY`: a changed `redeploy.nonce` or `savepointRedeployNonce`, starting the new deployment from the requested state, or from empty state, instead of a fresh savepoint.
 3. `IGNORE`: the nested specs are identical, nothing happens.
 4. Otherwise the nested `FlinkDeploymentSpec` diff decides: changes the [spec diff](#spec-diff-and-upgrade-decisions) classifies as ignorable become `PATCH_CHILD`, applied in place on the active child, and everything else becomes `TRANSITION`, the full blue/green cycle. The user-facing view is documented under [Blue/Green Deployments → Spec Change Behavior]({{< ref "docs/managing/bluegreen-deployments#spec-change-behavior" >}}).
 

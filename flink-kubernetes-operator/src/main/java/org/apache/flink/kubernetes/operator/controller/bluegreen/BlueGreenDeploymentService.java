@@ -31,6 +31,7 @@ import org.apache.flink.kubernetes.operator.api.status.SnapshotTriggerType;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.controller.FlinkBlueGreenDeployments;
 import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
+import org.apache.flink.kubernetes.operator.reconciler.RedeployRequest;
 import org.apache.flink.kubernetes.operator.utils.IngressUtils;
 import org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils;
 import org.apache.flink.util.Preconditions;
@@ -53,6 +54,7 @@ import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGree
 import static org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenKubernetesService.suspendFlinkDeployment;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.fetchSavepointInfo;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.getReconciliationReschedInterval;
+import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.getRedeployRequest;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.getSpecDiff;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.hasSpecChanged;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.instantStrToMillis;
@@ -86,6 +88,22 @@ public class BlueGreenDeploymentService {
             FlinkBlueGreenDeploymentState nextState,
             Savepoint lastCheckpoint,
             boolean isFirstDeployment) {
+        return initiateDeployment(
+                context,
+                nextBlueGreenDeploymentType,
+                nextState,
+                lastCheckpoint,
+                isFirstDeployment,
+                null);
+    }
+
+    private UpdateControl<FlinkBlueGreenDeployment> initiateDeployment(
+            BlueGreenContext context,
+            BlueGreenDeploymentType nextBlueGreenDeploymentType,
+            FlinkBlueGreenDeploymentState nextState,
+            Savepoint lastCheckpoint,
+            boolean isFirstDeployment,
+            @Nullable RedeployRequest redeploy) {
         ObjectMeta bgMeta = context.getBgDeployment().getMetadata();
 
         FlinkDeployment flinkDeployment =
@@ -94,7 +112,8 @@ public class BlueGreenDeploymentService {
                         nextBlueGreenDeploymentType,
                         lastCheckpoint,
                         isFirstDeployment,
-                        bgMeta);
+                        bgMeta,
+                        redeploy);
 
         deployCluster(context, flinkDeployment);
 
@@ -174,17 +193,22 @@ public class BlueGreenDeploymentService {
                     }
 
                 } else if (specDiff == BlueGreenDiffType.SAVEPOINT_REDEPLOY) {
-                    // Savepoint redeploy: skip taking a new savepoint, use initialSavepointPath
-                    var jobSpec =
-                            context.getBgDeployment().getSpec().getTemplate().getSpec().getJob();
+                    // Redeploy: skip taking a new savepoint, use the requested state instead.
+                    // Must be resolved before the new spec is recorded as last reconciled.
+                    var redeploy =
+                            getRedeployRequest(context)
+                                    .orElseThrow(
+                                            () ->
+                                                    new IllegalStateException(
+                                                            "Redeploy diff without redeploy request"));
                     LOG.info(
-                            "Savepoint redeploy triggered for '{}', using initialSavepointPath: {}",
+                            "Redeploy triggered for '{}', using savepoint: {}",
                             context.getBgDeployment().getMetadata().getName(),
-                            Objects.toString(jobSpec.getInitialSavepointPath(), "<none>"));
+                            Objects.toString(redeploy.getSavepointPath(), "<none>"));
                     setLastReconciledSpec(context);
                     try {
                         return startSavepointRedeployTransition(
-                                context, currentBlueGreenDeploymentType);
+                                context, currentBlueGreenDeploymentType, redeploy);
                     } catch (Exception e) {
                         var error =
                                 "Could not start Savepoint Redeploy Transition. Details: "
@@ -319,23 +343,27 @@ public class BlueGreenDeploymentService {
     }
 
     /**
-     * Starts a transition for savepoint redeploy scenario. Unlike normal transitions, this does not
-     * take a new savepoint - it uses the initialSavepointPath specified in the spec.
+     * Starts a transition for a redeploy. Unlike normal transitions, this does not take a new
+     * savepoint - the new deployment starts from the state of the redeploy request.
      *
      * @param context the transition context
      * @param currentBlueGreenDeploymentType the current deployment type
+     * @param redeploy the requested redeploy
      * @return UpdateControl for the deployment
      */
     private UpdateControl<FlinkBlueGreenDeployment> startSavepointRedeployTransition(
-            BlueGreenContext context, BlueGreenDeploymentType currentBlueGreenDeploymentType) {
+            BlueGreenContext context,
+            BlueGreenDeploymentType currentBlueGreenDeploymentType,
+            RedeployRequest redeploy) {
         DeploymentTransition transition = calculateTransition(currentBlueGreenDeploymentType);
 
         return initiateDeployment(
                 context,
                 transition.nextBlueGreenDeploymentType,
                 transition.nextState,
-                null, // Use initialSavepointPath from spec
-                false);
+                null,
+                false,
+                redeploy);
     }
 
     private DeploymentTransition calculateTransition(BlueGreenDeploymentType currentType) {

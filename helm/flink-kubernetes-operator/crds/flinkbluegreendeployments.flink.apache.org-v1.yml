@@ -197,6 +197,13 @@ spec:
                             type: "string"
                           parallelism:
                             type: "integer"
+                          redeploy:
+                            properties:
+                              nonce:
+                                type: "integer"
+                              savepointPath:
+                                type: "string"
+                            type: "object"
                           savepointRedeployNonce:
                             type: "integer"
                           savepointTriggerNonce:
