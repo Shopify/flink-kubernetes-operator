@@ -20,6 +20,7 @@ package org.apache.flink.kubernetes.operator.config;
 
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.IllegalConfigurationException;
+import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.kubernetes.operator.metrics.KubernetesOperatorMetricOptions;
 import org.apache.flink.kubernetes.operator.utils.EnvUtils;
 
@@ -34,6 +35,7 @@ import org.apache.commons.lang3.StringUtils;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -81,6 +83,11 @@ public class FlinkOperatorConfiguration {
     int reportedExceptionEventsMaxStackTraceLength;
     boolean manageIngress;
     Duration jobSubmissionTimeout;
+    List<String> jarUriAllowedSchemes;
+    boolean jarUriDisallowRestrictedHosts;
+    Duration jarFetchSocketTimeout;
+    Duration jarFetchTotalTimeout;
+    MemorySize jarArtifactMaxSize;
 
     public static FlinkOperatorConfiguration fromConfiguration(Configuration operatorConfig) {
         Duration reconcileInterval =
@@ -211,6 +218,22 @@ public class FlinkOperatorConfiguration {
         Duration jobSubmissionTimeout =
                 operatorConfig.get(KubernetesOperatorConfigOptions.OPERATOR_JOB_SUBMISSION_TIMEOUT);
 
+        List<String> jarUriAllowedSchemes =
+                operatorConfig.get(KubernetesOperatorConfigOptions.JAR_URI_ALLOWED_SCHEMES);
+
+        boolean jarUriDisallowRestrictedHosts =
+                operatorConfig.get(
+                        KubernetesOperatorConfigOptions.JAR_URI_DISALLOW_RESTRICTED_HOSTS);
+
+        Duration jarFetchSocketTimeout =
+                operatorConfig.get(KubernetesOperatorConfigOptions.JAR_FETCH_SOCKET_TIMEOUT);
+
+        Duration jarFetchTotalTimeout =
+                operatorConfig.get(KubernetesOperatorConfigOptions.JAR_FETCH_TOTAL_TIMEOUT);
+
+        MemorySize jarArtifactMaxSize =
+                operatorConfig.get(KubernetesOperatorConfigOptions.JAR_ARTIFACT_MAX_SIZE);
+
         return new FlinkOperatorConfiguration(
                 reconcileInterval,
                 reconcilerMaxParallelism,
@@ -244,7 +267,12 @@ public class FlinkOperatorConfiguration {
                 reportedExceptionEventsMaxCount,
                 reportedExceptionEventsMaxStackTraceLength,
                 manageIngress,
-                jobSubmissionTimeout);
+                jobSubmissionTimeout,
+                jarUriAllowedSchemes,
+                jarUriDisallowRestrictedHosts,
+                jarFetchSocketTimeout,
+                jarFetchTotalTimeout,
+                jarArtifactMaxSize);
     }
 
     private static GenericRetry getRetryConfig(Configuration conf) {

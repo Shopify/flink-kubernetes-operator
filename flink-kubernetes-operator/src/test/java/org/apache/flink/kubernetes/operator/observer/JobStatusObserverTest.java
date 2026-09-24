@@ -19,6 +19,7 @@ package org.apache.flink.kubernetes.operator.observer;
 
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
+import org.apache.flink.api.java.tuple.Tuple3;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.PipelineOptionsInternal;
 import org.apache.flink.kubernetes.operator.OperatorTestBase;
@@ -26,12 +27,15 @@ import org.apache.flink.kubernetes.operator.TestUtils;
 import org.apache.flink.kubernetes.operator.api.AbstractFlinkResource;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkSessionJob;
+import org.apache.flink.kubernetes.operator.api.lifecycle.ResourceLifecycleState;
 import org.apache.flink.kubernetes.operator.api.spec.JobState;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
+import org.apache.flink.kubernetes.operator.api.status.ReconciliationState;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
 import org.apache.flink.kubernetes.operator.reconciler.ReconciliationUtils;
 import org.apache.flink.kubernetes.operator.utils.EventRecorder;
+import org.apache.flink.runtime.client.JobStatusMessage;
 import org.apache.flink.util.SerializedThrowable;
 
 import io.fabric8.kubernetes.client.KubernetesClient;
@@ -53,6 +57,7 @@ import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Tests for the {@link JobStatusObserver}. */
@@ -85,9 +90,17 @@ public class JobStatusObserverTest extends OperatorTestBase {
         observer.observe(
                 getResourceContext(
                         job, TestUtils.createContextWithReadyFlinkDeployment(kubernetesClient)));
-        assertEquals(
-                JobStatusObserver.JOB_NOT_FOUND_ERR,
-                flinkResourceEventCollector.events.poll().getMessage());
+        if (fromStatus.isGloballyTerminalState()) {
+            assertTrue(flinkResourceEventCollector.events.isEmpty());
+            assertEquals(fromStatus, jobStatus.getState());
+            assertNull(status.getError());
+        } else {
+            assertEquals(
+                    JobStatusObserver.JOB_NOT_FOUND_ERR,
+                    flinkResourceEventCollector.events.poll().getMessage());
+            assertEquals(JobStatus.RECONCILING, jobStatus.getState());
+            assertEquals(JobStatusObserver.JOB_NOT_FOUND_ERR, status.getError());
+        }
         assertEquals(
                 expectedAfter,
                 status.getReconciliationStatus()
@@ -124,6 +137,188 @@ public class JobStatusObserverTest extends OperatorTestBase {
                         .deserializeLastReconciledSpec()
                         .getJob()
                         .getState());
+    }
+
+    @Test
+    void testSuspendCompletedWhenCancellationObserved() throws Exception {
+        var sessionJob = initSessionJob();
+        var status = sessionJob.getStatus();
+        var jobStatus = status.getJobStatus();
+        var jobId = JobID.fromHexString(jobStatus.getJobId());
+        FlinkResourceContext<AbstractFlinkResource<?, ?>> ctx =
+                getResourceContext(
+                        sessionJob,
+                        TestUtils.createContextWithReadyFlinkDeployment(kubernetesClient));
+        flinkService.submitJobToSessionCluster(
+                sessionJob.getMetadata(),
+                sessionJob.getSpec(),
+                jobId,
+                ctx.getDeployConfig(sessionJob.getSpec()),
+                null);
+        flinkService.cancelJob(jobId, false);
+
+        simulateAsyncSuspendInProgress(sessionJob);
+
+        observer.observe(ctx);
+
+        assertEquals(JobStatus.CANCELED, jobStatus.getState());
+        assertEquals(
+                JobState.SUSPENDED,
+                status.getReconciliationStatus()
+                        .deserializeLastReconciledSpec()
+                        .getJob()
+                        .getState());
+        // Nothing is left to deploy for the suspend, so the upgrade must be completed here
+        assertEquals(ReconciliationState.DEPLOYED, status.getReconciliationStatus().getState());
+        assertTrue(status.getReconciliationStatus().isLastReconciledSpecStable());
+        assertEquals(ResourceLifecycleState.SUSPENDED, status.getLifecycleState());
+
+        assertEquals(1, flinkResourceEventCollector.events.size());
+        var event = flinkResourceEventCollector.events.poll();
+        assertEquals(EventRecorder.Reason.JobStatusChanged.name(), event.getReason());
+        assertEquals("Job status changed from CANCELLING to CANCELED", event.getMessage());
+    }
+
+    @Test
+    void testSuspendedStateSurvivesJobManagerExceptionObservationAfterFinalize() throws Exception {
+        // After finalizeSuspendedUpgrade() completes the suspend, observe() may still call
+        // observeJobManagerExceptions() in the same pass (it checks the previous job status,
+        // not the reconciliation state). Verify this does not clobber the completed suspend.
+        var sessionJob = initSessionJob();
+        var status = sessionJob.getStatus();
+        var jobStatus = status.getJobStatus();
+        var jobId = JobID.fromHexString(jobStatus.getJobId());
+        FlinkResourceContext<AbstractFlinkResource<?, ?>> ctx =
+                getResourceContext(
+                        sessionJob,
+                        TestUtils.createContextWithReadyFlinkDeployment(kubernetesClient));
+        flinkService.submitJobToSessionCluster(
+                sessionJob.getMetadata(),
+                sessionJob.getSpec(),
+                jobId,
+                ctx.getDeployConfig(sessionJob.getSpec()),
+                null);
+        flinkService.cancelJob(jobId, false);
+
+        // Pre-seed the exception cache and history so observeJobManagerExceptions()
+        // runs its full body instead of returning early on a null history.
+        ctx.getExceptionCacheEntry().setInitialized(true);
+        ctx.getExceptionCacheEntry().setJobId(jobId.toHexString());
+        ctx.getExceptionCacheEntry().setLastTimestamp(Instant.ofEpochMilli(500L));
+        flinkService.addExceptionHistory(jobId, "SomeException", "trace", 1000L);
+
+        simulateAsyncSuspendInProgress(sessionJob);
+
+        observer.observe(ctx);
+
+        // Check observeJobManagerExceptions() really executed.
+        var events =
+                kubernetesClient
+                        .v1()
+                        .events()
+                        .inNamespace(sessionJob.getMetadata().getNamespace())
+                        .list()
+                        .getItems();
+        assertTrue(
+                events.stream()
+                        .anyMatch(
+                                e ->
+                                        EventRecorder.Reason.JobException.name()
+                                                .equals(e.getReason())));
+        assertEquals(Instant.ofEpochMilli(1000L), ctx.getExceptionCacheEntry().getLastTimestamp());
+
+        // The suspend completion performed by finalizeSuspendedUpgrade() must not be undone or
+        // altered by the subsequent observeJobManagerExceptions() call.
+        assertEquals(JobStatus.CANCELED, jobStatus.getState());
+        assertEquals(
+                JobState.SUSPENDED,
+                status.getReconciliationStatus()
+                        .deserializeLastReconciledSpec()
+                        .getJob()
+                        .getState());
+        assertEquals(ReconciliationState.DEPLOYED, status.getReconciliationStatus().getState());
+        assertTrue(status.getReconciliationStatus().isLastReconciledSpecStable());
+        assertEquals(ResourceLifecycleState.SUSPENDED, status.getLifecycleState());
+        // The stable spec is the same document as the reconciled spec (that's what "stable"
+        // means here) and it too reflects the completed suspend, not some clobbered value.
+        assertEquals(
+                status.getReconciliationStatus().getLastReconciledSpec(),
+                status.getReconciliationStatus().getLastStableSpec());
+        assertEquals(
+                JobState.SUSPENDED,
+                status.getReconciliationStatus().deserializeLastStableSpec().getJob().getState());
+    }
+
+    @Test
+    void testUpgradeNotCompletedWhenTargetStateStillRunning() throws Exception {
+        var deployment = initDeployment();
+        var status = deployment.getStatus();
+        var jobStatus = status.getJobStatus();
+        FlinkResourceContext<AbstractFlinkResource<?, ?>> ctx = getResourceContext(deployment);
+        flinkService.submitApplicationCluster(
+                deployment.getSpec().getJob(), ctx.getDeployConfig(deployment.getSpec()), false);
+        flinkService.cancelJob(JobID.fromHexString(jobStatus.getJobId()), false);
+
+        // The job was cancelled as the first step of an upgrade, the target state stays RUNNING
+        assertEquals(JobState.RUNNING, deployment.getSpec().getJob().getState());
+        status.getReconciliationStatus().setState(ReconciliationState.UPGRADING);
+        jobStatus.setState(JobStatus.CANCELLING);
+
+        observer.observe(ctx);
+
+        assertEquals(
+                JobState.SUSPENDED,
+                status.getReconciliationStatus()
+                        .deserializeLastReconciledSpec()
+                        .getJob()
+                        .getState());
+        // The new spec still has to be deployed, the upgrade must not be completed here
+        assertEquals(ReconciliationState.UPGRADING, status.getReconciliationStatus().getState());
+        assertFalse(status.getReconciliationStatus().isLastReconciledSpecStable());
+    }
+
+    @ParameterizedTest
+    @EnumSource(
+            value = JobStatus.class,
+            mode = EnumSource.Mode.INCLUDE,
+            names = {"FINISHED", "FAILED"})
+    void testSuspendCompletedWhenJobEndsWhileCancelling(JobStatus terminalStatus) throws Exception {
+        var deployment = initDeployment();
+        var status = deployment.getStatus();
+        FlinkResourceContext<AbstractFlinkResource<?, ?>> ctx = getResourceContext(deployment);
+        flinkService.submitApplicationCluster(
+                deployment.getSpec().getJob(), ctx.getDeployConfig(deployment.getSpec()), false);
+
+        // The job reached a globally terminal state on its own while the cancellation was still in
+        // flight, which the enclosing branch also treats as a completed cancellation
+        var job = flinkService.listJobs().get(0);
+        flinkService
+                .listJobs()
+                .set(
+                        0,
+                        Tuple3.of(
+                                job.f0,
+                                new JobStatusMessage(
+                                        job.f1.getJobId(),
+                                        job.f1.getJobName(),
+                                        terminalStatus,
+                                        job.f1.getStartTime()),
+                                job.f2));
+
+        simulateAsyncSuspendInProgress(deployment);
+
+        observer.observe(ctx);
+
+        assertEquals(
+                JobState.SUSPENDED,
+                status.getReconciliationStatus()
+                        .deserializeLastReconciledSpec()
+                        .getJob()
+                        .getState());
+        // The suspend is over regardless of how the job ended, so it must be completed here too
+        assertEquals(ReconciliationState.DEPLOYED, status.getReconciliationStatus().getState());
+        assertTrue(status.getReconciliationStatus().isLastReconciledSpecStable());
+        assertEquals(ResourceLifecycleState.SUSPENDED, status.getLifecycleState());
     }
 
     @Test
@@ -725,6 +920,80 @@ public class JobStatusObserverTest extends OperatorTestBase {
                 ctx.getExceptionCacheEntry().getLastTimestamp());
     }
 
+    @Test
+    void testFinishedJobStateSurvivesJobManagerRestart() throws Exception {
+        // A restarted JobManager serves the job overview from an empty in-memory job store, so a
+        // job that already finished reads as missing even though the HA store still considers it
+        // completed and does not resubmit it. The observed terminal state must be kept, otherwise
+        // the deployment is stranded in RECONCILING and the terminal JobManager is never cleaned
+        // up.
+        var deployment = initDeployment();
+        var status = deployment.getStatus();
+        var jobStatus = status.getJobStatus();
+        jobStatus.setState(JobStatus.RUNNING);
+
+        FlinkResourceContext<AbstractFlinkResource<?, ?>> ctx = getResourceContext(deployment);
+        flinkService.submitApplicationCluster(
+                deployment.getSpec().getJob(), ctx.getDeployConfig(deployment.getSpec()), false);
+        var jobId = JobID.fromHexString(jobStatus.getJobId());
+
+        // Let the observer record the terminal state from the cluster
+        flinkService.cancelJob(jobId, true);
+        assertTrue(observer.observe(ctx));
+        assertEquals(JobStatus.FINISHED, jobStatus.getState());
+        flinkResourceEventCollector.events.clear();
+
+        // The JobManager restart drops the finished job from the store it is served from
+        flinkService.clearJobsInTerminalState();
+        assertFalse(observer.observe(ctx));
+
+        assertEquals(JobStatus.FINISHED, jobStatus.getState());
+        assertNull(status.getError());
+        assertTrue(flinkResourceEventCollector.events.isEmpty());
+    }
+
+    @Test
+    void testFailedJobStateSurvivesJobManagerRestart() throws Exception {
+        // Same as the finished case, but a failed job must additionally keep the recorded failure
+        // reason instead of having it replaced by the job not found error.
+        var deployment = initDeployment();
+        var status = deployment.getStatus();
+        var jobStatus = status.getJobStatus();
+        jobStatus.setState(JobStatus.RUNNING);
+
+        FlinkResourceContext<AbstractFlinkResource<?, ?>> ctx = getResourceContext(deployment);
+        flinkService.submitApplicationCluster(
+                deployment.getSpec().getJob(), ctx.getDeployConfig(deployment.getSpec()), false);
+        var jobId = JobID.fromHexString(jobStatus.getJobId());
+
+        flinkService.markApplicationJobFailedWithError(jobId, "job failure");
+        assertTrue(observer.observe(ctx));
+        assertEquals(JobStatus.FAILED, jobStatus.getState());
+        var failureError = status.getError();
+        flinkResourceEventCollector.events.clear();
+
+        flinkService.clearJobsInTerminalState();
+        assertFalse(observer.observe(ctx));
+
+        assertEquals(JobStatus.FAILED, jobStatus.getState());
+        assertEquals(failureError, status.getError());
+        assertTrue(flinkResourceEventCollector.events.isEmpty());
+    }
+
+    @Test
+    void testMissingTerminalJobStillUnblocksPendingUpgrade() throws Exception {
+        // Keeping the terminal job state must not keep a pending upgrade in the UPGRADING state,
+        // the reconciliation state is still reset so the upgrade can be retried.
+        var deployment = initDeployment();
+        var status = deployment.getStatus();
+        status.getJobStatus().setState(JobStatus.FINISHED);
+        status.getReconciliationStatus().setState(ReconciliationState.UPGRADING);
+
+        observer.observe(getResourceContext(deployment));
+
+        assertEquals(ReconciliationState.DEPLOYED, status.getReconciliationStatus().getState());
+    }
+
     private static Stream<Arguments> cancellingArgs() {
         var args = new ArrayList<Arguments>();
         for (var status : JobStatus.values()) {
@@ -768,5 +1037,13 @@ public class JobStatusObserverTest extends OperatorTestBase {
                 .getReconciliationStatus()
                 .serializeAndSetLastReconciledSpec(job.getSpec(), job);
         return job;
+    }
+
+    private void simulateAsyncSuspendInProgress(AbstractFlinkResource<?, ?> resource) {
+        // A stateless or last-state session job suspend goes through an asynchronous cancellation,
+        // the reconciler only initiates it, records UPGRADING and waits for the observer
+        resource.getSpec().getJob().setState(JobState.SUSPENDED);
+        resource.getStatus().getReconciliationStatus().setState(ReconciliationState.UPGRADING);
+        resource.getStatus().getJobStatus().setState(JobStatus.CANCELLING);
     }
 }

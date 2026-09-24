@@ -58,7 +58,12 @@ public class ArtifactManager {
         createIfNotExists(targetDir);
         URI uri = new URI(jarURI);
         if ("http".equals(uri.getScheme()) || "https".equals(uri.getScheme())) {
-            return HttpArtifactFetcher.INSTANCE.fetch(jarURI, flinkConfiguration, targetDir);
+            // The scheme/host policy, fetch timeouts and size cap come from the operator config
+            // (matching DefaultValidator), not the tenant-influenced flinkConfiguration, so it's
+            // passed to the fetcher separately rather than merged into flinkConfiguration.
+            var operatorConfig = configManager.getOperatorConfiguration();
+            return HttpArtifactFetcher.INSTANCE.fetch(
+                    jarURI, flinkConfiguration, operatorConfig, targetDir);
         } else {
             return FileSystemBasedArtifactFetcher.INSTANCE.fetch(
                     jarURI, flinkConfiguration, targetDir);

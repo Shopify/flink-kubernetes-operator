@@ -24,28 +24,42 @@ import org.apache.flink.kubernetes.configuration.KubernetesConfigOptions;
 import org.apache.flink.kubernetes.operator.TestUtils;
 import org.apache.flink.kubernetes.operator.api.AbstractFlinkResource;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
+import org.apache.flink.kubernetes.operator.api.Mode;
 import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
 import org.apache.flink.kubernetes.operator.api.spec.KubernetesDeploymentMode;
 import org.apache.flink.kubernetes.operator.artifact.ArtifactManager;
 import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
-import org.apache.flink.kubernetes.operator.config.Mode;
+import org.apache.flink.kubernetes.operator.config.FlinkOperatorConfiguration;
+import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
+import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
 import org.apache.flink.kubernetes.operator.utils.StandaloneKubernetesUtils;
 import org.apache.flink.util.concurrent.Executors;
 
+import io.fabric8.kubernetes.api.model.DeletionPropagation;
+import io.fabric8.kubernetes.api.model.ListMeta;
 import io.fabric8.kubernetes.api.model.ObjectMeta;
+import io.fabric8.kubernetes.api.model.WatchEvent;
 import io.fabric8.kubernetes.api.model.apps.Deployment;
+import io.fabric8.kubernetes.api.model.apps.DeploymentBuilder;
+import io.fabric8.kubernetes.api.model.apps.DeploymentList;
+import io.fabric8.kubernetes.api.model.apps.DeploymentListBuilder;
 import io.fabric8.kubernetes.api.model.apps.DeploymentSpec;
+import io.fabric8.kubernetes.client.KubernetesClientTimeoutException;
 import io.fabric8.kubernetes.client.NamespacedKubernetesClient;
 import io.fabric8.kubernetes.client.server.mock.EnableKubernetesMockClient;
 import io.fabric8.kubernetes.client.server.mock.KubernetesMockServer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
+import java.time.Duration;
 import java.util.List;
 
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.OPERATOR_HEALTH_PROBE_PORT;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -59,10 +73,10 @@ public class StandaloneFlinkServiceTest {
     StandaloneFlinkService flinkStandaloneService;
     FlinkConfigManager configManager;
     FlinkDeployment flinkDeployment;
+    private final Configuration configuration = new Configuration();
 
     @BeforeEach
     public void setup() {
-        var configuration = new Configuration();
         configuration.set(KubernetesConfigOptions.CLUSTER_ID, TestUtils.TEST_DEPLOYMENT_NAME);
         configuration.set(KubernetesConfigOptions.NAMESPACE, TestUtils.TEST_NAMESPACE);
         configuration.set(OPERATOR_HEALTH_PROBE_PORT, 80);
@@ -125,119 +139,49 @@ public class StandaloneFlinkServiceTest {
         assertEquals(0, deployments.size());
     }
 
-    @Test
-    public void testTMReplicaScaleApplication() {
-        flinkDeployment.getSpec().setJob(new JobSpec());
+    @ParameterizedTest
+    @CsvSource({"true,true,true", "true,false,false", "false,false,true"})
+    public void testTMReplicaScale(
+            boolean applicationCluster, boolean reactiveMode, boolean expectScaled) {
         var clusterId = flinkDeployment.getMetadata().getName();
         var namespace = flinkDeployment.getMetadata().getNamespace();
         flinkDeployment.getSpec().setMode(KubernetesDeploymentMode.STANDALONE);
-
-        // Add parallelism change, verify it is honoured in reactive mode
-        flinkDeployment
-                .getSpec()
-                .getFlinkConfiguration()
-                .put(
-                        JobManagerOptions.SCHEDULER_MODE.key(),
-                        SchedulerExecutionMode.REACTIVE.name());
-        flinkDeployment
-                .getStatus()
-                .getReconciliationStatus()
-                .serializeAndSetLastReconciledSpec(flinkDeployment.getSpec(), flinkDeployment);
-        flinkDeployment.getSpec().getTaskManager().setReplicas(5);
-        var ctx =
-                new FlinkResourceContextFactory(
-                                configManager,
-                                TestUtils.createTestMetricGroup(new Configuration()),
-                                null)
-                        .getResourceContext(flinkDeployment, TestUtils.createEmptyContext());
-        assertTrue(
-                flinkStandaloneService.scale(ctx, ctx.getDeployConfig(flinkDeployment.getSpec())));
-        assertEquals(
-                5,
-                kubernetesClient
-                        .apps()
-                        .deployments()
-                        .inNamespace(namespace)
-                        .withName(StandaloneKubernetesUtils.getTaskManagerDeploymentName(clusterId))
-                        .get()
-                        .getSpec()
-                        .getReplicas());
-
-        flinkDeployment
-                .getSpec()
-                .getFlinkConfiguration()
-                .remove(JobManagerOptions.SCHEDULER_MODE.key());
+        if (applicationCluster) {
+            flinkDeployment.getSpec().setJob(new JobSpec());
+        }
+        if (reactiveMode) {
+            flinkDeployment
+                    .getSpec()
+                    .getFlinkConfiguration()
+                    .put(
+                            JobManagerOptions.SCHEDULER_MODE.key(),
+                            SchedulerExecutionMode.REACTIVE.name());
+        }
         flinkDeployment
                 .getStatus()
                 .getReconciliationStatus()
                 .serializeAndSetLastReconciledSpec(flinkDeployment.getSpec(), flinkDeployment);
-        ctx =
-                new FlinkResourceContextFactory(
-                                configManager,
-                                TestUtils.createTestMetricGroup(new Configuration()),
-                                null)
-                        .getResourceContext(flinkDeployment, TestUtils.createEmptyContext());
+        var ctx = getResourceContext();
 
-        // Add replicas and verify that the scaling is not honoured as reactive mode not enabled
-        flinkDeployment.getSpec().getTaskManager().setReplicas(10);
-        assertFalse(
+        flinkDeployment.getSpec().getTaskManager().setReplicas(200);
+        assertEquals(
+                expectScaled,
                 flinkStandaloneService.scale(ctx, ctx.getDeployConfig(flinkDeployment.getSpec())));
-    }
+        if (!expectScaled) {
+            return;
+        }
+        assertEquals(200, getTMReplicas(clusterId, namespace));
 
-    @Test
-    public void testTMReplicaScaleSession() {
-        var clusterId = flinkDeployment.getMetadata().getName();
-        var namespace = flinkDeployment.getMetadata().getNamespace();
-        flinkDeployment.getSpec().setMode(KubernetesDeploymentMode.STANDALONE);
-        // Add replicas
-        flinkDeployment.getSpec().getTaskManager().setReplicas(3);
-        flinkDeployment
-                .getSpec()
-                .getFlinkConfiguration()
-                .put(
-                        JobManagerOptions.SCHEDULER_MODE.key(),
-                        SchedulerExecutionMode.REACTIVE.name());
-        flinkDeployment
-                .getStatus()
-                .getReconciliationStatus()
-                .serializeAndSetLastReconciledSpec(flinkDeployment.getSpec(), flinkDeployment);
-
-        var ctx =
-                new FlinkResourceContextFactory(
-                                configManager,
-                                TestUtils.createTestMetricGroup(new Configuration()),
-                                null)
-                        .getResourceContext(flinkDeployment, TestUtils.createEmptyContext());
+        flinkDeployment.getSpec().getTaskManager().setReplicas(300);
         assertTrue(
                 flinkStandaloneService.scale(ctx, ctx.getDeployConfig(flinkDeployment.getSpec())));
+        assertEquals(300, getTMReplicas(clusterId, namespace));
 
-        assertEquals(
-                3,
-                kubernetesClient
-                        .apps()
-                        .deployments()
-                        .inNamespace(namespace)
-                        .withName(StandaloneKubernetesUtils.getTaskManagerDeploymentName(clusterId))
-                        .get()
-                        .getSpec()
-                        .getReplicas());
-
-        // Scale the replica count of the task managers
-        flinkDeployment.getSpec().getTaskManager().setReplicas(10);
-        createDeployments(flinkDeployment);
+        var requestsBefore = mockServer.getRequestCount();
         assertTrue(
                 flinkStandaloneService.scale(ctx, ctx.getDeployConfig(flinkDeployment.getSpec())));
-
-        assertEquals(
-                10,
-                kubernetesClient
-                        .apps()
-                        .deployments()
-                        .inNamespace(namespace)
-                        .withName(StandaloneKubernetesUtils.getTaskManagerDeploymentName(clusterId))
-                        .get()
-                        .getSpec()
-                        .getReplicas());
+        assertEquals(1, mockServer.getRequestCount() - requestsBefore);
+        assertEquals(300, getTMReplicas(clusterId, namespace));
     }
 
     @Test
@@ -259,6 +203,122 @@ public class StandaloneFlinkServiceTest {
                 configManager.getDeployConfig(
                         flinkDeployment.getMetadata(), flinkDeployment.getSpec()));
         assertFalse(service.getRuntimeConfig().containsKey(OPERATOR_HEALTH_PROBE_PORT.key()));
+    }
+
+    @Test
+    public void testDeleteClusterInternalThrowsOnDeploymentDeletionTimeout() {
+        var timeout = Duration.ofMillis(200);
+        configuration.set(
+                KubernetesOperatorConfigOptions.OPERATOR_RESOURCE_CLEANUP_TIMEOUT, timeout);
+        var service =
+                new StandaloneFlinkService(
+                        kubernetesClient,
+                        new ArtifactManager(configManager),
+                        Executors.newDirectExecutorService(),
+                        FlinkOperatorConfiguration.fromConfiguration(configuration));
+
+        String jmDeploymentName =
+                StandaloneKubernetesUtils.getJobManagerDeploymentName(
+                        TestUtils.TEST_DEPLOYMENT_NAME);
+
+        var dep =
+                new DeploymentBuilder()
+                        .withNewMetadata()
+                        .withName(jmDeploymentName)
+                        .withNamespace(TestUtils.TEST_NAMESPACE)
+                        .endMetadata()
+                        .build();
+        DeploymentList deploymentList =
+                new DeploymentListBuilder().withMetadata(new ListMeta()).withItems(dep).build();
+
+        String getUrl =
+                String.format(
+                        "/apis/apps/v1/namespaces/%s/deployments?fieldSelector=metadata.name%%3D%s",
+                        TestUtils.TEST_NAMESPACE, jmDeploymentName);
+        String watchUrl =
+                String.format(
+                        "/apis/apps/v1/namespaces/%s/deployments?allowWatchBookmarks=true&fieldSelector=metadata.name%%3D%s&timeoutSeconds=600&watch=true",
+                        TestUtils.TEST_NAMESPACE, jmDeploymentName);
+
+        // GET always returns the deployment; watch never emits DELETED within timeout
+        mockServer.expect().get().withPath(getUrl).andReturn(200, deploymentList).always();
+        mockServer
+                .expect()
+                .get()
+                .withPath(watchUrl)
+                .andUpgradeToWebSocket()
+                .open()
+                .waitFor(5000)
+                .andEmit(new WatchEvent(dep, "DELETED"))
+                .done()
+                .always();
+
+        assertThrows(
+                KubernetesClientTimeoutException.class,
+                () ->
+                        service.deleteClusterInternal(
+                                TestUtils.TEST_NAMESPACE,
+                                TestUtils.TEST_DEPLOYMENT_NAME,
+                                new Configuration(),
+                                DeletionPropagation.BACKGROUND));
+    }
+
+    @Test
+    public void testDeleteClusterInternalThrowsOnTaskManagerDeletionTimeout() {
+        var timeout = Duration.ofMillis(200);
+        configuration.set(
+                KubernetesOperatorConfigOptions.OPERATOR_RESOURCE_CLEANUP_TIMEOUT, timeout);
+        var service =
+                new StandaloneFlinkService(
+                        kubernetesClient,
+                        new ArtifactManager(configManager),
+                        Executors.newDirectExecutorService(),
+                        FlinkOperatorConfiguration.fromConfiguration(configuration));
+
+        String tmDeploymentName =
+                StandaloneKubernetesUtils.getTaskManagerDeploymentName(
+                        TestUtils.TEST_DEPLOYMENT_NAME);
+
+        var dep =
+                new DeploymentBuilder()
+                        .withNewMetadata()
+                        .withName(tmDeploymentName)
+                        .withNamespace(TestUtils.TEST_NAMESPACE)
+                        .endMetadata()
+                        .build();
+        DeploymentList deploymentList =
+                new DeploymentListBuilder().withMetadata(new ListMeta()).withItems(dep).build();
+
+        String getUrl =
+                String.format(
+                        "/apis/apps/v1/namespaces/%s/deployments?fieldSelector=metadata.name%%3D%s",
+                        TestUtils.TEST_NAMESPACE, tmDeploymentName);
+        String watchUrl =
+                String.format(
+                        "/apis/apps/v1/namespaces/%s/deployments?allowWatchBookmarks=true&fieldSelector=metadata.name%%3D%s&timeoutSeconds=600&watch=true",
+                        TestUtils.TEST_NAMESPACE, tmDeploymentName);
+
+        // GET always returns the deployment; watch never emits DELETED within timeout
+        mockServer.expect().get().withPath(getUrl).andReturn(200, deploymentList).always();
+        mockServer
+                .expect()
+                .get()
+                .withPath(watchUrl)
+                .andUpgradeToWebSocket()
+                .open()
+                .waitFor(5000)
+                .andEmit(new WatchEvent(dep, "DELETED"))
+                .done()
+                .always();
+
+        assertThrows(
+                KubernetesClientTimeoutException.class,
+                () ->
+                        service.deleteClusterInternal(
+                                TestUtils.TEST_NAMESPACE,
+                                TestUtils.TEST_DEPLOYMENT_NAME,
+                                new Configuration(),
+                                DeletionPropagation.BACKGROUND));
     }
 
     class TestingStandaloneFlinkService extends StandaloneFlinkService {
@@ -303,5 +363,22 @@ public class StandaloneFlinkServiceTest {
                 .resource(tmDeployment)
                 .inNamespace(cr.getMetadata().getNamespace())
                 .createOrReplace();
+    }
+
+    private FlinkResourceContext<FlinkDeployment> getResourceContext() {
+        return new FlinkResourceContextFactory(
+                        configManager, TestUtils.createTestMetricGroup(new Configuration()), null)
+                .getResourceContext(flinkDeployment, TestUtils.createEmptyContext());
+    }
+
+    private Integer getTMReplicas(String clusterId, String namespace) {
+        return kubernetesClient
+                .apps()
+                .deployments()
+                .inNamespace(namespace)
+                .withName(StandaloneKubernetesUtils.getTaskManagerDeploymentName(clusterId))
+                .get()
+                .getSpec()
+                .getReplicas();
     }
 }

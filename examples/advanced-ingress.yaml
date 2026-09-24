@@ -21,8 +21,8 @@ kind: FlinkDeployment
 metadata:
   name: advanced-ingress
 spec:
-  image: flink:1.20
-  flinkVersion: v1_20
+  image: flink:2.2
+  flinkVersion: v2_2
   ingress:
     template: "/{{namespace}}/{{name}}(/|$)(.*)"
     className: "nginx"
@@ -32,13 +32,15 @@ spec:
     taskmanager.numberOfTaskSlots: 2
   serviceAccount: flink
   jobManager:
-    resource:
-      memory: "2048m"
-      cpu: 1
+    resources:
+      requests:
+        memory: "2048m"
+        cpu: "1"
   taskManager:
-    resource:
-      memory: "2048m"
-      cpu: 1
+    resources:
+      requests:
+        memory: "2048m"
+        cpu: "1"
   job:
     jarURI: local:///opt/flink/examples/streaming/StateMachineExample.jar
     parallelism: 2

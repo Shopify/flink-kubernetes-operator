@@ -36,15 +36,21 @@ public class AutoscalerFactory {
     public static JobAutoScaler<ResourceID, KubernetesJobAutoScalerContext> create(
             KubernetesClient client,
             EventRecorder eventRecorder,
-            ClusterResourceManager clusterResourceManager) {
+            ClusterResourceManager clusterResourceManager,
+            AutoscalerPlugins plugins) {
 
         var stateStore = new KubernetesAutoScalerStateStore(new ConfigMapStore(client));
         var eventHandler = new KubernetesAutoScalerEventHandler(eventRecorder);
 
         return new JobAutoScalerImpl<>(
-                new RestApiMetricsCollector<>(),
-                new ScalingMetricEvaluator(),
-                new ScalingExecutor<>(eventHandler, stateStore, clusterResourceManager),
+                new RestApiMetricsCollector<>(stateStore),
+                new ScalingMetricEvaluator<>(plugins.getEvaluators()),
+                new ScalingExecutor<>(
+                        eventHandler,
+                        stateStore,
+                        clusterResourceManager,
+                        plugins.getScalingExecutors(),
+                        plugins.getAlignmentModes()),
                 eventHandler,
                 new KubernetesScalingRealizer(),
                 stateStore);

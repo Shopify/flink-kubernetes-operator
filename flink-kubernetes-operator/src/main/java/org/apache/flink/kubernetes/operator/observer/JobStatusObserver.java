@@ -272,17 +272,23 @@ public class JobStatusObserver<R extends AbstractFlinkResource<?, ?>> {
     protected void onTargetJobNotFound(FlinkResourceContext<R> ctx) {
         var resource = ctx.getResource();
         var jobStatus = resource.getStatus().getJobStatus();
-
-        eventRecorder.triggerEvent(
-                resource,
-                EventRecorder.Type.Warning,
-                EventRecorder.Reason.Missing,
-                EventRecorder.Component.Job,
-                JOB_NOT_FOUND_ERR,
-                ctx.getKubernetesClient());
+        var alreadyTerminal = ReconciliationUtils.isJobInTerminalState(resource.getStatus());
+        if (alreadyTerminal) {
+            LOG.info(
+                    "Job not found but it was already observed in the {} state, keeping the observed state",
+                    jobStatus.getState());
+        } else {
+            eventRecorder.triggerEvent(
+                    resource,
+                    EventRecorder.Type.Warning,
+                    EventRecorder.Reason.Missing,
+                    EventRecorder.Component.Job,
+                    JOB_NOT_FOUND_ERR,
+                    ctx.getKubernetesClient());
+        }
 
         if (resource instanceof FlinkSessionJob
-                && !ReconciliationUtils.isJobInTerminalState(resource.getStatus())
+                && !alreadyTerminal
                 && resource.getSpec().getJob().getUpgradeMode() == UpgradeMode.STATELESS) {
             // We also mark jobs that were previously not terminated as suspended if
             // stateless upgrade mode is used. In these cases we want to simply restart the job.
@@ -292,8 +298,10 @@ public class JobStatusObserver<R extends AbstractFlinkResource<?, ?>> {
             // upgrading state and retry the upgrade (if possible)
             resource.getStatus().getReconciliationStatus().setState(ReconciliationState.DEPLOYED);
         }
-        jobStatus.setState(org.apache.flink.api.common.JobStatus.RECONCILING);
-        resource.getStatus().setError(JOB_NOT_FOUND_ERR);
+        if (!alreadyTerminal) {
+            jobStatus.setState(org.apache.flink.api.common.JobStatus.RECONCILING);
+            resource.getStatus().setError(JOB_NOT_FOUND_ERR);
+        }
     }
 
     /**
@@ -350,6 +358,7 @@ public class JobStatusObserver<R extends AbstractFlinkResource<?, ?>> {
                             && JobStatus.CANCELLING.equals(previousJobStatus))) {
                 // The job was cancelled
                 markSuspended(resource);
+                finalizeSuspendedUpgrade(resource);
             }
 
             recordJobErrorIfPresent(ctx, clusterJobStatus);
@@ -371,6 +380,29 @@ public class JobStatusObserver<R extends AbstractFlinkResource<?, ?>> {
                     s.getJob().setState(JobState.SUSPENDED);
                     m.setFirstDeployment(false);
                 });
+    }
+
+    /**
+     * When a suspend is executed through an asynchronous cancellation the reconciler exits early
+     * and leaves the resource in the UPGRADING state until the cancellation completes. Once the job
+     * has ended there is nothing left to do for a suspend request, so we complete the upgrade here,
+     * otherwise the resource would report the UPGRADING lifecycle state indefinitely.
+     *
+     * <p>Must be called right after {@link #markSuspended(AbstractFlinkResource)}, which records
+     * the suspended job state that this completion makes stable.
+     *
+     * @param resource The Flink resource whose cancellation was just observed.
+     */
+    private static void finalizeSuspendedUpgrade(AbstractFlinkResource<?, ?> resource) {
+        var reconciliationStatus = resource.getStatus().getReconciliationStatus();
+        if (reconciliationStatus.getState() != ReconciliationState.UPGRADING
+                || resource.getSpec().getJob().getState() != JobState.SUSPENDED) {
+            return;
+        }
+        LOG.debug("Suspend completed after asynchronous cancellation");
+        reconciliationStatus.setState(ReconciliationState.DEPLOYED);
+        // Suspended specs are always marked stable, same as for synchronous suspends
+        reconciliationStatus.markReconciledSpecAsStable();
     }
 
     private void recordJobErrorIfPresent(

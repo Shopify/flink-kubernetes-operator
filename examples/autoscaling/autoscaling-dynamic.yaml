@@ -34,20 +34,22 @@ spec:
     taskmanager.numberOfTaskSlots: 4
   serviceAccount: flink
   jobManager:
-    resource:
-      memory: "2048m"
-      cpu: 0.5
+    resources:
+      requests:
+        memory: "2048m"
+        cpu: "0.5"
   taskManager:
-    resource:
-      memory: "2048m"
-      cpu: 1
+    resources:
+      requests:
+        memory: "2048m"
+        cpu: "1"
   podTemplate:
     spec:
       containers:
         - name: flink-main-container
   job:
     jarURI: local:///opt/flink/usrlib/autoscaling.jar
-    entryClass: autoscaling.LoadSimulationPipeline
+    entryClass: org.apache.flink.examples.autoscaling.LoadSimulationPipeline
     parallelism: 1
     upgradeMode: stateless
     args:

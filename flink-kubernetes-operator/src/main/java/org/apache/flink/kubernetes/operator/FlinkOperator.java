@@ -21,12 +21,13 @@ import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.core.fs.FileSystem;
 import org.apache.flink.core.plugin.PluginManager;
-import org.apache.flink.core.plugin.PluginUtils;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkSessionJob;
 import org.apache.flink.kubernetes.operator.api.FlinkStateSnapshot;
 import org.apache.flink.kubernetes.operator.api.listener.FlinkResourceListener;
+import org.apache.flink.kubernetes.operator.api.validation.FlinkResourceValidator;
 import org.apache.flink.kubernetes.operator.autoscaler.AutoscalerFactory;
+import org.apache.flink.kubernetes.operator.autoscaler.AutoscalerPlugins;
 import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
 import org.apache.flink.kubernetes.operator.config.FlinkOperatorConfiguration;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
@@ -53,9 +54,9 @@ import org.apache.flink.kubernetes.operator.service.FlinkResourceContextFactory;
 import org.apache.flink.kubernetes.operator.utils.EnvUtils;
 import org.apache.flink.kubernetes.operator.utils.EventRecorder;
 import org.apache.flink.kubernetes.operator.utils.KubernetesClientUtils;
+import org.apache.flink.kubernetes.operator.utils.OperatorPluginUtils;
 import org.apache.flink.kubernetes.operator.utils.StatusRecorder;
 import org.apache.flink.kubernetes.operator.utils.ValidatorUtils;
-import org.apache.flink.kubernetes.operator.validation.FlinkResourceValidator;
 
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.javaoperatorsdk.operator.Operator;
@@ -90,6 +91,8 @@ public class FlinkOperator {
 
     private final EventRecorder eventRecorder;
     private final Configuration baseConfig;
+    private final PluginManager pluginManager;
+    private final AutoscalerPlugins autoscalerPlugins;
 
     public FlinkOperator(@Nullable Configuration conf) {
         this(conf, null);
@@ -105,7 +108,8 @@ public class FlinkOperator {
                                 KubernetesClientUtils.isCrdInstalled(FlinkStateSnapshot.class));
 
         baseConfig = configManager.getDefaultConfig();
-        this.metricGroup = OperatorMetricUtils.initOperatorMetrics(baseConfig);
+        this.pluginManager = OperatorPluginUtils.createPluginManager(baseConfig);
+        this.metricGroup = OperatorMetricUtils.initOperatorMetrics(baseConfig, pluginManager);
         if (client == null) {
             this.client =
                     KubernetesClientUtils.getKubernetesClient(
@@ -114,12 +118,13 @@ public class FlinkOperator {
             this.client = client;
         }
         this.operator = createOperator();
-        this.validators = ValidatorUtils.discoverValidators(configManager);
-        this.listeners = ListenerUtils.discoverListeners(configManager);
+        this.validators = ValidatorUtils.discoverValidators(configManager, pluginManager);
+        this.listeners = ListenerUtils.discoverListeners(configManager, pluginManager);
+        this.autoscalerPlugins = AutoscalerPlugins.discover(pluginManager);
         this.eventRecorder = EventRecorder.create(client, listeners);
         this.ctxFactory =
                 new FlinkResourceContextFactory(configManager, metricGroup, eventRecorder);
-        PluginManager pluginManager = PluginUtils.createPluginManagerFromRootFolder(baseConfig);
+        LOG.info("Initializing file system factories from plugin directory.");
         FileSystem.initialize(baseConfig, pluginManager);
         this.operatorHealthService = OperatorHealthService.fromConfig(configManager);
     }
@@ -186,7 +191,9 @@ public class FlinkOperator {
         var statusRecorder = StatusRecorder.create(client, metricManager, listeners);
         var clusterResourceManager =
                 ClusterResourceManager.of(configManager.getDefaultConfig(), client);
-        var autoscaler = AutoscalerFactory.create(client, eventRecorder, clusterResourceManager);
+        var autoscaler =
+                AutoscalerFactory.create(
+                        client, eventRecorder, clusterResourceManager, autoscalerPlugins);
         var reconcilerFactory = new ReconcilerFactory(eventRecorder, statusRecorder, autoscaler);
         var observerFactory = new FlinkDeploymentObserverFactory(eventRecorder);
         var canaryResourceManager = new CanaryResourceManager<FlinkDeployment>(configManager);
@@ -207,11 +214,10 @@ public class FlinkOperator {
 
     @VisibleForTesting
     void registerSessionJobController() {
-        var eventRecorder = EventRecorder.create(client, listeners);
         var metricManager =
                 MetricManager.createFlinkSessionJobMetricManager(baseConfig, metricGroup);
         var statusRecorder = StatusRecorder.create(client, metricManager, listeners);
-        var autoscaler = AutoscalerFactory.create(client, eventRecorder, null);
+        var autoscaler = AutoscalerFactory.create(client, eventRecorder, null, autoscalerPlugins);
         var reconciler = new SessionJobReconciler(eventRecorder, statusRecorder, autoscaler);
         var observer = new FlinkSessionJobObserver(eventRecorder);
         var canaryResourceManager = new CanaryResourceManager<FlinkSessionJob>(configManager);
@@ -225,7 +231,8 @@ public class FlinkOperator {
                         observer,
                         statusRecorder,
                         eventRecorder,
-                        canaryResourceManager);
+                        canaryResourceManager,
+                        configManager);
         registeredControllers.add(operator.register(controller, this::overrideControllerConfigs));
     }
 
@@ -240,7 +247,6 @@ public class FlinkOperator {
                 MetricManager.createFlinkStateSnapshotMetricManager(baseConfig, metricGroup);
         var statusRecorder =
                 StatusRecorder.createForFlinkStateSnapshot(client, metricManager, listeners);
-        var eventRecorder = EventRecorder.create(client, listeners);
         var reconciler = new StateSnapshotReconciler(ctxFactory, eventRecorder);
         var observer = new StateSnapshotObserver(ctxFactory, eventRecorder);
         var controller =

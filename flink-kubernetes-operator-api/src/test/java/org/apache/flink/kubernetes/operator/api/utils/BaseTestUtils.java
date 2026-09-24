@@ -17,10 +17,12 @@
 
 package org.apache.flink.kubernetes.operator.api.utils;
 
+import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.HighAvailabilityOptions;
 import org.apache.flink.configuration.TaskManagerOptions;
 import org.apache.flink.kubernetes.highavailability.KubernetesHaServicesFactory;
+import org.apache.flink.kubernetes.operator.api.CrdConstants;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkSessionJob;
 import org.apache.flink.kubernetes.operator.api.FlinkStateSnapshot;
@@ -39,16 +41,22 @@ import org.apache.flink.kubernetes.operator.api.spec.SavepointSpec;
 import org.apache.flink.kubernetes.operator.api.spec.TaskManagerSpec;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.api.status.CheckpointType;
+import org.apache.flink.kubernetes.operator.api.status.FlinkDeploymentReconciliationStatus;
 import org.apache.flink.kubernetes.operator.api.status.FlinkDeploymentStatus;
 import org.apache.flink.kubernetes.operator.api.status.FlinkSessionJobStatus;
+import org.apache.flink.kubernetes.operator.api.status.JobManagerDeploymentStatus;
 
 import io.fabric8.kubernetes.api.model.Container;
 import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
 import io.fabric8.kubernetes.api.model.Pod;
 import io.fabric8.kubernetes.api.model.PodSpec;
 import io.fabric8.kubernetes.api.model.PodTemplateSpec;
+import io.fabric8.kubernetes.api.model.Quantity;
+import io.fabric8.kubernetes.api.model.ResourceRequirements;
+import io.fabric8.kubernetes.api.model.ResourceRequirementsBuilder;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -63,9 +71,10 @@ public class BaseTestUtils {
     public static final String IMAGE = String.format("flink:%s", FLINK_VERSION);
     public static final String IMAGE_POLICY = "IfNotPresent";
     public static final String SAMPLE_JAR = "local:///tmp/sample.jar";
+    public static final String SAMPLE_SESSION_JOB_JAR = "https://example.com/sample.jar";
 
     public static FlinkDeployment buildSessionCluster() {
-        return buildSessionCluster(FlinkVersion.v1_17);
+        return buildSessionCluster(FlinkVersion.v1_20);
     }
 
     public static FlinkDeployment buildSessionCluster(FlinkVersion version) {
@@ -89,15 +98,15 @@ public class BaseTestUtils {
     }
 
     public static FlinkDeployment buildApplicationCluster(JobState state) {
-        return buildApplicationCluster(FlinkVersion.v1_17, state);
+        return buildApplicationCluster(FlinkVersion.v1_20, state);
     }
 
     public static FlinkDeployment buildApplicationCluster() {
-        return buildApplicationCluster(FlinkVersion.v1_17, JobState.RUNNING);
+        return buildApplicationCluster(FlinkVersion.v1_20, JobState.RUNNING);
     }
 
     public static FlinkDeployment buildApplicationCluster(String name, String namespace) {
-        return buildApplicationCluster(name, namespace, FlinkVersion.v1_17, JobState.RUNNING);
+        return buildApplicationCluster(name, namespace, FlinkVersion.v1_20, JobState.RUNNING);
     }
 
     public static FlinkDeployment buildApplicationCluster(FlinkVersion version) {
@@ -150,7 +159,7 @@ public class BaseTestUtils {
                         .deploymentName(TEST_DEPLOYMENT_NAME)
                         .job(
                                 JobSpec.builder()
-                                        .jarURI(SAMPLE_JAR)
+                                        .jarURI(SAMPLE_SESSION_JOB_JAR)
                                         .parallelism(1)
                                         .upgradeMode(UpgradeMode.STATELESS)
                                         .state(jobState)
@@ -186,9 +195,45 @@ public class BaseTestUtils {
                 .serviceAccount(SERVICE_ACCOUNT)
                 .flinkVersion(version)
                 .flinkConfiguration(conf)
-                .jobManager(new JobManagerSpec(new Resource(1.0, "2048m", "2G"), 1, null))
-                .taskManager(new TaskManagerSpec(new Resource(1.0, "2048m", "2G"), null, null))
+                .jobManager(
+                        JobManagerSpec.builder()
+                                .resources(getTestResourceRequirements())
+                                .replicas(1)
+                                .build())
+                .taskManager(
+                        TaskManagerSpec.builder().resources(getTestResourceRequirements()).build())
                 .build();
+    }
+
+    /**
+     * Builds the default resource requirements used across tests, mirroring the legacy {@code new
+     * Resource(1.0, "2048m", "2G")}: cpu/memory are requested (routed to Flink config) and
+     * ephemeral-storage is set on both requests and limits (carried in the pod template).
+     */
+    private static ResourceRequirements getTestResourceRequirements() {
+        return new ResourceRequirementsBuilder()
+                .addToRequests(CrdConstants.CPU, new Quantity("1"))
+                .addToRequests(CrdConstants.MEMORY, new Quantity("2048m"))
+                .addToRequests(CrdConstants.EPHEMERAL_STORAGE, new Quantity("2G"))
+                .addToLimits(CrdConstants.EPHEMERAL_STORAGE, new Quantity("2G"))
+                .build();
+    }
+
+    /**
+     * Switches the given spec from the default (new) {@code resources} field to the deprecated
+     * {@code resource} field, reproducing the legacy {@code new Resource(1.0, "2048m", "2G")}
+     * fixture. Used by tests that specifically exercise the deprecated resource path.
+     */
+    public static void useDeprecatedResource(FlinkDeploymentSpec spec) {
+        spec.getJobManager().setResources(null);
+        spec.getJobManager().setResource(new Resource(1.0, "2048m", "2G"));
+        spec.getTaskManager().setResources(null);
+        spec.getTaskManager().setResource(new Resource(1.0, "2048m", "2G"));
+    }
+
+    /** See {@link #useDeprecatedResource(FlinkDeploymentSpec)}. */
+    public static void useDeprecatedResource(FlinkDeployment deployment) {
+        useDeprecatedResource(deployment.getSpec());
     }
 
     public static PodTemplateSpec getTestPodTemplate(String hostname, List<Container> containers) {
@@ -267,5 +312,44 @@ public class BaseTestUtils {
                         .build());
 
         return snapshot;
+    }
+
+    public static FlinkDeploymentStatus createApplicationModeStatus(JobStatus jobStatus) {
+        FlinkDeploymentStatus status = new FlinkDeploymentStatus();
+        org.apache.flink.kubernetes.operator.api.status.JobStatus flinkJobStatus =
+                new org.apache.flink.kubernetes.operator.api.status.JobStatus();
+        flinkJobStatus.setState(jobStatus);
+        status.setJobStatus(flinkJobStatus);
+        status.setConditions(new ArrayList<>());
+
+        FlinkDeploymentReconciliationStatus reconciliationStatus =
+                new FlinkDeploymentReconciliationStatus();
+
+        FlinkDeployment deployment = BaseTestUtils.buildApplicationCluster();
+        String serializedSpec = SpecUtils.writeSpecWithMeta(deployment.getSpec(), deployment);
+        reconciliationStatus.setLastReconciledSpec(serializedSpec);
+
+        status.setReconciliationStatus(reconciliationStatus);
+        status.setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+
+        return status;
+    }
+
+    public static FlinkDeploymentStatus createSessionModeStatus(
+            JobManagerDeploymentStatus jmStatus) {
+        FlinkDeploymentStatus status = new FlinkDeploymentStatus();
+        status.setJobManagerDeploymentStatus(jmStatus);
+        status.setConditions(new ArrayList<>());
+
+        FlinkDeploymentReconciliationStatus reconciliationStatus =
+                new FlinkDeploymentReconciliationStatus();
+
+        FlinkDeployment deployment = BaseTestUtils.buildSessionCluster();
+        String serializedSpec = SpecUtils.writeSpecWithMeta(deployment.getSpec(), deployment);
+        reconciliationStatus.setLastReconciledSpec(serializedSpec);
+
+        status.setReconciliationStatus(reconciliationStatus);
+
+        return status;
     }
 }

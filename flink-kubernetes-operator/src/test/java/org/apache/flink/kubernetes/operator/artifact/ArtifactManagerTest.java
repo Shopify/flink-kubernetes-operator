@@ -18,6 +18,7 @@
 package org.apache.flink.kubernetes.operator.artifact;
 
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.kubernetes.operator.TestUtils;
 import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
@@ -42,6 +43,8 @@ import java.net.HttpURLConnection;
 import java.net.InetSocketAddress;
 import java.net.URL;
 import java.nio.file.Path;
+import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 
 /** Test for {@link ArtifactManager}. */
@@ -53,11 +56,49 @@ public class ArtifactManagerTest {
 
     @BeforeEach
     public void setup() {
+        // The test server binds to loopback, so the operator policy must permit http + loopback.
+        artifactManager = artifactManagerWithPolicy(List.of("http"), false);
+    }
+
+    private ArtifactManager artifactManagerWithPolicy(
+            List<String> allowedSchemes, boolean disallowRestrictedHosts) {
         Configuration configuration = new Configuration();
         configuration.setString(
                 KubernetesOperatorConfigOptions.OPERATOR_USER_ARTIFACTS_BASE_DIR,
                 tempDir.toAbsolutePath().toString());
-        artifactManager = new ArtifactManager(new FlinkConfigManager(configuration));
+        configuration.set(KubernetesOperatorConfigOptions.JAR_URI_ALLOWED_SCHEMES, allowedSchemes);
+        configuration.set(
+                KubernetesOperatorConfigOptions.JAR_URI_DISALLOW_RESTRICTED_HOSTS,
+                disallowRestrictedHosts);
+        return new ArtifactManager(new FlinkConfigManager(configuration));
+    }
+
+    private ArtifactManager artifactManagerWithFetchLimits(
+            Duration totalTimeout, long maxArtifactSizeBytes) {
+        Configuration configuration = new Configuration();
+        configuration.setString(
+                KubernetesOperatorConfigOptions.OPERATOR_USER_ARTIFACTS_BASE_DIR,
+                tempDir.toAbsolutePath().toString());
+        configuration.set(KubernetesOperatorConfigOptions.JAR_URI_ALLOWED_SCHEMES, List.of("http"));
+        configuration.set(KubernetesOperatorConfigOptions.JAR_URI_DISALLOW_RESTRICTED_HOSTS, false);
+        configuration.set(KubernetesOperatorConfigOptions.JAR_FETCH_TOTAL_TIMEOUT, totalTimeout);
+        configuration.set(
+                KubernetesOperatorConfigOptions.JAR_ARTIFACT_MAX_SIZE,
+                new MemorySize(maxArtifactSizeBytes));
+        return new ArtifactManager(new FlinkConfigManager(configuration));
+    }
+
+    private ArtifactManager artifactManagerWithSocketTimeout(
+            Duration socketTimeout, Duration totalTimeout) {
+        Configuration configuration = new Configuration();
+        configuration.setString(
+                KubernetesOperatorConfigOptions.OPERATOR_USER_ARTIFACTS_BASE_DIR,
+                tempDir.toAbsolutePath().toString());
+        configuration.set(KubernetesOperatorConfigOptions.JAR_URI_ALLOWED_SCHEMES, List.of("http"));
+        configuration.set(KubernetesOperatorConfigOptions.JAR_URI_DISALLOW_RESTRICTED_HOSTS, false);
+        configuration.set(KubernetesOperatorConfigOptions.JAR_FETCH_SOCKET_TIMEOUT, socketTimeout);
+        configuration.set(KubernetesOperatorConfigOptions.JAR_FETCH_TOTAL_TIMEOUT, totalTimeout);
+        return new ArtifactManager(new FlinkConfigManager(configuration));
     }
 
     @Test
@@ -117,6 +158,375 @@ public class ArtifactManagerTest {
         }
     }
 
+    @Test
+    public void testHttpFetchCreatesNestedNonExistentTargetDir() throws Exception {
+        // The real call site (uploadJar -> generateJarDir) targets a nested per-job directory
+        // (base/namespace/deployment/job) that doesn't exist yet; unlike the other tests here,
+        // don't reuse the JUnit-provided tempDir directly so a missing intermediate directory
+        // actually gets exercised.
+        var nestedTargetDir = tempDir.resolve("ns").resolve("deployment").resolve("job");
+        Assertions.assertFalse(nestedTargetDir.toFile().exists());
+        HttpServer httpServer = null;
+        try {
+            httpServer = startHttpServer();
+            var sourceFile = mockTheJarFile();
+            httpServer.createContext("/download/file.jar", new DownloadFileHttpHandler(sourceFile));
+
+            var file =
+                    artifactManager.fetch(
+                            String.format(
+                                    "http://127.0.0.1:%d/download/file.jar",
+                                    httpServer.getAddress().getPort()),
+                            new Configuration(),
+                            nestedTargetDir.toString());
+            Assertions.assertTrue(file.exists());
+            Assertions.assertEquals(nestedTargetDir.toString(), file.getParent());
+        } finally {
+            if (httpServer != null) {
+                httpServer.stop(0);
+            }
+        }
+    }
+
+    @Test
+    public void testHttpFetchFollowsRedirectToAllowedTarget() throws Exception {
+        HttpServer httpServer = null;
+        try {
+            httpServer = startHttpServer();
+            var port = httpServer.getAddress().getPort();
+            var sourceFile = mockTheJarFile();
+            httpServer.createContext("/download/file.jar", new DownloadFileHttpHandler(sourceFile));
+            httpServer.createContext(
+                    "/myjob.jar",
+                    new RedirectHttpHandler(
+                            String.format("http://127.0.0.1:%d/download/file.jar", port)));
+
+            var file =
+                    artifactManager.fetch(
+                            String.format("http://127.0.0.1:%d/myjob.jar", port),
+                            new Configuration(),
+                            tempDir.toString());
+            Assertions.assertTrue(file.exists());
+            // Content comes from the redirect target, but the name from the original jarURI.
+            Assertions.assertEquals("myjob.jar", file.getName());
+            Assertions.assertEquals(sourceFile.length(), file.length());
+        } finally {
+            if (httpServer != null) {
+                httpServer.stop(0);
+            }
+        }
+    }
+
+    @Test
+    public void testHttpFetchBlocksRedirectToNonHttpScheme() throws Exception {
+        // An http fetch must only follow http(s) redirects. Here a JDK-recognized non-http scheme
+        // (ftp) is rejected cleanly.
+        HttpServer httpServer = null;
+        try {
+            httpServer = startHttpServer();
+            var port = httpServer.getAddress().getPort();
+            httpServer.createContext(
+                    "/redirect",
+                    new RedirectHttpHandler(String.format("ftp://127.0.0.1:%d/job.jar", port)));
+
+            var ex =
+                    Assertions.assertThrows(
+                            IOException.class,
+                            () ->
+                                    artifactManager.fetch(
+                                            String.format("http://127.0.0.1:%d/redirect", port),
+                                            new Configuration(),
+                                            tempDir.toString()));
+            Assertions.assertTrue(ex.getMessage().contains("non-http(s) target"), ex.getMessage());
+        } finally {
+            if (httpServer != null) {
+                httpServer.stop(0);
+            }
+        }
+    }
+
+    @Test
+    public void testHttpFetchBlocksRedirectToFilesystemScheme() throws Exception {
+        // An http server redirecting to an s3/hdfs target (a Flink filesystem scheme, not a
+        // java.net URL protocol) must fail closed cleanly rather than with a raw error.
+        HttpServer httpServer = null;
+        try {
+            httpServer = startHttpServer();
+            var port = httpServer.getAddress().getPort();
+            httpServer.createContext("/redirect", new RedirectHttpHandler("s3://bucket/job.jar"));
+
+            var ex =
+                    Assertions.assertThrows(
+                            IOException.class,
+                            () ->
+                                    artifactManager.fetch(
+                                            String.format("http://127.0.0.1:%d/redirect", port),
+                                            new Configuration(),
+                                            tempDir.toString()));
+            Assertions.assertTrue(
+                    ex.getMessage().contains("Refusing to follow redirect"), ex.getMessage());
+        } finally {
+            if (httpServer != null) {
+                httpServer.stop(0);
+            }
+        }
+    }
+
+    @Test
+    public void testHttpFetchBlocksTooManyRedirects() throws Exception {
+        HttpServer httpServer = null;
+        try {
+            httpServer = startHttpServer();
+            var port = httpServer.getAddress().getPort();
+            httpServer.createContext(
+                    "/loop",
+                    new RedirectHttpHandler(String.format("http://127.0.0.1:%d/loop", port)));
+
+            var ex =
+                    Assertions.assertThrows(
+                            IOException.class,
+                            () ->
+                                    artifactManager.fetch(
+                                            String.format("http://127.0.0.1:%d/loop", port),
+                                            new Configuration(),
+                                            tempDir.toString()));
+            Assertions.assertTrue(ex.getMessage().contains("Too many redirects"), ex.getMessage());
+        } finally {
+            if (httpServer != null) {
+                httpServer.stop(0);
+            }
+        }
+    }
+
+    @Test
+    public void testHttpFetchRejectsOversizedDeclaredContentLength() throws Exception {
+        // The server declares a Content-Length beyond the cap; the fetch must fail fast without
+        // reading the body.
+        var strictManager = artifactManagerWithFetchLimits(Duration.ofSeconds(30), 10);
+        HttpServer httpServer = null;
+        try {
+            httpServer = startHttpServer();
+            var port = httpServer.getAddress().getPort();
+            var sourceFile = mockTheJarFile();
+            Assertions.assertTrue(sourceFile.length() > 10);
+            httpServer.createContext("/download/file.jar", new DownloadFileHttpHandler(sourceFile));
+
+            var ex =
+                    Assertions.assertThrows(
+                            IOException.class,
+                            () ->
+                                    strictManager.fetch(
+                                            String.format(
+                                                    "http://127.0.0.1:%d/download/file.jar", port),
+                                            new Configuration(),
+                                            tempDir.toString()));
+            Assertions.assertTrue(ex.getMessage().contains("exceeds the configured limit"));
+        } finally {
+            if (httpServer != null) {
+                httpServer.stop(0);
+            }
+        }
+    }
+
+    @Test
+    public void testHttpFetchRejectsOversizedActualBody() throws Exception {
+        // The server does not declare a Content-Length (chunked transfer), so the cap must be
+        // enforced while streaming the body rather than up front.
+        var strictManager = artifactManagerWithFetchLimits(Duration.ofSeconds(30), 10);
+        HttpServer httpServer = null;
+        try {
+            httpServer = startHttpServer();
+            var port = httpServer.getAddress().getPort();
+            httpServer.createContext("/download/file.jar", new ChunkedOversizedHttpHandler());
+
+            var ex =
+                    Assertions.assertThrows(
+                            IOException.class,
+                            () ->
+                                    strictManager.fetch(
+                                            String.format(
+                                                    "http://127.0.0.1:%d/download/file.jar", port),
+                                            new Configuration(),
+                                            tempDir.toString()));
+            Assertions.assertTrue(ex.getMessage().contains("exceeds the configured limit"));
+            Assertions.assertTrue(ex.getMessage().contains("downloaded size"), ex.getMessage());
+            Assertions.assertFalse(new File(tempDir.toFile(), "file.jar").exists());
+        } finally {
+            if (httpServer != null) {
+                httpServer.stop(0);
+            }
+        }
+    }
+
+    @Test
+    public void testHttpFetchTimesOutOnSlowTrickle() throws Exception {
+        // The server sends a byte at a time, each well within the read timeout, so only the
+        // overall fetch timeout can bound the reconcile thread here.
+        var strictManager = artifactManagerWithFetchLimits(Duration.ofMillis(300), 10_000_000);
+        HttpServer httpServer = null;
+        try {
+            httpServer = startHttpServer();
+            var port = httpServer.getAddress().getPort();
+            httpServer.createContext("/download/file.jar", new SlowTrickleHttpHandler());
+
+            var fetchStart = System.currentTimeMillis();
+            var ex =
+                    Assertions.assertThrows(
+                            IOException.class,
+                            () ->
+                                    strictManager.fetch(
+                                            String.format(
+                                                    "http://127.0.0.1:%d/download/file.jar", port),
+                                            new Configuration(),
+                                            tempDir.toString()));
+            var elapsed = System.currentTimeMillis() - fetchStart;
+            Assertions.assertTrue(ex.getMessage().contains("Timed out"), ex.getMessage());
+            // Bounded well below the many seconds the slow trickle would otherwise take to finish.
+            Assertions.assertTrue(elapsed < 10_000, "fetch took " + elapsed + " ms");
+        } finally {
+            if (httpServer != null) {
+                httpServer.stop(0);
+            }
+        }
+    }
+
+    @Test
+    public void testHttpFetchTimesOutOnConnectToUnreachableHost() {
+        // Connect to a blackholed address (TEST-NET-1, RFC 5737) whose SYNs are dropped, so the
+        // TCP connect never completes. The 1s connect timeout must bound it far below the 60s
+        // total timeout, proving the per-connection timeout (not just the total) is in effect.
+        var strictManager =
+                artifactManagerWithSocketTimeout(Duration.ofSeconds(1), Duration.ofSeconds(60));
+
+        var fetchStart = System.currentTimeMillis();
+        var ex =
+                Assertions.assertThrows(
+                        IOException.class,
+                        () ->
+                                strictManager.fetch(
+                                        "http://192.0.2.1:81/job.jar",
+                                        new Configuration(),
+                                        tempDir.toString()));
+        var elapsed = System.currentTimeMillis() - fetchStart;
+        Assertions.assertTrue(
+                ex.getMessage().toLowerCase().contains("connect timed out"), ex.getMessage());
+        Assertions.assertTrue(elapsed < 30_000, "fetch took " + elapsed + " ms");
+    }
+
+    @Test
+    public void testHttpFetchTimesOutOnReadWhenServerStallsAfterHeaders() throws Exception {
+        // The server sends response headers then never sends the body, so a client read blocks.
+        // The 1s read timeout must bound the stalled read far below the 60s total timeout,
+        // proving the per-read socket timeout (not just the total) is in effect.
+        var strictManager =
+                artifactManagerWithSocketTimeout(Duration.ofSeconds(1), Duration.ofSeconds(60));
+        HttpServer httpServer = null;
+        try {
+            httpServer = startHttpServer();
+            var port = httpServer.getAddress().getPort();
+            httpServer.createContext("/download/file.jar", new StallAfterHeadersHttpHandler());
+
+            var fetchStart = System.currentTimeMillis();
+            var ex =
+                    Assertions.assertThrows(
+                            IOException.class,
+                            () ->
+                                    strictManager.fetch(
+                                            String.format(
+                                                    "http://127.0.0.1:%d/download/file.jar", port),
+                                            new Configuration(),
+                                            tempDir.toString()));
+            var elapsed = System.currentTimeMillis() - fetchStart;
+            Assertions.assertTrue(
+                    ex.getMessage().toLowerCase().contains("read timed out"), ex.getMessage());
+            Assertions.assertTrue(elapsed < 30_000, "fetch took " + elapsed + " ms");
+        } finally {
+            if (httpServer != null) {
+                httpServer.stop(0);
+            }
+        }
+    }
+
+    @Test
+    public void testOperatorConfigControlsFetchLimits() throws Exception {
+        // The size-cap policy comes from the operator config; a value set in the per-job config
+        // does not override it.
+        var strictManager = artifactManagerWithFetchLimits(Duration.ofSeconds(30), 10);
+        var jobConfig =
+                new Configuration()
+                        .set(
+                                KubernetesOperatorConfigOptions.JAR_ARTIFACT_MAX_SIZE,
+                                MemorySize.ofMebiBytes(1024));
+
+        HttpServer httpServer = null;
+        try {
+            httpServer = startHttpServer();
+            var port = httpServer.getAddress().getPort();
+            var sourceFile = mockTheJarFile();
+            Assertions.assertTrue(sourceFile.length() > 10);
+            httpServer.createContext("/download/file.jar", new DownloadFileHttpHandler(sourceFile));
+
+            var ex =
+                    Assertions.assertThrows(
+                            IOException.class,
+                            () ->
+                                    strictManager.fetch(
+                                            String.format(
+                                                    "http://127.0.0.1:%d/download/file.jar", port),
+                                            jobConfig,
+                                            tempDir.toString()));
+            Assertions.assertTrue(ex.getMessage().contains("exceeds the configured limit"));
+        } finally {
+            if (httpServer != null) {
+                httpServer.stop(0);
+            }
+        }
+    }
+
+    @Test
+    public void testOperatorConfigControlsRestrictedHostPolicy() {
+        // The restricted-host policy comes from the operator config; a value set in the per-job
+        // config does not override it. No server is needed: the loopback host is rejected first.
+        var strictManager = artifactManagerWithPolicy(List.of("http"), true);
+        var jobConfig =
+                new Configuration()
+                        .set(
+                                KubernetesOperatorConfigOptions.JAR_URI_DISALLOW_RESTRICTED_HOSTS,
+                                false);
+
+        var ex =
+                Assertions.assertThrows(
+                        IOException.class,
+                        () ->
+                                strictManager.fetch(
+                                        "http://127.0.0.1:9999/job.jar",
+                                        jobConfig,
+                                        tempDir.toString()));
+        Assertions.assertTrue(ex.getMessage().contains("restricted address"), ex.getMessage());
+    }
+
+    @Test
+    public void testOperatorConfigControlsSchemeAllowlist() {
+        // The scheme allowlist comes from the operator config; a value set in the per-job config
+        // does not override it.
+        var strictManager = artifactManagerWithPolicy(List.of("https"), false);
+        var jobConfig =
+                new Configuration()
+                        .set(
+                                KubernetesOperatorConfigOptions.JAR_URI_ALLOWED_SCHEMES,
+                                List.of("http"));
+
+        var ex =
+                Assertions.assertThrows(
+                        IOException.class,
+                        () ->
+                                strictManager.fetch(
+                                        "http://127.0.0.1:9999/job.jar",
+                                        jobConfig,
+                                        tempDir.toString()));
+        Assertions.assertTrue(ex.getMessage().contains("scheme 'http'"), ex.getMessage());
+    }
+
     private HttpServer startHttpServer() throws IOException {
         int port = RandomUtils.nextInt(2000, 3000);
         HttpServer httpServer = null;
@@ -158,6 +568,89 @@ public class ArtifactManagerTest {
             exchange.sendResponseHeaders(HttpURLConnection.HTTP_OK, file.length());
             FileUtils.copyFile(this.file, exchange.getResponseBody());
             exchange.close();
+        }
+    }
+
+    /** Handler that always responds with a 302 redirect to the configured location. */
+    public static class RedirectHttpHandler implements HttpHandler {
+
+        private final String location;
+
+        public RedirectHttpHandler(String location) {
+            this.location = location;
+        }
+
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            exchange.getResponseHeaders().add("Location", location);
+            exchange.sendResponseHeaders(HttpURLConnection.HTTP_MOVED_TEMP, -1);
+            exchange.close();
+        }
+    }
+
+    /**
+     * Handler that streams more bytes than any reasonable test cap without ever declaring a
+     * Content-Length (chunked transfer), so the size cap must be enforced while streaming.
+     */
+    public static class ChunkedOversizedHttpHandler implements HttpHandler {
+
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            // -1 body length tells the JDK HTTP server to use chunked transfer encoding.
+            exchange.sendResponseHeaders(HttpURLConnection.HTTP_OK, 0);
+            var body = exchange.getResponseBody();
+            byte[] chunk = new byte[1024];
+            for (int i = 0; i < 100; i++) {
+                body.write(chunk);
+            }
+            exchange.close();
+        }
+    }
+
+    /**
+     * Handler that dribbles a single byte at a time with a short pause between each, simulating a
+     * slow-loris style host: each individual read completes quickly, but the transfer as a whole
+     * never finishes on any reasonable timescale.
+     */
+    public static class SlowTrickleHttpHandler implements HttpHandler {
+
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            // 0 body length with no prior Content-Length header tells the JDK HTTP server to use
+            // chunked transfer encoding, so the client never sees a declared size to fail fast on.
+            exchange.sendResponseHeaders(HttpURLConnection.HTTP_OK, 0);
+            var body = exchange.getResponseBody();
+            try {
+                while (true) {
+                    body.write(0);
+                    body.flush();
+                    Thread.sleep(50);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                exchange.close();
+            }
+        }
+    }
+
+    /**
+     * Handler that sends response headers declaring a body, then stalls without sending any body
+     * bytes, so a client read blocks until the socket read timeout fires.
+     */
+    public static class StallAfterHeadersHttpHandler implements HttpHandler {
+
+        @Override
+        public void handle(HttpExchange exchange) throws IOException {
+            // Declare a fixed-length body but never write it; the client's read blocks on the body.
+            exchange.sendResponseHeaders(HttpURLConnection.HTTP_OK, 1024);
+            try {
+                Thread.sleep(5_000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            } finally {
+                exchange.close();
+            }
         }
     }
 }

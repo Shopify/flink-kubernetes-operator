@@ -1,0 +1,102 @@
+<table class="configuration table table-bordered">
+    <thead>
+        <tr>
+            <th class="text-left" style="width: 20%">Key</th>
+            <th class="text-left" style="width: 15%">Default</th>
+            <th class="text-left" style="width: 10%">Type</th>
+            <th class="text-left" style="width: 55%">Description</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td><h5>kubernetes.operator.exception.field.max.length</h5></td>
+            <td style="word-wrap: break-word;">2048</td>
+            <td>Integer</td>
+            <td>Maximum length of each exception field including stack trace to be included in CR status error field.</td>
+        </tr>
+        <tr>
+            <td><h5>kubernetes.operator.exception.stacktrace.enabled</h5></td>
+            <td style="word-wrap: break-word;">false</td>
+            <td>Boolean</td>
+            <td>Enable exception stacktrace to be included in CR status error field.</td>
+        </tr>
+        <tr>
+            <td><h5>kubernetes.operator.exception.stacktrace.max.length</h5></td>
+            <td style="word-wrap: break-word;">2048</td>
+            <td>Integer</td>
+            <td>Maximum length of stacktrace to be included in CR status error field.</td>
+        </tr>
+        <tr>
+            <td><h5>kubernetes.operator.exception.throwable.list.max.count</h5></td>
+            <td style="word-wrap: break-word;">2</td>
+            <td>Integer</td>
+            <td>Maximum number of throwable to be included in CR status error field.</td>
+        </tr>
+        <tr>
+            <td><h5>kubernetes.operator.flink.client.cancel.timeout</h5></td>
+            <td style="word-wrap: break-word;">1 min</td>
+            <td>Duration</td>
+            <td>The timeout for the reconciler to wait for flink to cancel job.</td>
+        </tr>
+        <tr>
+            <td><h5>kubernetes.operator.flink.client.timeout</h5></td>
+            <td style="word-wrap: break-word;">10 s</td>
+            <td>Duration</td>
+            <td>The timeout for the observer to wait the flink rest client to return.</td>
+        </tr>
+        <tr>
+            <td><h5>kubernetes.operator.job.submission.timeout</h5></td>
+            <td style="word-wrap: break-word;">10 min</td>
+            <td>Duration</td>
+            <td>The timeout for session job submissions.</td>
+        </tr>
+        <tr>
+            <td><h5>kubernetes.operator.reconcile.interval</h5></td>
+            <td style="word-wrap: break-word;">1 min</td>
+            <td>Duration</td>
+            <td>The interval for the controller to reschedule the reconcile process.</td>
+        </tr>
+        <tr>
+            <td><h5>kubernetes.operator.resource.cleanup.timeout</h5></td>
+            <td style="word-wrap: break-word;">5 min</td>
+            <td>Duration</td>
+            <td>The timeout for the resource clean up to wait for flink to shutdown cluster.</td>
+        </tr>
+        <tr>
+            <td><h5>kubernetes.operator.user.artifacts.allowed-schemes</h5></td>
+            <td style="word-wrap: break-word;">"https"</td>
+            <td>List&lt;String&gt;</td>
+            <td>Comma separated list of URI schemes that are allowed for the FlinkSessionJob jarURI. Only 'https' is allowed by default. Operators that need to fetch artifacts via other schemes (such as 's3' or 'hdfs') can extend this list. Scheme matching is case-insensitive.</td>
+        </tr>
+        <tr>
+            <td><h5>kubernetes.operator.user.artifacts.base.dir</h5></td>
+            <td style="word-wrap: break-word;">"/opt/flink/artifacts"</td>
+            <td>String</td>
+            <td>The base dir to put the session job artifacts.</td>
+        </tr>
+        <tr>
+            <td><h5>kubernetes.operator.user.artifacts.disallow-restricted-hosts</h5></td>
+            <td style="word-wrap: break-word;">true</td>
+            <td>Boolean</td>
+            <td>If enabled, FlinkSessionJob jarURI hosts that resolve to loopback, link-local, site-local, wildcard or multicast addresses are rejected during validation. Disable only if the operator legitimately needs to fetch from such addresses.</td>
+        </tr>
+        <tr>
+            <td><h5>kubernetes.operator.user.artifacts.http.socket-timeout</h5></td>
+            <td style="word-wrap: break-word;">30 s</td>
+            <td>Duration</td>
+            <td>The connect and socket read timeout for downloading a FlinkSessionJob jarURI over http(s). Bounds how long the reconcile thread can be blocked establishing the connection, or waiting for the next byte, from an unresponsive artifact host.</td>
+        </tr>
+        <tr>
+            <td><h5>kubernetes.operator.user.artifacts.http.total-timeout</h5></td>
+            <td style="word-wrap: break-word;">5 min</td>
+            <td>Duration</td>
+            <td>The total wall-clock budget for downloading a FlinkSessionJob jarURI over http(s), covering all redirects and the full body transfer. Unlike the socket timeout, this bounds the overall download even against a slow host that keeps trickling data fast enough to avoid tripping it.</td>
+        </tr>
+        <tr>
+            <td><h5>kubernetes.operator.user.artifacts.max-size</h5></td>
+            <td style="word-wrap: break-word;">1 gb</td>
+            <td>MemorySize</td>
+            <td>The maximum size of a FlinkSessionJob jarURI artifact fetched over http(s). The download is rejected once it exceeds this size, whether or not the server declares a Content-Length up front.</td>
+        </tr>
+    </tbody>
+</table>

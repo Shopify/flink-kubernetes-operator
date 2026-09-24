@@ -22,18 +22,20 @@ metadata:
   name: sql-example
 spec:
   image: flink-sql-runner-example:latest
-  flinkVersion: v1_20
+  flinkVersion: v2_2
   flinkConfiguration:
     taskmanager.numberOfTaskSlots: 1
   serviceAccount: flink
   jobManager:
-    resource:
-      memory: "2048m"
-      cpu: 1
+    resources:
+      requests:
+        memory: "2048m"
+        cpu: "1"
   taskManager:
-    resource:
-      memory: "2048m"
-      cpu: 1
+    resources:
+      requests:
+        memory: "2048m"
+        cpu: "1"
   job:
     jarURI: local:///opt/flink/usrlib/sql-runner.jar
     args: ["/opt/flink/usrlib/sql-scripts/simple.sql"]

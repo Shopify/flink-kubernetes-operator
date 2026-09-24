@@ -62,6 +62,7 @@ import org.apache.flink.kubernetes.operator.api.utils.SpecUtils;
 import org.apache.flink.kubernetes.operator.autoscaler.KubernetesJobAutoScalerContext;
 import org.apache.flink.kubernetes.operator.config.FlinkOperatorConfiguration;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
+import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
 import org.apache.flink.kubernetes.operator.exception.UpgradeFailureException;
 import org.apache.flink.kubernetes.operator.health.ClusterHealthInfo;
 import org.apache.flink.kubernetes.operator.observer.ClusterHealthEvaluator;
@@ -130,6 +131,8 @@ import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConf
 import static org.apache.flink.kubernetes.operator.reconciler.SnapshotType.CHECKPOINT;
 import static org.apache.flink.kubernetes.operator.reconciler.SnapshotType.SAVEPOINT;
 import static org.apache.flink.kubernetes.operator.reconciler.deployment.AbstractFlinkResourceReconciler.MSG_SUBMIT;
+import static org.apache.flink.kubernetes.operator.reconciler.deployment.ApplicationReconciler.APPLICATION_RESULT_STORE_DELETE_ON_COMMIT;
+import static org.apache.flink.kubernetes.operator.reconciler.deployment.ApplicationReconciler.APPLICATION_RESULT_STORE_STORAGE_PATH;
 import static org.apache.flink.kubernetes.operator.reconciler.deployment.ApplicationReconciler.MSG_RECOVERY;
 import static org.apache.flink.kubernetes.operator.utils.SnapshotUtils.getLastSnapshotStatus;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -801,9 +804,14 @@ public class ApplicationReconcilerTest extends OperatorTestBase {
         assertNotEquals(path1, path2);
     }
 
+    /**
+     * The application result store lives under the HA storage path and survives the HA metadata
+     * deletion performed on upgrade, so a terminal entry left by the previous deployment would
+     * otherwise be recovered by the replacement cluster, which then skips submitting the new job.
+     */
     @Test
-    public void testRandomApplicationResultStorePathForFlink23() throws Exception {
-        FlinkDeployment flinkApp = TestUtils.buildApplicationCluster(FlinkVersion.v2_3);
+    public void testRandomApplicationResultStorePath() throws Exception {
+        FlinkDeployment flinkApp = TestUtils.buildApplicationCluster();
         final String haStoragePath = "file:///flink-data/ha";
         flinkApp.getSpec()
                 .getFlinkConfiguration()
@@ -819,53 +827,55 @@ public class ApplicationReconcilerTest extends OperatorTestBase {
         reconciler
                 .getReconciler()
                 .deploy(getResourceContext(flinkApp), spec, deployConfig, Optional.empty(), false);
-
-        String path1 =
-                deployConfig.getString(
-                        ApplicationReconciler.APPLICATION_RESULT_STORE_STORAGE_PATH, null);
-        assertEquals(
-                "false",
-                deployConfig.getString(
-                        ApplicationReconciler.APPLICATION_RESULT_STORE_DELETE_ON_COMMIT, null));
-        assertTrue(path1.startsWith(haStoragePath));
+        String path1 = deployConfig.get(APPLICATION_RESULT_STORE_STORAGE_PATH);
+        assertThat(path1).startsWith(haStoragePath);
 
         status.getJobStatus().setState(org.apache.flink.api.common.JobStatus.FINISHED);
         status.setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
         reconciler
                 .getReconciler()
                 .deploy(getResourceContext(flinkApp), spec, deployConfig, Optional.empty(), false);
-        String path2 =
-                deployConfig.getString(
-                        ApplicationReconciler.APPLICATION_RESULT_STORE_STORAGE_PATH, null);
-        assertTrue(path2.startsWith(haStoragePath));
-        assertNotEquals(path1, path2);
+        String path2 = deployConfig.get(APPLICATION_RESULT_STORE_STORAGE_PATH);
+        assertThat(path2).startsWith(haStoragePath).isNotEqualTo(path1);
+    }
+
+    /**
+     * A terminal application result must outlive its cleanup, otherwise a JobManager restart before
+     * the cluster is shut down finds no record of the application and runs it again.
+     */
+    @Test
+    public void testApplicationResultStoreRetainsResults() throws Exception {
+        var deployConfig = deployWithHaStorage(Map.of());
+        assertThat(deployConfig.get(APPLICATION_RESULT_STORE_DELETE_ON_COMMIT)).isFalse();
     }
 
     @Test
-    public void testApplicationResultStorePathNotSetBeforeFlink23() throws Exception {
-        FlinkDeployment flinkApp = TestUtils.buildApplicationCluster(FlinkVersion.v2_2);
-        final String haStoragePath = "file:///flink-data/ha";
+    public void testApplicationResultStoreDeleteOnCommitNotOverridden() throws Exception {
+        var deployConfig =
+                deployWithHaStorage(
+                        Map.of(APPLICATION_RESULT_STORE_DELETE_ON_COMMIT.key(), "true"));
+        assertThat(deployConfig.get(APPLICATION_RESULT_STORE_DELETE_ON_COMMIT)).isTrue();
+    }
+
+    /** Deploys an application cluster with HA storage configured, plus any extra config. */
+    private Configuration deployWithHaStorage(Map<String, String> extraConfig) throws Exception {
+        final FlinkDeployment flinkApp = TestUtils.buildApplicationCluster();
         flinkApp.getSpec()
                 .getFlinkConfiguration()
-                .put(HighAvailabilityOptions.HA_STORAGE_PATH.key(), haStoragePath);
+                .put(HighAvailabilityOptions.HA_STORAGE_PATH.key(), "file:///flink-data/ha");
+        flinkApp.getSpec().getFlinkConfiguration().putAllFrom(extraConfig);
 
-        ObjectMeta deployMeta = flinkApp.getMetadata();
-        FlinkDeploymentStatus status = flinkApp.getStatus();
-        FlinkDeploymentSpec spec = flinkApp.getSpec();
-        Configuration deployConfig = configManager.getDeployConfig(deployMeta, spec);
-
-        status.getJobStatus().setState(org.apache.flink.api.common.JobStatus.FINISHED);
-        status.setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+        final Configuration deployConfig =
+                configManager.getDeployConfig(flinkApp.getMetadata(), flinkApp.getSpec());
         reconciler
                 .getReconciler()
-                .deploy(getResourceContext(flinkApp), spec, deployConfig, Optional.empty(), false);
-
-        assertFalse(
-                deployConfig.containsKey(
-                        ApplicationReconciler.APPLICATION_RESULT_STORE_STORAGE_PATH));
-        assertFalse(
-                deployConfig.containsKey(
-                        ApplicationReconciler.APPLICATION_RESULT_STORE_DELETE_ON_COMMIT));
+                .deploy(
+                        getResourceContext(flinkApp),
+                        flinkApp.getSpec(),
+                        deployConfig,
+                        Optional.empty(),
+                        false);
+        return deployConfig;
     }
 
     @Test
@@ -1032,6 +1042,71 @@ public class ApplicationReconcilerTest extends OperatorTestBase {
         assertEquals(1, rescaleCounter.get());
         assertEquals(3, flinkResourceEventCollector.events.size());
         assertFalse(reconStatus.isLastReconciledSpecStable());
+    }
+
+    @Test
+    public void testResumedUpgradeDoesNotTriggerInPlaceScaling() throws Exception {
+        var scaleCounter = new AtomicInteger(0);
+        var cancelCounter = new AtomicInteger(0);
+        var deployCounter = new AtomicInteger(0);
+
+        var nativeService =
+                new NativeFlinkService(
+                        kubernetesClient, null, executorService, operatorConfig, eventRecorder) {
+                    @Override
+                    public boolean scale(FlinkResourceContext<?> ctx, Configuration deployConfig) {
+                        scaleCounter.incrementAndGet();
+                        return true;
+                    }
+
+                    @Override
+                    public CancelResult cancelJob(
+                            FlinkDeployment deployment,
+                            SuspendMode suspendMode,
+                            Configuration conf) {
+                        cancelCounter.incrementAndGet();
+                        deployment.getStatus().getJobStatus().setState(FINISHED);
+                        return CancelResult.completed(null);
+                    }
+
+                    @Override
+                    protected void deployApplicationCluster(JobSpec jobSpec, Configuration conf) {
+                        deployCounter.incrementAndGet();
+                    }
+                };
+
+        var ctxFactory =
+                new TestingFlinkResourceContextFactory(
+                        configManager, operatorMetricGroup, nativeService, eventRecorder);
+        FlinkDeployment deployment = TestUtils.buildApplicationCluster();
+        deployment.getMetadata().setGeneration(1L);
+
+        reconciler.reconcile(deployment, context);
+        verifyAndSetRunningJobsToStatus(deployment, flinkService.listJobs());
+
+        // Simulate an upgrade such as the spec diff is IGNORE while the reconciliation state is
+        // UPGRADING
+        deployment.getStatus().getReconciliationStatus().setState(ReconciliationState.UPGRADING);
+
+        appReconciler.reconcile(ctxFactory.getResourceContext(deployment, context));
+
+        // The first reconcile starts the upgrade (suspend job) and does not trigger in-place
+        // scaling
+        assertEquals(0, scaleCounter.get());
+        assertEquals(1, cancelCounter.get());
+        assertEquals(0, deployCounter.get());
+        assertEquals(
+                ReconciliationState.UPGRADING,
+                deployment.getStatus().getReconciliationStatus().getState());
+
+        // The second reconcile completes the upgrade (redeploy job)
+        appReconciler.reconcile(ctxFactory.getResourceContext(deployment, context));
+        assertEquals(0, scaleCounter.get());
+        assertEquals(1, cancelCounter.get());
+        assertEquals(1, deployCounter.get());
+        assertEquals(
+                ReconciliationState.DEPLOYED,
+                deployment.getStatus().getReconciliationStatus().getState());
     }
 
     @Test

@@ -22,18 +22,13 @@ under the License.
 
     <parent>
         <groupId>org.apache.flink</groupId>
-        <artifactId>flink-kubernetes-operator-parent</artifactId>
-        <version>1.15-SNAPSHOT</version>
-        <relativePath>../..</relativePath>
+        <artifactId>flink-kubernetes-operator-examples</artifactId>
+        <version>1.17-SNAPSHOT</version>
+        <relativePath>..</relativePath>
     </parent>
 
     <artifactId>flink-sql-runner-example</artifactId>
     <name>Flink SQL Runner Example</name>
-
-    <!-- Given that this is an example skip maven deployment -->
-    <properties>
-        <maven.deploy.skip>true</maven.deploy.skip>
-    </properties>
 
     <dependencies>
         <!-- Apache Flink dependencies -->
@@ -71,7 +66,7 @@ under the License.
         </dependency>
         <dependency>
             <groupId>org.apache.logging.log4j</groupId>
-            <artifactId>log4j-slf4j-impl</artifactId>
+            <artifactId>log4j-slf4j2-impl</artifactId>
             <version>${log4j.version}</version>
             <scope>runtime</scope>
         </dependency>

@@ -21,8 +21,8 @@ kind: FlinkDeployment
 metadata:
   name: basic-checkpoint-ha-example
 spec:
-  image: flink:1.20
-  flinkVersion: v1_20
+  image: flink:2.2
+  flinkVersion: v2_2
   flinkConfiguration:
     taskmanager.numberOfTaskSlots: 2
     state:
@@ -34,13 +34,15 @@ spec:
     kubernetes.operator.savepoint.format.type: NATIVE
   serviceAccount: flink
   jobManager:
-    resource:
-      memory: "2048m"
-      cpu: 1
+    resources:
+      requests:
+        memory: "2048m"
+        cpu: "1"
   taskManager:
-    resource:
-      memory: "2048m"
-      cpu: 1
+    resources:
+      requests:
+        memory: "2048m"
+        cpu: "1"
   podTemplate:
     spec:
       containers:

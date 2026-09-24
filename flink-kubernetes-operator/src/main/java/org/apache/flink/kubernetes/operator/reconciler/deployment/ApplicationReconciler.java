@@ -20,13 +20,14 @@ package org.apache.flink.kubernetes.operator.reconciler.deployment;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
 import org.apache.flink.autoscaler.JobAutoScaler;
+import org.apache.flink.configuration.ConfigOption;
+import org.apache.flink.configuration.ConfigOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.HighAvailabilityOptions;
 import org.apache.flink.configuration.PipelineOptionsInternal;
 import org.apache.flink.kubernetes.configuration.KubernetesConfigOptions;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentSpec;
-import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.api.status.FlinkDeploymentStatus;
 import org.apache.flink.kubernetes.operator.api.status.JobManagerDeploymentStatus;
@@ -72,10 +73,24 @@ public class ApplicationReconciler
     private static final Logger LOG = LoggerFactory.getLogger(ApplicationReconciler.class);
     static final String MSG_RECOVERY = "Recovering lost deployment";
     static final String MSG_RESTART_UNHEALTHY = "Restarting unhealthy job";
-    static final String APPLICATION_RESULT_STORE_STORAGE_PATH =
-            "application-result-store.storage-path";
-    static final String APPLICATION_RESULT_STORE_DELETE_ON_COMMIT =
-            "application-result-store.delete-on-commit";
+
+    /**
+     * Mirrors {@code ApplicationResultStoreOptions#STORAGE_PATH}, introduced in Flink 2.3. The
+     * option is unknown and ignored in earlier versions.
+     */
+    static final ConfigOption<String> APPLICATION_RESULT_STORE_STORAGE_PATH =
+            ConfigOptions.key("application-result-store.storage-path")
+                    .stringType()
+                    .noDefaultValue();
+
+    /**
+     * Mirrors {@code ApplicationResultStoreOptions#DELETE_ON_COMMIT}, introduced in Flink 2.3. The
+     * option is unknown and ignored in earlier versions.
+     */
+    static final ConfigOption<Boolean> APPLICATION_RESULT_STORE_DELETE_ON_COMMIT =
+            ConfigOptions.key("application-result-store.delete-on-commit")
+                    .booleanType()
+                    .defaultValue(true);
 
     public ApplicationReconciler(
             EventRecorder eventRecorder,
@@ -173,7 +188,7 @@ public class ApplicationReconciler
 
         setOwnerReference(relatedResource, deployConfig);
         setRandomJobResultStorePath(deployConfig);
-        setRandomApplicationResultStorePath(deployConfig, spec.getFlinkVersion());
+        setRandomApplicationResultStorePath(deployConfig);
 
         if (status.getJobManagerDeploymentStatus() != JobManagerDeploymentStatus.MISSING) {
             Preconditions.checkArgument(ReconciliationUtils.isJobInTerminalState(status));
@@ -272,19 +287,23 @@ public class ApplicationReconciler
         }
     }
 
-    // Workaround for https://issues.apache.org/jira/browse/FLINK-40467
-    private static void setRandomApplicationResultStorePath(
-            Configuration effectiveConfig, FlinkVersion flinkVersion) {
-        if (flinkVersion == null || !flinkVersion.isEqualOrNewer(FlinkVersion.v2_3)) {
-            return;
-        }
-
+    private static void setRandomApplicationResultStorePath(Configuration effectiveConfig) {
         if (effectiveConfig.contains(HighAvailabilityOptions.HA_STORAGE_PATH)) {
-            if (!effectiveConfig.containsKey(APPLICATION_RESULT_STORE_DELETE_ON_COMMIT)) {
-                effectiveConfig.setString(APPLICATION_RESULT_STORE_DELETE_ON_COMMIT, "false");
+
+            // With shutdown-on-application-finish disabled, a JobManager that restarts
+            // after an application has terminated would find no result and run the
+            // application's main() again. Retaining the entry avoids that.
+            if (!effectiveConfig.contains(APPLICATION_RESULT_STORE_DELETE_ON_COMMIT)) {
+                effectiveConfig.set(APPLICATION_RESULT_STORE_DELETE_ON_COMMIT, false);
             }
 
-            effectiveConfig.setString(
+            // The application result store shares the HA storage path, which outlives
+            // the HA metadata deleted on upgrade. Dirty entries are recovered unkeyed,
+            // so a terminal entry left behind by a previous deployment makes the
+            // replacement cluster skip submitting the new job.
+            // Giving each deployment a unique path makes sure that nothing stale is
+            // recovered, including entries retained above.
+            effectiveConfig.set(
                     APPLICATION_RESULT_STORE_STORAGE_PATH,
                     effectiveConfig.getString(HighAvailabilityOptions.HA_STORAGE_PATH)
                             + "/application-result-store/"
@@ -307,7 +326,7 @@ public class ApplicationReconciler
                 ClusterHealthEvaluator.getLastValidClusterHealthInfo(
                         deployment.getStatus().getClusterInfo());
         boolean shouldRestartJobBecauseUnhealthy =
-                shouldRestartJobBecauseUnhealthy(deployment, observeConfig);
+                shouldRestartJobBecauseUnhealthy(ctx, observeConfig);
         boolean shouldRecoverDeployment = shouldRecoverDeployment(observeConfig, deployment);
         if (shouldRestartJobBecauseUnhealthy || shouldRecoverDeployment) {
             if (shouldRecoverDeployment) {
@@ -344,7 +363,15 @@ public class ApplicationReconciler
     }
 
     private boolean shouldRestartJobBecauseUnhealthy(
-            FlinkDeployment deployment, Configuration observeConfig) {
+            FlinkResourceContext<FlinkDeployment> ctx, Configuration observeConfig) {
+        var deployment = ctx.getResource();
+        // Terminal jobs (FAILED, FINISHED, CANCELED) must not be restarted via the cluster health
+        // check. Restarting a FAILED job is controlled exclusively by OPERATOR_JOB_RESTART_FAILED;
+        // a terminal job also has no HA metadata, so a health-based restart would always fail.
+        if (ReconciliationUtils.isJobInTerminalState(deployment.getStatus())) {
+            return false;
+        }
+
         boolean restartNeeded = false;
 
         if (observeConfig.getBoolean(OPERATOR_CLUSTER_HEALTH_CHECK_ENABLED)) {
@@ -357,13 +384,13 @@ public class ApplicationReconciler
                     if (deployment.getSpec().getJob().getUpgradeMode() == UpgradeMode.STATELESS) {
                         LOG.debug("Stateless job, recovering unhealthy jobmanager deployment");
                         restartNeeded = true;
-                    } else if (HighAvailabilityMode.isHighAvailabilityModeActivated(
-                            observeConfig)) {
-                        LOG.debug("HA is enabled, recovering unhealthy jobmanager deployment");
+                    } else if (ctx.getFlinkService().isHaMetadataAvailable(observeConfig)) {
+                        LOG.debug(
+                                "HA metadata available, recovering unhealthy jobmanager deployment");
                         restartNeeded = true;
                     } else {
                         LOG.warn(
-                                "Could not recover unhealthy jobmanager deployment without HA enabled");
+                                "Could not recover unhealthy jobmanager deployment, HA metadata not available");
                     }
 
                     if (restartNeeded) {

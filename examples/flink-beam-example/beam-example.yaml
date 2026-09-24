@@ -22,21 +22,23 @@ metadata:
   name: beam-example
 spec:
   image: flink-beam-example:latest
-  flinkVersion: v1_19
+  flinkVersion: v2_2
   flinkConfiguration:
     taskmanager.numberOfTaskSlots: 1
   serviceAccount: flink
   jobManager:
-    resource:
-      memory: "2048m"
-      cpu: 1
+    resources:
+      requests:
+        memory: "2048m"
+        cpu: "1"
   taskManager:
-    resource:
-      memory: "2048m"
-      cpu: 1
+    resources:
+      requests:
+        memory: "2048m"
+        cpu: "1"
   job:
     entryClass: org.apache.beam.examples.WordCount
-    jarURI: local:///opt/flink/usrlib/beam-runner.jar
-    args: [ "--runner=FlinkRunner", "--output=file://opt/output.txt" ]
+    jarURI: file:///opt/flink/usrlib/beam-runner.jar
+    args: [ "--runner=FlinkRunner", "--output=file:///opt/flink/output.txt", "--attachedMode=false" ]
     parallelism: 1
     upgradeMode: stateless
