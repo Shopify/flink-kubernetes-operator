@@ -50,6 +50,7 @@ import org.apache.flink.runtime.rest.messages.JobMessageParameters;
 import org.apache.flink.runtime.rest.messages.job.JobResourceRequirementsBody;
 import org.apache.flink.runtime.rest.messages.job.JobResourceRequirementsHeaders;
 import org.apache.flink.runtime.rest.messages.job.JobResourcesRequirementsUpdateHeaders;
+import org.apache.flink.util.ExceptionUtils;
 
 import io.fabric8.kubernetes.api.model.DeletionPropagation;
 import io.fabric8.kubernetes.api.model.PodList;
@@ -68,6 +69,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.apache.flink.kubernetes.operator.config.FlinkConfigBuilder.FLINK_VERSION;
 
@@ -235,6 +237,11 @@ public class NativeFlinkService extends AbstractFlinkService {
             }
             return true;
         } catch (Throwable t) {
+            if (ExceptionUtils.findThrowable(t, TimeoutException.class).isPresent()) {
+                // The resource update may have been applied despite the timeout. Retry
+                // reconciliation to read back the requirements instead of restarting the job.
+                ExceptionUtils.rethrowException(t);
+            }
             LOG.error("Error while rescaling, falling back to regular upgrade", t);
             return false;
         }

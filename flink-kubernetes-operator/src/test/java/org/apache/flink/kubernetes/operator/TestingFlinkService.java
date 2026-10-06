@@ -726,7 +726,7 @@ public class TestingFlinkService extends AbstractFlinkService {
     }
 
     @Override
-    public boolean scale(FlinkResourceContext<?> ctx, Configuration deployConfig) {
+    public boolean scale(FlinkResourceContext<?> ctx, Configuration deployConfig) throws Exception {
         boolean standalone = ctx.getDeploymentMode() == KubernetesDeploymentMode.STANDALONE;
         boolean session = ctx.getResource().getSpec().getJob() == null;
         boolean reactive =

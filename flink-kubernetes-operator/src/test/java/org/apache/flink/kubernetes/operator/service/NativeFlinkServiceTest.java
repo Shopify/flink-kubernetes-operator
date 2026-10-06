@@ -26,15 +26,20 @@ import org.apache.flink.configuration.PipelineOptions;
 import org.apache.flink.kubernetes.configuration.KubernetesConfigOptions;
 import org.apache.flink.kubernetes.operator.TestUtils;
 import org.apache.flink.kubernetes.operator.TestingClusterClient;
+import org.apache.flink.kubernetes.operator.TestingFlinkService;
 import org.apache.flink.kubernetes.operator.api.AbstractFlinkResource;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentSpec;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
 import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
+import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
 import org.apache.flink.kubernetes.operator.config.FlinkOperatorConfiguration;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.controller.FlinkDeploymentContext;
+import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
+import org.apache.flink.kubernetes.operator.controller.TestingFlinkDeploymentController;
+import org.apache.flink.kubernetes.operator.exception.ReconciliationException;
 import org.apache.flink.kubernetes.operator.reconciler.ReconciliationUtils;
 import org.apache.flink.kubernetes.operator.utils.EventRecorder;
 import org.apache.flink.kubernetes.operator.utils.FlinkResourceEventCollector;
@@ -43,9 +48,13 @@ import org.apache.flink.kubernetes.utils.KubernetesUtils;
 import org.apache.flink.runtime.jobgraph.JobResourceRequirements;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.JobVertexResourceRequirements;
+import org.apache.flink.runtime.rest.messages.EmptyResponseBody;
 import org.apache.flink.runtime.rest.messages.JobMessageParameters;
+import org.apache.flink.runtime.rest.messages.ResponseBody;
 import org.apache.flink.runtime.rest.messages.job.JobResourceRequirementsBody;
 import org.apache.flink.runtime.rest.messages.job.JobResourceRequirementsHeaders;
+import org.apache.flink.runtime.rest.messages.job.JobResourcesRequirementsUpdateHeaders;
+import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.concurrent.Executors;
 
 import io.fabric8.kubernetes.api.model.DeletionPropagation;
@@ -57,16 +66,22 @@ import io.fabric8.kubernetes.client.server.mock.KubernetesMockServer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
@@ -75,6 +90,7 @@ import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConf
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -477,6 +493,202 @@ public class NativeFlinkServiceTest {
         // Test error handling
         current.set(null);
         testScaleConditionDep(flinkDep, service, d -> {}, false);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+    public void testScalingTimeoutRetriedWithoutUpgrade(boolean wrapped, boolean applied)
+            throws Exception {
+        // An incomplete response exercises the direct Future.get timeout without sleeping.
+        configuration.set(
+                KubernetesOperatorConfigOptions.OPERATOR_FLINK_CLIENT_TIMEOUT, Duration.ZERO);
+        operatorConfig = FlinkOperatorConfiguration.fromConfiguration(configuration);
+        var response =
+                new AtomicReference<CompletableFuture<ResponseBody>>(
+                        wrapped
+                                ? CompletableFuture.failedFuture(
+                                        new CompletionException(
+                                                new TimeoutException("ambiguous update")))
+                                : new CompletableFuture<>());
+        var vertex = new JobVertexID();
+        var current =
+                new AtomicReference<>(
+                        new JobResourceRequirements(
+                                Map.of(
+                                        vertex,
+                                        new JobVertexResourceRequirements(
+                                                new JobVertexResourceRequirements.Parallelism(
+                                                        1, 1)))));
+        var target =
+                new JobResourceRequirements(
+                        Map.of(
+                                vertex,
+                                new JobVertexResourceRequirements(
+                                        new JobVertexResourceRequirements.Parallelism(1, 4))));
+        var updates = new ArrayList<JobResourceRequirements>();
+        var reads = new AtomicInteger();
+        var clusterClient = new TestingClusterClient<String>(configuration);
+        clusterClient.setRequestProcessor(
+                (headers, parameters, body) -> {
+                    if (headers instanceof JobResourceRequirementsHeaders) {
+                        reads.incrementAndGet();
+                        return CompletableFuture.completedFuture(
+                                new JobResourceRequirementsBody(current.get()));
+                    }
+                    assertTrue(headers instanceof JobResourcesRequirementsUpdateHeaders);
+                    var requested =
+                            ((JobResourceRequirementsBody) body)
+                                    .asJobResourceRequirements()
+                                    .orElseThrow();
+                    updates.add(requested);
+                    if (applied || response.get() == null) {
+                        current.set(requested);
+                    }
+                    return response.get() == null
+                            ? CompletableFuture.completedFuture(EmptyResponseBody.getInstance())
+                            : response.get();
+                });
+        var nativeService = createFlinkService(clusterClient);
+        // Keep the existing observer/deployment fake, but use the real native scaling REST path.
+        var testingService =
+                new TestingFlinkService(client) {
+                    @Override
+                    public boolean scale(FlinkResourceContext<?> ctx, Configuration conf)
+                            throws Exception {
+                        return nativeService.scale(ctx, conf);
+                    }
+                };
+        var controller = new TestingFlinkDeploymentController(configManager, testingService);
+        var context = testingService.<FlinkDeployment>getContext();
+        var deployment = TestUtils.buildApplicationCluster(FlinkVersion.v1_18);
+        deployment.getSpec().getJob().setUpgradeMode(UpgradeMode.SAVEPOINT);
+        deployment
+                .getSpec()
+                .getFlinkConfiguration()
+                .put(
+                        JobManagerOptions.SCHEDULER.key(),
+                        JobManagerOptions.SchedulerType.Adaptive.name());
+        client.resource(deployment).createOrReplace();
+        for (int i = 0; i < 4; i++) {
+            controller.reconcile(deployment, context);
+        }
+        assertEquals(JobStatus.RUNNING, deployment.getStatus().getJobStatus().getState());
+        var jobId = deployment.getStatus().getJobStatus().getJobId();
+        var lastReconciled =
+                deployment.getStatus().getReconciliationStatus().getLastReconciledSpec();
+        var lastStable = deployment.getStatus().getReconciliationStatus().getLastStableSpec();
+        deployment
+                .getSpec()
+                .getFlinkConfiguration()
+                .put(PipelineOptions.PARALLELISM_OVERRIDES.key(), vertex.toHexString() + ":4");
+
+        var retry =
+                configManager.getOperatorConfiguration().getRetryConfiguration().initExecution();
+        int failures = applied ? 1 : 3;
+        for (int i = 0; i < failures; i++) {
+            var error =
+                    assertThrows(
+                            ReconciliationException.class,
+                            () -> controller.reconcile(deployment, context));
+            assertTrue(ExceptionUtils.findThrowable(error, TimeoutException.class).isPresent());
+            assertEquals(
+                    wrapped,
+                    ExceptionUtils.findThrowable(error, ExecutionException.class).isPresent());
+            var errorControl = controller.updateErrorStatus(deployment, context, error);
+            assertFalse(errorControl.isNoRetry());
+            assertTrue(retry.nextDelay().isPresent());
+            assertEquals(
+                    lastReconciled,
+                    deployment.getStatus().getReconciliationStatus().getLastReconciledSpec());
+            assertEquals(
+                    lastStable,
+                    deployment.getStatus().getReconciliationStatus().getLastStableSpec());
+            assertEquals(JobStatus.RUNNING, deployment.getStatus().getJobStatus().getState());
+            assertEquals(jobId, deployment.getStatus().getJobStatus().getJobId());
+            assertTrue(deployment.getStatus().getError().contains("TimeoutException"));
+            assertEquals(0, testingService.getCancelJobCallCount());
+            assertTrue(testingService.getSavepointTriggers().isEmpty());
+            assertTrue(
+                    controller.flinkResourceEvents().stream()
+                            .noneMatch(
+                                    event ->
+                                            EventRecorder.Reason.Scaling.name()
+                                                    .equals(event.getReason())));
+        }
+
+        response.set(null);
+        controller.reconcile(deployment, context);
+        assertEquals(failures + 1, reads.get());
+        // Already-applied requirements are read back, not submitted a second time. Otherwise
+        // retry the same absolute bounds, not an incremental parallelism change.
+        assertEquals(applied ? 1 : failures + 1, updates.size());
+        updates.forEach(requirements -> assertEquals(target, requirements));
+        assertEquals(target, current.get());
+        assertEquals(
+                deployment.getSpec(),
+                deployment.getStatus().getReconciliationStatus().deserializeLastReconciledSpec());
+        assertNull(deployment.getStatus().getError());
+        assertEquals(jobId, deployment.getStatus().getJobStatus().getJobId());
+        assertEquals(0, testingService.getCancelJobCallCount());
+        assertTrue(testingService.getSavepointTriggers().isEmpty());
+        controller.reconcile(deployment, context);
+        assertEquals(failures + 1, reads.get());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false, false", "false, true", "true, false", "true, true"})
+    public void testScalingRequestFailures(boolean readFailure, boolean timeout) throws Exception {
+        var vertex = new JobVertexID();
+        var failure = timeout ? new TimeoutException() : new IllegalStateException("REST failure");
+        var clusterClient = new TestingClusterClient<String>(configuration);
+        clusterClient.setRequestProcessor(
+                (headers, parameters, body) -> {
+                    if (readFailure || headers instanceof JobResourcesRequirementsUpdateHeaders) {
+                        return CompletableFuture.failedFuture(failure);
+                    }
+                    return CompletableFuture.completedFuture(
+                            new JobResourceRequirementsBody(
+                                    new JobResourceRequirements(
+                                            Map.of(
+                                                    vertex,
+                                                    new JobVertexResourceRequirements(
+                                                            new JobVertexResourceRequirements
+                                                                    .Parallelism(1, 1))))));
+                });
+        var service = createFlinkService(clusterClient);
+        var deployment = TestUtils.buildApplicationCluster(FlinkVersion.v1_18);
+        deployment
+                .getSpec()
+                .getFlinkConfiguration()
+                .put(
+                        JobManagerOptions.SCHEDULER.key(),
+                        JobManagerOptions.SchedulerType.Adaptive.name());
+        ReconciliationUtils.updateStatusForDeployedSpec(deployment, configuration);
+        deployment.getStatus().getJobStatus().setState(JobStatus.RUNNING);
+        deployment.getStatus().getJobStatus().setJobId(new JobID().toHexString());
+        deployment
+                .getSpec()
+                .getFlinkConfiguration()
+                .put(PipelineOptions.PARALLELISM_OVERRIDES.key(), vertex.toHexString() + ":4");
+        var context =
+                new FlinkDeploymentContext(
+                        deployment,
+                        TestUtils.createEmptyContextWithClient(client),
+                        null,
+                        configManager,
+                        c -> service,
+                        null);
+        var deployConfig =
+                configManager.getDeployConfig(deployment.getMetadata(), deployment.getSpec());
+        if (timeout) {
+            var error =
+                    assertThrows(
+                            ExecutionException.class, () -> service.scale(context, deployConfig));
+            assertEquals(failure, error.getCause());
+        } else {
+            // Non-timeout REST failures still fall back to the regular upgrade path.
+            assertFalse(service.scale(context, deployConfig));
+        }
     }
 
     private void testScaleConditionDep(
