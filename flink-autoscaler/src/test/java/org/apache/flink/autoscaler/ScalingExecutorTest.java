@@ -42,6 +42,7 @@ import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
@@ -217,6 +218,134 @@ public class ScalingExecutorTest {
                                 jobTopology,
                                 new DelayedScaleDown()))
                 .hasSize(2);
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {90, 100, 110})
+    public void testDelayedScaleDownPreservesOtherVertexRecommendations(int windowParallelism)
+            throws Exception {
+        conf.set(AutoScalerOptions.UTILIZATION_TARGET, 1.);
+        conf.set(AutoScalerOptions.SCALE_DOWN_INTERVAL, Duration.ofMinutes(1));
+        var instant = Instant.parse("2026-01-01T00:00:00Z");
+        var now = instant.plusSeconds(65);
+        scalingExecutor.setClock(Clock.fixed(now, ZoneId.systemDefault()));
+
+        var delayedVertex = new JobVertexID();
+        var scaleUpVertex = new JobVertexID();
+        var scaleDownVertex = new JobVertexID();
+        var jobTopology =
+                new JobTopology(
+                        new VertexInfo(scaleUpVertex, Map.of(), 10, MAX_PARALLELISM, false, null),
+                        new VertexInfo(
+                                delayedVertex,
+                                Map.of(scaleUpVertex, REBALANCE),
+                                100,
+                                MAX_PARALLELISM,
+                                false,
+                                null),
+                        new VertexInfo(
+                                scaleDownVertex,
+                                Map.of(delayedVertex, REBALANCE),
+                                100,
+                                MAX_PARALLELISM,
+                                false,
+                                null));
+        var metrics =
+                new EvaluatedMetrics(
+                        Map.of(
+                                delayedVertex,
+                                evaluated(100, 800, 1000),
+                                scaleUpVertex,
+                                evaluated(10, 200, 100),
+                                scaleDownVertex,
+                                evaluated(100, 400, 1000)),
+                        dummyGlobalMetrics);
+        var delayedScaleDown = new DelayedScaleDown();
+        // The window includes its left boundary. The latest recommendations (80 and 40)
+        // must not replace the historical maxima, including when the maximum equals current.
+        delayedScaleDown.triggerScaleDown(
+                delayedVertex, instant.plusSeconds(5), windowParallelism, true);
+        delayedScaleDown.triggerScaleDown(scaleDownVertex, instant.plusSeconds(5), 50, true);
+
+        var summaries =
+                scalingExecutor.computeScalingSummary(
+                        context, metrics, Map.of(), Duration.ZERO, jobTopology, delayedScaleDown);
+        var expectedTargets = new HashMap<>(Map.of(scaleUpVertex, 20, scaleDownVertex, 50));
+        if (windowParallelism != 100) {
+            expectedTargets.put(delayedVertex, windowParallelism);
+        }
+        assertThat(
+                        summaries.entrySet().stream()
+                                .collect(
+                                        Collectors.toMap(
+                                                Map.Entry::getKey,
+                                                e -> e.getValue().getNewParallelism())))
+                .isEqualTo(expectedTargets);
+
+        assertTrue(
+                scalingExecutor.scaleResource(
+                        context,
+                        metrics,
+                        new HashMap<>(),
+                        scalingTracking,
+                        now,
+                        jobTopology,
+                        delayedScaleDown));
+        assertThat(getScaledParallelism(stateStore, context))
+                .isEqualTo(
+                        Map.of(
+                                delayedVertex, windowParallelism,
+                                scaleUpVertex, 20,
+                                scaleDownVertex, 50));
+        assertThat(stateStore.getScalingHistory(context))
+                .containsOnlyKeys(expectedTargets.keySet());
+        assertThat(delayedScaleDown.getDelayedVertices()).isEmpty();
+    }
+
+    @Test
+    public void testDelayedNoOpDoesNotTriggerScaling() throws Exception {
+        conf.set(AutoScalerOptions.UTILIZATION_TARGET, 1.);
+        conf.set(AutoScalerOptions.UTILIZATION_MIN, 1.);
+        conf.set(AutoScalerOptions.SCALE_DOWN_INTERVAL, Duration.ofMinutes(1));
+        var instant = Instant.parse("2026-01-01T00:00:00Z");
+        var now = instant.plusSeconds(65);
+        scalingExecutor.setClock(Clock.fixed(now, ZoneId.systemDefault()));
+        var vertex = new JobVertexID();
+        var jobTopology = new JobTopology(new VertexInfo(vertex, Map.of(), 100, 1000, false, null));
+        var metrics =
+                new EvaluatedMetrics(Map.of(vertex, evaluated(100, 800, 1000)), dummyGlobalMetrics);
+        var delayedScaleDown = new DelayedScaleDown();
+        delayedScaleDown.triggerScaleDown(vertex, instant.plusSeconds(5), 100, true);
+
+        assertFalse(
+                scalingExecutor.scaleResource(
+                        context,
+                        metrics,
+                        new HashMap<>(),
+                        scalingTracking,
+                        now,
+                        jobTopology,
+                        delayedScaleDown));
+        assertThat(stateStore.getParallelismOverrides(context)).isEmpty();
+        assertThat(stateStore.getScalingHistory(context)).isEmpty();
+        assertThat(eventCollector.events).isEmpty();
+        assertThat(delayedScaleDown.getDelayedVertices()).containsOnlyKeys(vertex);
+
+        // Once the historical no-op falls outside the window, the real downscale can proceed.
+        var afterExpiry = now.plusSeconds(1);
+        scalingExecutor.setClock(Clock.fixed(afterExpiry, ZoneId.systemDefault()));
+        assertTrue(
+                scalingExecutor.scaleResource(
+                        context,
+                        metrics,
+                        new HashMap<>(),
+                        scalingTracking,
+                        afterExpiry,
+                        jobTopology,
+                        delayedScaleDown));
+        assertThat(getScaledParallelism(stateStore, context)).isEqualTo(Map.of(vertex, 80));
+        assertThat(stateStore.getScalingHistory(context)).containsOnlyKeys(vertex);
+        assertThat(delayedScaleDown.getDelayedVertices()).isEmpty();
     }
 
     @Test
