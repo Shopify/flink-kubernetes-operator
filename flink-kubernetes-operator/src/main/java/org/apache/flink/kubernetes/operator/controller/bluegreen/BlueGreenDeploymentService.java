@@ -913,6 +913,8 @@ public class BlueGreenDeploymentService {
         deploymentStatus.setObservedGeneration(
                 flinkBlueGreenDeployment.getMetadata().getGeneration());
         deploymentStatus.setLastReconciledTimestamp(java.time.Instant.now().toString());
+        deploymentStatus.setObservedGeneration(
+                flinkBlueGreenDeployment.getMetadata().getGeneration());
         flinkBlueGreenDeployment.setStatus(deploymentStatus);
         return UpdateControl.patchStatus(flinkBlueGreenDeployment);
     }
