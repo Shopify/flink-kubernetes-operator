@@ -49,6 +49,7 @@ import org.apache.flink.kubernetes.operator.observer.CheckpointStatsResult;
 import org.apache.flink.kubernetes.operator.observer.SavepointFetchResult;
 import org.apache.flink.kubernetes.operator.service.AbstractFlinkService;
 import org.apache.flink.kubernetes.operator.service.CheckpointHistoryWrapper;
+import org.apache.flink.kubernetes.operator.service.CustomApplicationDetails;
 import org.apache.flink.kubernetes.operator.service.SuspendMode;
 import org.apache.flink.kubernetes.operator.standalone.StandaloneKubernetesConfigOptionsInternal;
 import org.apache.flink.runtime.client.DuplicateJobSubmissionException;
@@ -152,6 +153,8 @@ public class TestingFlinkService extends AbstractFlinkService {
     private final Map<Long, String> checkpointStats = new HashMap<>();
     @Setter private boolean throwCheckpointingDisabledError = false;
     @Setter private Throwable jobFailedErr;
+    @Setter private List<CustomApplicationDetails> applications = new ArrayList<>();
+    @Getter private int getApplicationsCallCount = 0;
 
     @Getter private int desiredReplicas = 0;
     @Getter private int cancelJobCallCount = 0;
@@ -714,6 +717,16 @@ public class TestingFlinkService extends AbstractFlinkService {
                         JobStatus.FAILED,
                         oldStatus.getStartTime());
         jobErrors.put(jobID, error);
+    }
+
+    @Override
+    public List<CustomApplicationDetails> getApplications(Configuration conf)
+            throws TimeoutException {
+        getApplicationsCallCount++;
+        if (!isPortReady) {
+            throw new TimeoutException("JM port is unavailable");
+        }
+        return applications;
     }
 
     @Override

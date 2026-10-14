@@ -119,6 +119,15 @@ public interface FlinkService {
 
     Map<String, String> getClusterInfo(Configuration conf, @Nullable String jobId) throws Exception;
 
+    /**
+     * Lists the applications running on the cluster. Only supported by Flink 2.3 and above, where
+     * the {@code /applications/overview} REST endpoint exists.
+     *
+     * @param conf Observe configuration of the cluster.
+     * @return Details of all applications known to the cluster.
+     */
+    List<CustomApplicationDetails> getApplications(Configuration conf) throws Exception;
+
     PodList getJmPodList(FlinkDeployment deployment, Configuration conf);
 
     boolean scale(FlinkResourceContext<?> resourceContext, Configuration deployConfig)

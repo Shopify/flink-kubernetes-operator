@@ -230,3 +230,11 @@ jobs:
       flink-version: ${{ matrix.flink-version }}
       test: ${{ matrix.test }}
       mode: ${{ matrix.mode }}
+  e2e_flink_2_3:
+    name: Flink 2.3 application state
+    needs: e2e_smoke_test
+    uses: ./.github/workflows/e2e.yaml
+    with:
+      java-version: 17
+      flink-version: "v2_3"
+      test: test_application_terminal_without_job.sh

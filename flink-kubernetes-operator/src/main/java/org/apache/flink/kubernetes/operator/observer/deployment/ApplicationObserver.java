@@ -34,18 +34,25 @@ public class ApplicationObserver extends AbstractFlinkDeploymentObserver {
     private final JobStatusObserver<FlinkDeployment> jobStatusObserver;
 
     private final ClusterHealthObserver clusterHealthObserver;
+    private final ApplicationStatusObserver applicationStatusObserver;
 
     public ApplicationObserver(EventRecorder eventRecorder) {
         super(eventRecorder);
         this.savepointObserver = new SnapshotObserver<>(eventRecorder);
         this.jobStatusObserver = new ApplicationJobObserver(eventRecorder);
         this.clusterHealthObserver = new ClusterHealthObserver();
+        this.applicationStatusObserver = new ApplicationStatusObserver(eventRecorder);
     }
 
     @Override
     protected void observeFlinkCluster(FlinkResourceContext<FlinkDeployment> ctx) {
         logger.debug("Observing application cluster");
         boolean jobFound = jobStatusObserver.observe(ctx);
+        boolean jobMissing =
+                !jobFound
+                        && JobStatusObserver.JOB_NOT_FOUND_ERR.equals(
+                                ctx.getResource().getStatus().getError());
+        applicationStatusObserver.observe(ctx, jobMissing);
         if (jobFound) {
             var observeConfig = ctx.getObserveConfig();
             savepointObserver.observeSavepointStatus(ctx);
@@ -54,6 +61,15 @@ public class ApplicationObserver extends AbstractFlinkDeploymentObserver {
                 clusterHealthObserver.observe(ctx);
             }
         }
+    }
+
+    /** The application-without-job error persists until the job is found again. */
+    @Override
+    protected void clearErrorsIfDeploymentIsHealthy(FlinkDeployment dep) {
+        if (ApplicationStatusObserver.isApplicationWithoutJobError(dep.getStatus().getError())) {
+            return;
+        }
+        super.clearErrorsIfDeploymentIsHealthy(dep);
     }
 
     private class ApplicationJobObserver extends JobStatusObserver<FlinkDeployment> {
