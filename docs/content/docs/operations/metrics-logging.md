@@ -32,6 +32,35 @@ The Flink Kubernetes Operator (Operator) extends the [Flink Metric System](https
 
 Different operator metrics can be turned on/off individually using the configuration. For details check the [metrics config reference]({{< ref "docs/operations/configuration#system-metrics-configuration" >}}).
 
+### Operator Leadership Metric
+
+Each operator instance registers a leadership gauge in the root operator metric group, independently of the optional JVM and JOSDK metrics:
+
+```java
+operatorMetricGroup
+    .addGroup("LeaderElection")
+    .gauge("IsLeader", () -> leadershipState.get());
+```
+
+The Java metric group and name are `LeaderElection.IsLeader`. Metric reporters determine the exported representation. For example, the Prometheus reporter automatically supplies the `flink_` prefix and the root `k8soperator` group name, and exports this gauge as:
+
+```text
+flink_k8soperator_LeaderElection_IsLeader
+```
+
+The root operator metric group supplies the `namespace`, `name`, and `host` variables. Their exported labels depend on the reporter configuration; for example, `host` can be excluded from Prometheus labels. The gauge is registered once per operator instance before the Java Operator SDK starts, including on replicas that remain standby, and does not depend on JVM or JOSDK metrics being enabled.
+
+| Operator instance state | Value |
+|-------------------------|------:|
+| Constructed, starting, waiting for election, or standby | `0` |
+| The local start-leading callback has run | `1` |
+| The local stop-leading callback has run | `0` |
+| Leader election is disabled and operator startup completed successfully | `1` |
+
+With leader election disabled, `1` means that this is the single active operator instance; it does not represent an elected leader. With leader election enabled, the gauge reflects only the SDK's local callback state. In particular, it does not indicate controller readiness or the health or freshness of Lease renewal. The start-leading callback runs before the SDK starts controller event processing, so the gauge may change to `1` before controllers begin processing events.
+
+An explicit `FlinkOperator.stop()` clears the gauge before stopping the SDK. When leader election is disabled, the SDK installs a shutdown hook that stops the SDK directly and bypasses `FlinkOperator.stop()`; it does not install that hook when leader election is enabled. A hard process exit can also prevent the stop-leading value from being scraped. Monitoring should therefore treat a missing series separately from a reported `0`, account for scrape health, and not require a final zero sample when an operator process exits.
+
 ### Flink Resource Metrics
 The Operator gathers aggregates metrics about managed resources.
 
