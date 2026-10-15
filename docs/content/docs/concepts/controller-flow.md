@@ -63,6 +63,15 @@ The observer should never take actions to change or submit new resources, these 
 3. For FlinkDeployments we next observe the status of the cluster Kubernetes resources, JM Deployment and Pods. We do this once after an upgrade or any time we cannot access the Job Rest endpoints. The status is recorded in the `jobManagerDeploymentStatus` field.
 
     It’s important to note here that trying to observe Jobs or anything through the Flink rest API only makes sense if the JobManager Kubernetes resources are seemingly healthy. Any errors with the JM deployment automatically translate into an error state and should clear out any previously observed running JobStatus. A Job cannot be in running state without a healthy jobmanager.
+
+    For application clusters on Flink 2.3 and above, we also observe the Flink application that owns the job. We read it from the `/applications/overview` rest endpoint. The application id and state are recorded in the `clusterInfo` status field as `application-id` and `application-state`.
+
+    Flink does not run an application that has a terminal result in the application result store. After a JobManager restart Flink skips the submission and does not list the application. The deployment then stays in `RECONCILING` with no explanation. The observer reports this case when all conditions below are true:
+    - The job observer confirmed `Job Not Found`. A failed rest lookup does not count.
+    - The cluster lists no application, or the application is terminal (`FINISHED, FAILED, CANCELED`).
+    - The deployment is older than `kubernetes.operator.deployment.readiness.timeout`. A new JobManager may not have submitted the job yet.
+
+    The observer then records the error in the status and emits an `ApplicationTerminalWithoutJob` warning event. The error stays until the job is found again. The regular health check does not clear it. The operator still manages exactly one job per application, so this is a diagnostic only. See [FLINK-40467](https://issues.apache.org/jira/browse/FLINK-40467).
 4. If the cluster is seemingly healthy, we proceed to observing the `JobStatus` (for Application and SessionJob resources). In this phase we query the information using the Jobmanager rest api about the current job state and pending savepoint progress.
 
     The current state of the job determines what can be observed. For terminal job states (`FAILED, FINISHED`) we also record the last available savepoint information to be used during last-state upgrades. We can only do this in terminal states because otherwise there is no guarantee that by the time of the upgrade a new checkpoint won’t be created.
@@ -140,6 +149,8 @@ Application clusters have a few more extra config steps compared to session jobs
 **setRandomJobResultStorePath**: In order to avoid terminated applications being restarted on JM failover, we have to disable Job result cleanup. This forces us to create a random job result store path for each application deployment as described here: https://issues.apache.org/jira/browse/FLINK-27569 . Users need to manually clean up the jobresultstore later.
 
 **setRandomApplicationResultStorePath**: Flink 2.3 and above records a terminal result when an application finishes, and will not run an application that already has one. Since an application cluster runs exactly one application, its Application ID is derived from the clusterId, so every redeployment looks like the same application to Flink and inherits the previous deployment's result. This silently stops the new job from being submitted, since we keep the JobManager alive after the application finishes. We therefore create a random application result store path for each deployment as described here: https://issues.apache.org/jira/browse/FLINK-40467 . Users need to manually clean up the applicationresultstore later.
+
+The operator never changes the application identity. Flink derives the Application ID from the clusterId. Last-state upgrades depend on this. The new JobManager recovers the application and its job from the HA metadata. The HA metadata is keyed by the Application ID and by the Job ID. The operator keeps the Job ID stable across last-state deployments. A new Application ID would break the recovery. The result store path is rotated on every deployment, including last-state deployments. This is safe. A non-terminal application has no result to recover. A terminal result must never block the next deployment.
 
 **setJobIdIfNecessary**: Flink by default generates deterministic jobids based on the clusterId (which is the CR name in our case). This causes checkpoint path conflicts if the job is ever restarted from an empty state (stateless upgrade). We therefore generate a random jobid to avoid this.
 

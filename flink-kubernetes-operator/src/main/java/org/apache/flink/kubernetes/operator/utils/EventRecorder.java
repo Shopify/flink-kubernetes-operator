@@ -337,6 +337,7 @@ public class EventRecorder {
         SnapshotError,
         SnapshotAbandoned,
         JobException,
-        Error
+        Error,
+        ApplicationTerminalWithoutJob
     }
 }

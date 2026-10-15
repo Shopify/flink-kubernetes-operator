@@ -1,10 +1,11 @@
 /*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -31,21 +32,35 @@ import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConf
 public class ApplicationObserver extends AbstractFlinkDeploymentObserver {
 
     private final SnapshotObserver<FlinkDeployment, FlinkDeploymentStatus> savepointObserver;
-    private final JobStatusObserver<FlinkDeployment> jobStatusObserver;
 
     private final ClusterHealthObserver clusterHealthObserver;
+    private final ApplicationStatusObserver applicationStatusObserver;
 
     public ApplicationObserver(EventRecorder eventRecorder) {
         super(eventRecorder);
         this.savepointObserver = new SnapshotObserver<>(eventRecorder);
-        this.jobStatusObserver = new ApplicationJobObserver(eventRecorder);
         this.clusterHealthObserver = new ClusterHealthObserver();
+        this.applicationStatusObserver = new ApplicationStatusObserver(eventRecorder);
+    }
+
+    @Override
+    public void observeInternal(FlinkResourceContext<FlinkDeployment> ctx) {
+        super.observeInternal(ctx);
+        if (!isJmDeploymentReady(ctx.getResource())) {
+            // The application state can only be observed through a ready JobManager, do not keep
+            // the state of a JobManager that is gone
+            applicationStatusObserver.clear(ctx.getResource().getStatus());
+        }
     }
 
     @Override
     protected void observeFlinkCluster(FlinkResourceContext<FlinkDeployment> ctx) {
         logger.debug("Observing application cluster");
+        // One job observer per observation, it carries the job-not-found result of this
+        // observation only. The status error may still hold the result of an earlier one.
+        var jobStatusObserver = new ApplicationJobObserver(eventRecorder);
         boolean jobFound = jobStatusObserver.observe(ctx);
+        applicationStatusObserver.observe(ctx, jobFound, jobStatusObserver.isJobNotFound());
         if (jobFound) {
             var observeConfig = ctx.getObserveConfig();
             savepointObserver.observeSavepointStatus(ctx);
@@ -56,7 +71,18 @@ public class ApplicationObserver extends AbstractFlinkDeploymentObserver {
         }
     }
 
+    /** The application-without-job error persists until the job is found again. */
+    @Override
+    protected void clearErrorsIfDeploymentIsHealthy(FlinkDeployment dep) {
+        if (ApplicationStatusObserver.isApplicationWithoutJob(dep.getStatus())) {
+            return;
+        }
+        super.clearErrorsIfDeploymentIsHealthy(dep);
+    }
+
     private class ApplicationJobObserver extends JobStatusObserver<FlinkDeployment> {
+        private boolean jobNotFound;
+
         public ApplicationJobObserver(EventRecorder eventRecorder) {
             super(eventRecorder);
         }
@@ -64,6 +90,17 @@ public class ApplicationObserver extends AbstractFlinkDeploymentObserver {
         @Override
         public void onTimeout(FlinkResourceContext<FlinkDeployment> ctx) {
             observeJmDeployment(ctx);
+        }
+
+        @Override
+        protected void onTargetJobNotFound(FlinkResourceContext<FlinkDeployment> ctx) {
+            super.onTargetJobNotFound(ctx);
+            jobNotFound = true;
+        }
+
+        /** The cluster answered the job lookup and the expected job was not listed. */
+        boolean isJobNotFound() {
+            return jobNotFound;
         }
     }
 }

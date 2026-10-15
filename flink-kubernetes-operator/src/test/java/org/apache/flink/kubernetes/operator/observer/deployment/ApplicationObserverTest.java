@@ -25,6 +25,7 @@ import org.apache.flink.kubernetes.operator.OperatorTestBase;
 import org.apache.flink.kubernetes.operator.TestUtils;
 import org.apache.flink.kubernetes.operator.TestingFlinkService;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
+import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
 import org.apache.flink.kubernetes.operator.api.spec.JobState;
 import org.apache.flink.kubernetes.operator.api.status.JobManagerDeploymentStatus;
 import org.apache.flink.kubernetes.operator.api.status.JobStatus;
@@ -34,8 +35,10 @@ import org.apache.flink.kubernetes.operator.api.status.SnapshotTriggerType;
 import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.exception.DeploymentFailedException;
+import org.apache.flink.kubernetes.operator.observer.JobStatusObserver;
 import org.apache.flink.kubernetes.operator.observer.TestObserverAdapter;
 import org.apache.flink.kubernetes.operator.reconciler.ReconciliationUtils;
+import org.apache.flink.kubernetes.operator.service.CustomApplicationDetails;
 import org.apache.flink.kubernetes.operator.utils.EventRecorder;
 import org.apache.flink.kubernetes.operator.utils.FlinkUtils;
 import org.apache.flink.kubernetes.operator.utils.SnapshotUtils;
@@ -55,6 +58,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.HashMap;
+import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -942,5 +946,358 @@ public class ApplicationObserverTest extends OperatorTestBase {
                         EventRecorder.Reason.CheckpointError.name(),
                         deployment.getMetadata().getNamespace(),
                         "Checkpointing has not been enabled"));
+    }
+
+    @Test
+    public void testApplicationStatusObservedForFlink23() throws Exception {
+        var deployment = buildApplicationClusterWithJobId(FlinkVersion.v2_3);
+        Configuration conf =
+                configManager.getDeployConfig(deployment.getMetadata(), deployment.getSpec());
+        flinkService.submitApplicationCluster(deployment.getSpec().getJob(), conf, false);
+        ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
+        markDeployedBeforeReadinessTimeout(deployment);
+        deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+
+        var jobId = deployment.getStatus().getJobStatus().getJobId();
+        flinkService.setApplications(List.of(application("app1", "RUNNING")));
+
+        observer.observe(deployment, readyContext);
+        assertEquals(1, flinkService.getGetApplicationsCallCount());
+        var clusterInfo = deployment.getStatus().getClusterInfo();
+        assertEquals("app1", clusterInfo.get(ApplicationStatusObserver.FIELD_NAME_APPLICATION_ID));
+        assertEquals(
+                "RUNNING", clusterInfo.get(ApplicationStatusObserver.FIELD_NAME_APPLICATION_STATE));
+        assertNull(deployment.getStatus().getError());
+        assertTrue(getApplicationTerminalEvents(deployment).isEmpty());
+
+        // Job failed and the application failed with it, the job is still found: no alert
+        flinkService.markApplicationJobFailedWithError(JobID.fromHexString(jobId), "Job failed");
+        flinkService.setApplications(List.of(application("app1", "FAILED")));
+        observer.observe(deployment, readyContext);
+        assertEquals(
+                "FAILED", clusterInfo.get(ApplicationStatusObserver.FIELD_NAME_APPLICATION_STATE));
+        assertEquals(
+                org.apache.flink.api.common.JobStatus.FAILED,
+                deployment.getStatus().getJobStatus().getState());
+        assertTrue(getApplicationTerminalEvents(deployment).isEmpty());
+    }
+
+    @Test
+    public void testApplicationTerminalWithoutJobForFlink23() throws Exception {
+        var deployment = buildApplicationClusterWithJobId(FlinkVersion.v2_3);
+        Configuration conf =
+                configManager.getDeployConfig(deployment.getMetadata(), deployment.getSpec());
+        flinkService.submitApplicationCluster(deployment.getSpec().getJob(), conf, false);
+        ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
+        markDeployedBeforeReadinessTimeout(deployment);
+        deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+
+        // Flink recovered a finished application and did not submit the expected job
+        flinkService.clear();
+        flinkService.setApplications(List.of(application("app1", "FINISHED")));
+
+        observer.observe(deployment, readyContext);
+        var clusterInfo = deployment.getStatus().getClusterInfo();
+        assertEquals(
+                "FINISHED",
+                clusterInfo.get(ApplicationStatusObserver.FIELD_NAME_APPLICATION_STATE));
+        assertEquals(
+                org.apache.flink.api.common.JobStatus.RECONCILING,
+                deployment.getStatus().getJobStatus().getState());
+        var error = deployment.getStatus().getError();
+        assertTrue(error.contains("app1"), error);
+        assertTrue(error.contains("FINISHED"), error);
+        assertTrue(error.contains(deployment.getStatus().getJobStatus().getJobId()), error);
+
+        var events = getApplicationTerminalEvents(deployment);
+        assertEquals(1, events.size());
+        assertEquals("Warning", events.get(0).getType());
+        assertEquals(error, events.get(0).getMessage());
+
+        // Repeated observation does not create duplicate events
+        observer.observe(deployment, readyContext);
+        assertEquals(1, getApplicationTerminalEvents(deployment).size());
+
+        // The error survives the health check once the spec is stable
+        deployment.getStatus().getReconciliationStatus().markReconciledSpecAsStable();
+        observer.observe(deployment, readyContext);
+        assertEquals(error, deployment.getStatus().getError());
+
+        // The error is cleared once the job is found again, even if the application lookup fails
+        flinkService.submitApplicationCluster(deployment.getSpec().getJob(), conf, false);
+        flinkService.setGetApplicationsError(new RuntimeException("REST call failed"));
+        observer.observe(deployment, readyContext);
+        assertNull(deployment.getStatus().getError());
+        assertFalse(
+                clusterInfo.containsKey(
+                        ApplicationStatusObserver.FIELD_NAME_APPLICATION_WITHOUT_JOB));
+        assertEquals(
+                "FINISHED",
+                clusterInfo.get(ApplicationStatusObserver.FIELD_NAME_APPLICATION_STATE));
+
+        flinkService.setGetApplicationsError(null);
+        flinkService.setApplications(List.of(application("app1", "RUNNING")));
+        observer.observe(deployment, readyContext);
+        assertNull(deployment.getStatus().getError());
+        assertEquals(
+                "RUNNING", clusterInfo.get(ApplicationStatusObserver.FIELD_NAME_APPLICATION_STATE));
+        assertEquals(1, getApplicationTerminalEvents(deployment).size());
+    }
+
+    @Test
+    public void testApplicationNotAlertedOnFailedJobLookupForFlink23() throws Exception {
+        var deployment = buildApplicationClusterWithJobId(FlinkVersion.v2_3);
+        Configuration conf =
+                configManager.getDeployConfig(deployment.getMetadata(), deployment.getSpec());
+        flinkService.submitApplicationCluster(deployment.getSpec().getJob(), conf, false);
+        ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
+        markDeployedBeforeReadinessTimeout(deployment);
+        deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+
+        // A Job Not Found error of an earlier observation is still in the status while the job
+        // lookup fails now. The application endpoint would report a terminal application.
+        deployment.getStatus().setError(JobStatusObserver.JOB_NOT_FOUND_ERR);
+        flinkService.setGetJobStatusError(new RuntimeException("REST call failed"));
+        flinkService.setApplications(List.of(application("app1", "FINISHED")));
+
+        observer.observe(deployment, readyContext);
+        // The stale error is not a confirmation, the application lookup is skipped
+        assertEquals(0, flinkService.getGetApplicationsCallCount());
+        var clusterInfo = deployment.getStatus().getClusterInfo();
+        assertFalse(
+                clusterInfo.containsKey(ApplicationStatusObserver.FIELD_NAME_APPLICATION_STATE));
+        assertFalse(
+                clusterInfo.containsKey(
+                        ApplicationStatusObserver.FIELD_NAME_APPLICATION_WITHOUT_JOB));
+        assertTrue(getApplicationTerminalEvents(deployment).isEmpty());
+
+        // Same for the empty overview
+        flinkService.setApplications(List.of());
+        observer.observe(deployment, readyContext);
+        assertEquals(0, flinkService.getGetApplicationsCallCount());
+        assertTrue(getApplicationTerminalEvents(deployment).isEmpty());
+    }
+
+    @Test
+    public void testApplicationStatusClearedForSuspendedJobForFlink23() throws Exception {
+        var deployment = buildApplicationClusterWithJobId(FlinkVersion.v2_3);
+        deployment.getSpec().getJob().setState(JobState.SUSPENDED);
+        ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
+        markDeployedBeforeReadinessTimeout(deployment);
+        deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+        var clusterInfo = deployment.getStatus().getClusterInfo();
+        clusterInfo.put(ApplicationStatusObserver.FIELD_NAME_APPLICATION_ID, "stale");
+        clusterInfo.put(ApplicationStatusObserver.FIELD_NAME_APPLICATION_STATE, "RUNNING");
+        clusterInfo.put(ApplicationStatusObserver.FIELD_NAME_APPLICATION_WITHOUT_JOB, "true");
+        deployment
+                .getStatus()
+                .setError(
+                        String.format(
+                                ApplicationStatusObserver.MSG_APPLICATION_MISSING_WITHOUT_JOB,
+                                deployment.getStatus().getJobStatus().getJobId()));
+
+        observer.observe(deployment, readyContext);
+        assertEquals(0, flinkService.getGetApplicationsCallCount());
+        assertFalse(clusterInfo.containsKey(ApplicationStatusObserver.FIELD_NAME_APPLICATION_ID));
+        assertFalse(
+                clusterInfo.containsKey(ApplicationStatusObserver.FIELD_NAME_APPLICATION_STATE));
+        assertFalse(
+                clusterInfo.containsKey(
+                        ApplicationStatusObserver.FIELD_NAME_APPLICATION_WITHOUT_JOB));
+        assertNull(deployment.getStatus().getError());
+    }
+
+    @Test
+    public void testApplicationMissingWithoutJobForFlink23() throws Exception {
+        var deployment = buildApplicationClusterWithJobId(FlinkVersion.v2_3);
+        Configuration conf =
+                configManager.getDeployConfig(deployment.getMetadata(), deployment.getSpec());
+        flinkService.submitApplicationCluster(deployment.getSpec().getJob(), conf, false);
+        ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
+        markDeployedBeforeReadinessTimeout(deployment);
+        deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+        var clusterInfo = deployment.getStatus().getClusterInfo();
+        clusterInfo.put(ApplicationStatusObserver.FIELD_NAME_APPLICATION_ID, "stale");
+        clusterInfo.put(ApplicationStatusObserver.FIELD_NAME_APPLICATION_STATE, "FINISHED");
+
+        // Flink skipped the application because its result was already committed: the cluster
+        // lists neither an application nor the expected job
+        flinkService.clear();
+        flinkService.setApplications(List.of());
+
+        observer.observe(deployment, readyContext);
+        assertFalse(clusterInfo.containsKey(ApplicationStatusObserver.FIELD_NAME_APPLICATION_ID));
+        assertFalse(
+                clusterInfo.containsKey(ApplicationStatusObserver.FIELD_NAME_APPLICATION_STATE));
+        assertEquals(
+                org.apache.flink.api.common.JobStatus.RECONCILING,
+                deployment.getStatus().getJobStatus().getState());
+        var error = deployment.getStatus().getError();
+        assertTrue(error.contains("No application"), error);
+        assertTrue(error.contains(deployment.getStatus().getJobStatus().getJobId()), error);
+
+        var events = getApplicationTerminalEvents(deployment);
+        assertEquals(1, events.size());
+        assertEquals(error, events.get(0).getMessage());
+
+        // A cluster without application but with the job running is not an error, the recorded
+        // error is cleared without a redeploy
+        flinkService.submitApplicationCluster(deployment.getSpec().getJob(), conf, false);
+        observer.observe(deployment, readyContext);
+        assertNull(deployment.getStatus().getError());
+        assertEquals(1, getApplicationTerminalEvents(deployment).size());
+    }
+
+    @Test
+    public void testApplicationStatusNotObservedBeforeFlink23() throws Exception {
+        var deployment = buildApplicationClusterWithJobId(FlinkVersion.v2_2);
+        Configuration conf =
+                configManager.getDeployConfig(deployment.getMetadata(), deployment.getSpec());
+        flinkService.submitApplicationCluster(deployment.getSpec().getJob(), conf, false);
+        ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
+        markDeployedBeforeReadinessTimeout(deployment);
+        deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+        flinkService.setApplications(List.of(application("app1", "FINISHED")));
+
+        observer.observe(deployment, readyContext);
+        flinkService.clear();
+        observer.observe(deployment, readyContext);
+
+        assertEquals(0, flinkService.getGetApplicationsCallCount());
+        var clusterInfo = deployment.getStatus().getClusterInfo();
+        assertFalse(clusterInfo.containsKey(ApplicationStatusObserver.FIELD_NAME_APPLICATION_ID));
+        assertFalse(
+                clusterInfo.containsKey(ApplicationStatusObserver.FIELD_NAME_APPLICATION_STATE));
+        assertTrue(getApplicationTerminalEvents(deployment).isEmpty());
+    }
+
+    @Test
+    public void testApplicationMissingWithoutJobNotAlertedWithinReadinessTimeout()
+            throws Exception {
+        var deployment = buildApplicationClusterWithJobId(FlinkVersion.v2_3);
+        Configuration conf =
+                configManager.getDeployConfig(deployment.getMetadata(), deployment.getSpec());
+        flinkService.submitApplicationCluster(deployment.getSpec().getJob(), conf, false);
+        ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
+        deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+
+        // A freshly started JobManager has neither registered the application nor submitted
+        // the job yet
+        flinkService.clear();
+        flinkService.setApplications(List.of());
+
+        observer.observe(deployment, readyContext);
+        assertEquals(1, flinkService.getGetApplicationsCallCount());
+        assertEquals(
+                org.apache.flink.api.common.JobStatus.RECONCILING,
+                deployment.getStatus().getJobStatus().getState());
+        var clusterInfo = deployment.getStatus().getClusterInfo();
+        assertFalse(
+                clusterInfo.containsKey(
+                        ApplicationStatusObserver.FIELD_NAME_APPLICATION_WITHOUT_JOB));
+        assertTrue(getApplicationTerminalEvents(deployment).isEmpty());
+
+        // The same observation is reported once the deployment is older than the timeout
+        markDeployedBeforeReadinessTimeout(deployment);
+        observer.observe(deployment, readyContext);
+        assertEquals(1, getApplicationTerminalEvents(deployment).size());
+        var error = deployment.getStatus().getError();
+        assertTrue(error.contains("No application"), error);
+    }
+
+    @Test
+    public void testApplicationStatusClearedWhenJobManagerNotReadyForFlink23() throws Exception {
+        var deployment = buildApplicationClusterWithJobId(FlinkVersion.v2_3);
+        ReconciliationUtils.updateStatusForDeployedSpec(deployment, new Configuration());
+        markDeployedBeforeReadinessTimeout(deployment);
+        var clusterInfo = deployment.getStatus().getClusterInfo();
+        clusterInfo.put(ApplicationStatusObserver.FIELD_NAME_APPLICATION_ID, "app1");
+        clusterInfo.put(ApplicationStatusObserver.FIELD_NAME_APPLICATION_STATE, "FINISHED");
+        clusterInfo.put(ApplicationStatusObserver.FIELD_NAME_APPLICATION_WITHOUT_JOB, "true");
+        deployment.getStatus().setError("application without job");
+
+        // The JobManager of the finished application was cleaned up
+        deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.MISSING);
+        deployment
+                .getStatus()
+                .getJobStatus()
+                .setState(org.apache.flink.api.common.JobStatus.FINISHED);
+        flinkService.setApplications(List.of(application("app1", "FINISHED")));
+
+        observer.observe(deployment, TestUtils.createEmptyContext());
+        assertEquals(0, flinkService.getGetApplicationsCallCount());
+        assertFalse(clusterInfo.containsKey(ApplicationStatusObserver.FIELD_NAME_APPLICATION_ID));
+        assertFalse(
+                clusterInfo.containsKey(ApplicationStatusObserver.FIELD_NAME_APPLICATION_STATE));
+        assertFalse(
+                clusterInfo.containsKey(
+                        ApplicationStatusObserver.FIELD_NAME_APPLICATION_WITHOUT_JOB));
+        assertNull(deployment.getStatus().getError());
+    }
+
+    @Test
+    public void testSelectApplicationPrefersLiveApplication() {
+        assertTrue(ApplicationStatusObserver.selectApplication(List.of()).isEmpty());
+        assertTrue(ApplicationStatusObserver.selectApplication(null).isEmpty());
+
+        var old = application("old", "FINISHED");
+        old.setStartTime(1L);
+        var recent = application("recent", "FAILED");
+        recent.setStartTime(2L);
+        var live = application("live", "RUNNING");
+        live.setStartTime(0L);
+
+        assertEquals(
+                "recent",
+                ApplicationStatusObserver.selectApplication(List.of(old, recent))
+                        .get()
+                        .getApplicationId());
+        assertEquals(
+                "live",
+                ApplicationStatusObserver.selectApplication(List.of(old, live, recent))
+                        .get()
+                        .getApplicationId());
+    }
+
+    private FlinkDeployment buildApplicationClusterWithJobId(FlinkVersion version) {
+        var dep = TestUtils.buildApplicationCluster(version);
+        var jobId = new JobID().toHexString();
+        dep.getSpec()
+                .getFlinkConfiguration()
+                .put(PipelineOptionsInternal.PIPELINE_FIXED_JOB_ID.key(), jobId);
+        dep.getStatus().getJobStatus().setJobId(jobId);
+        // The reconciler sets RECONCILING when it submits the application cluster
+        dep.getStatus().getJobStatus().setState(org.apache.flink.api.common.JobStatus.RECONCILING);
+        return dep;
+    }
+
+    private static CustomApplicationDetails application(String id, String status) {
+        return new CustomApplicationDetails(id, 1L, status);
+    }
+
+    /**
+     * The missing-job alert is only raised once the deployment is older than the readiness timeout.
+     */
+    private static void markDeployedBeforeReadinessTimeout(FlinkDeployment deployment) {
+        deployment
+                .getStatus()
+                .getReconciliationStatus()
+                .setReconciliationTimestamp(
+                        Instant.now().minus(Duration.ofMinutes(10)).toEpochMilli());
+    }
+
+    private List<Event> getApplicationTerminalEvents(FlinkDeployment dep) {
+        return kubernetesClient
+                .v1()
+                .events()
+                .inNamespace(dep.getMetadata().getNamespace())
+                .list()
+                .getItems()
+                .stream()
+                .filter(
+                        e ->
+                                EventRecorder.Reason.ApplicationTerminalWithoutJob.name()
+                                        .equals(e.getReason()))
+                .collect(Collectors.toList());
     }
 }

@@ -772,6 +772,22 @@ public abstract class AbstractFlinkService implements FlinkService {
         return clusterInfo;
     }
 
+    @Override
+    public List<CustomApplicationDetails> getApplications(Configuration conf) throws Exception {
+        try (var clusterClient = getClusterClient(conf)) {
+            var overview =
+                    clusterClient
+                            .sendRequest(
+                                    CustomApplicationsOverviewHeaders.getInstance(),
+                                    EmptyMessageParameters.getInstance(),
+                                    EmptyRequestBody.getInstance())
+                            .get(
+                                    operatorConfig.getFlinkClientTimeout().toSeconds(),
+                                    TimeUnit.SECONDS);
+            return overview.getApplications() == null ? List.of() : overview.getApplications();
+        }
+    }
+
     private void populateFlinkVersion(Configuration conf, Map<String, String> clusterInfo)
             throws Exception {
         try (var clusterClient = getClusterClient(conf)) {
