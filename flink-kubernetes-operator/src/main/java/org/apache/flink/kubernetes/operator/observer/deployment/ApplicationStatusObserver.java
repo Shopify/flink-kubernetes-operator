@@ -22,6 +22,7 @@ import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
 import org.apache.flink.kubernetes.operator.api.spec.JobState;
 import org.apache.flink.kubernetes.operator.api.status.FlinkDeploymentStatus;
+import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.controller.FlinkResourceContext;
 import org.apache.flink.kubernetes.operator.service.CustomApplicationDetails;
 import org.apache.flink.kubernetes.operator.utils.EventRecorder;
@@ -29,8 +30,7 @@ import org.apache.flink.kubernetes.operator.utils.EventRecorder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.annotation.Nullable;
-
+import java.time.Instant;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
@@ -42,6 +42,10 @@ import static org.apache.flink.kubernetes.operator.config.FlinkConfigBuilder.FLI
  * {@code clusterInfo}. If the application is terminal, or not listed at all, while the expected job
  * is not found, Flink skipped the job submission because of a recorded terminal result. The
  * deployment would otherwise sit in {@code RECONCILING} with no explanation, see FLINK-40467.
+ *
+ * <p>The alert is only raised once the deployment is older than {@link
+ * KubernetesOperatorConfigOptions#DEPLOYMENT_READINESS_TIMEOUT}. A freshly started JobManager may
+ * not have registered the application or submitted the job yet.
  */
 public class ApplicationStatusObserver {
 
@@ -49,6 +53,12 @@ public class ApplicationStatusObserver {
 
     public static final String FIELD_NAME_APPLICATION_ID = "application-id";
     public static final String FIELD_NAME_APPLICATION_STATE = "application-state";
+
+    /**
+     * Marks in {@code clusterInfo} that the application-without-job error is active. The error is
+     * kept until the job is found again, independently of the error message text.
+     */
+    public static final String FIELD_NAME_APPLICATION_WITHOUT_JOB = "application-without-job";
 
     public static final String MSG_APPLICATION_WITHOUT_JOB_HINT =
             "Check the application result store configuration and redeploy.";
@@ -72,14 +82,33 @@ public class ApplicationStatusObserver {
         this.eventRecorder = eventRecorder;
     }
 
-    public void observe(FlinkResourceContext<FlinkDeployment> ctx, boolean jobMissing) {
+    /**
+     * Observe the application after the job was observed on a ready JobManager.
+     *
+     * @param ctx Resource context.
+     * @param jobFound The job observer found the expected job.
+     * @param jobNotFound The job observer confirmed that the expected job is not on the cluster.
+     *     Both flags are false when the job lookup failed.
+     */
+    public void observe(
+            FlinkResourceContext<FlinkDeployment> ctx, boolean jobFound, boolean jobNotFound) {
         var status = ctx.getResource().getStatus();
         var clusterInfo = status.getClusterInfo();
         if (!isSupported(ctx) || isJobSuspended(ctx)) {
-            clusterInfo.remove(FIELD_NAME_APPLICATION_ID);
-            clusterInfo.remove(FIELD_NAME_APPLICATION_STATE);
-            clearApplicationWithoutJobError(status);
+            clear(status);
             return;
+        }
+
+        if (!jobFound && !jobNotFound) {
+            // The job lookup failed, the application lookup would most likely fail too.
+            // Keep the previous observation and try again later.
+            LOG.debug("Job lookup failed, skipping application observation");
+            return;
+        }
+
+        if (jobFound) {
+            // The job is back, clear the alert even if the application lookup below fails
+            clearApplicationWithoutJob(status);
         }
 
         List<CustomApplicationDetails> applications;
@@ -96,61 +125,69 @@ public class ApplicationStatusObserver {
             LOG.debug("No application found on the cluster");
             clusterInfo.remove(FIELD_NAME_APPLICATION_ID);
             clusterInfo.remove(FIELD_NAME_APPLICATION_STATE);
-            if (jobMissing) {
-                onMissingApplicationWithoutJob(ctx);
-            } else {
-                clearApplicationWithoutJobError(status);
+        } else {
+            var application = applicationOpt.get();
+            var previousState = clusterInfo.get(FIELD_NAME_APPLICATION_STATE);
+            clusterInfo.put(FIELD_NAME_APPLICATION_ID, application.getApplicationId());
+            clusterInfo.put(FIELD_NAME_APPLICATION_STATE, application.getStatus());
+            if (!application.getStatus().equals(previousState)) {
+                LOG.info(
+                        "Application {} state changed from {} to {}",
+                        application.getApplicationId(),
+                        previousState,
+                        application.getStatus());
             }
+        }
+
+        boolean applicationWithoutJob =
+                jobNotFound
+                        && applicationOpt.map(CustomApplicationDetails::isTerminal).orElse(true);
+        if (!applicationWithoutJob) {
+            clearApplicationWithoutJob(status);
             return;
         }
 
-        var application = applicationOpt.get();
-        var previousState = clusterInfo.get(FIELD_NAME_APPLICATION_STATE);
-        clusterInfo.put(FIELD_NAME_APPLICATION_ID, application.getApplicationId());
-        clusterInfo.put(FIELD_NAME_APPLICATION_STATE, application.getStatus());
-        if (!application.getStatus().equals(previousState)) {
-            LOG.info(
-                    "Application {} state changed from {} to {}",
-                    application.getApplicationId(),
-                    previousState,
-                    application.getStatus());
+        if (!isDeploymentOlderThanReadinessTimeout(ctx)) {
+            // A freshly started JobManager may not have submitted the job yet
+            LOG.debug(
+                    "Job not found on a deployment within the readiness timeout, not reporting yet");
+            clearApplicationWithoutJob(status);
+            return;
         }
 
-        if (application.isTerminal() && jobMissing) {
-            onTerminalApplicationWithoutJob(ctx, application);
-        } else {
-            clearApplicationWithoutJobError(status);
-        }
+        var jobId = status.getJobStatus().getJobId();
+        var message =
+                applicationOpt
+                        .map(
+                                application ->
+                                        String.format(
+                                                MSG_APPLICATION_TERMINAL_WITHOUT_JOB,
+                                                application.getApplicationId(),
+                                                application.getStatus(),
+                                                jobId))
+                        .orElseGet(
+                                // Flink does not list an application whose terminal result was
+                                // already committed, it only skips its submission.
+                                () -> String.format(MSG_APPLICATION_MISSING_WITHOUT_JOB, jobId));
+        recordApplicationWithoutJob(ctx, message);
     }
 
-    private void onTerminalApplicationWithoutJob(
-            FlinkResourceContext<FlinkDeployment> ctx, CustomApplicationDetails application) {
-        recordApplicationWithoutJob(
-                ctx,
-                String.format(
-                        MSG_APPLICATION_TERMINAL_WITHOUT_JOB,
-                        application.getApplicationId(),
-                        application.getStatus(),
-                        ctx.getResource().getStatus().getJobStatus().getJobId()));
+    /** Removes the application state and the alert, used when the JobManager is not ready. */
+    public void clear(FlinkDeploymentStatus status) {
+        status.getClusterInfo().remove(FIELD_NAME_APPLICATION_ID);
+        status.getClusterInfo().remove(FIELD_NAME_APPLICATION_STATE);
+        clearApplicationWithoutJob(status);
     }
 
-    /**
-     * Flink does not list an application whose terminal result was already committed to the
-     * application result store, it only skips its submission. An application cluster without any
-     * application and without the expected job is therefore the same failure as a terminal
-     * application without a job.
-     */
-    private void onMissingApplicationWithoutJob(FlinkResourceContext<FlinkDeployment> ctx) {
-        recordApplicationWithoutJob(
-                ctx,
-                String.format(
-                        MSG_APPLICATION_MISSING_WITHOUT_JOB,
-                        ctx.getResource().getStatus().getJobStatus().getJobId()));
+    /** The alert is active, the error must survive the regular health check. */
+    public static boolean isApplicationWithoutJob(FlinkDeploymentStatus status) {
+        return status.getClusterInfo().containsKey(FIELD_NAME_APPLICATION_WITHOUT_JOB);
     }
 
     private void recordApplicationWithoutJob(
             FlinkResourceContext<FlinkDeployment> ctx, String message) {
         var resource = ctx.getResource();
+        resource.getStatus().getClusterInfo().put(FIELD_NAME_APPLICATION_WITHOUT_JOB, "true");
         resource.getStatus().setError(message);
         boolean newEvent =
                 eventRecorder.triggerEvent(
@@ -167,14 +204,25 @@ public class ApplicationStatusObserver {
         }
     }
 
-    static boolean isApplicationWithoutJobError(@Nullable String error) {
-        return error != null && error.endsWith(MSG_APPLICATION_WITHOUT_JOB_HINT);
-    }
-
-    private static void clearApplicationWithoutJobError(FlinkDeploymentStatus status) {
-        if (isApplicationWithoutJobError(status.getError())) {
+    private static void clearApplicationWithoutJob(FlinkDeploymentStatus status) {
+        if (isApplicationWithoutJob(status)) {
+            status.getClusterInfo().remove(FIELD_NAME_APPLICATION_WITHOUT_JOB);
             status.setError(null);
         }
+    }
+
+    private static boolean isDeploymentOlderThanReadinessTimeout(
+            FlinkResourceContext<FlinkDeployment> ctx) {
+        var readinessTimeout =
+                ctx.getObserveConfig()
+                        .get(KubernetesOperatorConfigOptions.DEPLOYMENT_READINESS_TIMEOUT);
+        var deployedAt =
+                Instant.ofEpochMilli(
+                        ctx.getResource()
+                                .getStatus()
+                                .getReconciliationStatus()
+                                .getReconciliationTimestamp());
+        return Instant.now().minus(readinessTimeout).isAfter(deployedAt);
     }
 
     /**
@@ -188,7 +236,7 @@ public class ApplicationStatusObserver {
             return Optional.empty();
         }
         if (applications.size() > 1) {
-            LOG.warn(
+            LOG.debug(
                     "Expected a single application on the cluster but found {}: {}",
                     applications.size(),
                     applications);

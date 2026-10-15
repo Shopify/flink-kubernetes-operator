@@ -155,6 +155,8 @@ public class TestingFlinkService extends AbstractFlinkService {
     @Setter private Throwable jobFailedErr;
     @Setter private List<CustomApplicationDetails> applications = new ArrayList<>();
     @Getter private int getApplicationsCallCount = 0;
+    @Setter private Exception getApplicationsError;
+    @Setter private Exception getJobStatusError;
 
     @Getter private int desiredReplicas = 0;
     @Getter private int cancelJobCallCount = 0;
@@ -319,6 +321,9 @@ public class TestingFlinkService extends AbstractFlinkService {
             throws Exception {
         if (!isPortReady) {
             throw new TimeoutException("JM port is unavailable");
+        }
+        if (getJobStatusError != null) {
+            throw getJobStatusError;
         }
 
         if (jobFailedErr != null) {
@@ -720,11 +725,13 @@ public class TestingFlinkService extends AbstractFlinkService {
     }
 
     @Override
-    public List<CustomApplicationDetails> getApplications(Configuration conf)
-            throws TimeoutException {
+    public List<CustomApplicationDetails> getApplications(Configuration conf) throws Exception {
         getApplicationsCallCount++;
         if (!isPortReady) {
             throw new TimeoutException("JM port is unavailable");
+        }
+        if (getApplicationsError != null) {
+            throw getApplicationsError;
         }
         return applications;
     }
