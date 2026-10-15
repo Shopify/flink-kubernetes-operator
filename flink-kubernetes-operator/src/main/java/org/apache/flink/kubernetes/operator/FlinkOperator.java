@@ -39,6 +39,7 @@ import org.apache.flink.kubernetes.operator.health.HealthProbe;
 import org.apache.flink.kubernetes.operator.health.OperatorHealthService;
 import org.apache.flink.kubernetes.operator.listener.ListenerUtils;
 import org.apache.flink.kubernetes.operator.metrics.KubernetesOperatorMetricGroup;
+import org.apache.flink.kubernetes.operator.metrics.LeaderElectionMetric;
 import org.apache.flink.kubernetes.operator.metrics.MetricManager;
 import org.apache.flink.kubernetes.operator.metrics.OperatorJosdkMetrics;
 import org.apache.flink.kubernetes.operator.metrics.OperatorMetricUtils;
@@ -85,6 +86,7 @@ public class FlinkOperator {
     private final Set<FlinkResourceValidator> validators;
     @VisibleForTesting final Set<RegisteredController<?>> registeredControllers = new HashSet<>();
     private final KubernetesOperatorMetricGroup metricGroup;
+    private final LeaderElectionMetric leaderElectionMetric;
     private final Collection<FlinkResourceListener> listeners;
     private final OperatorHealthService operatorHealthService;
 
@@ -106,6 +108,7 @@ public class FlinkOperator {
 
         baseConfig = configManager.getDefaultConfig();
         this.metricGroup = OperatorMetricUtils.initOperatorMetrics(baseConfig);
+        this.leaderElectionMetric = new LeaderElectionMetric(metricGroup);
         if (client == null) {
             this.client =
                     KubernetesClientUtils.getKubernetesClient(
@@ -172,7 +175,8 @@ public class FlinkOperator {
         overrider.withUseSSAToPatchPrimaryResource(false);
         var leaderElectionConf = operatorConf.getLeaderElectionConfiguration();
         if (leaderElectionConf != null) {
-            overrider.withLeaderElectionConfiguration(leaderElectionConf);
+            overrider.withLeaderElectionConfiguration(
+                    leaderElectionMetric.decorate(leaderElectionConf));
             LOG.info("Operator leader election is enabled.");
         } else {
             LOG.info("Operator leader election is disabled.");
@@ -290,6 +294,10 @@ public class FlinkOperator {
         operator.installShutdownHook(
                 baseConfig.get(KubernetesOperatorConfigOptions.OPERATOR_TERMINATION_TIMEOUT));
         operator.start();
+        if (!baseConfig.get(KubernetesOperatorConfigOptions.OPERATOR_LEADER_ELECTION_ENABLED)) {
+            // Without election, a successfully started operator is the single active instance.
+            leaderElectionMetric.onStartLeading();
+        }
         if (operatorHealthService != null) {
             HealthProbe.INSTANCE.setRuntimeInfo(operator.getRuntimeInfo());
             Runtime.getRuntime().addShutdownHook(new Thread(operatorHealthService::stop));
@@ -298,6 +306,9 @@ public class FlinkOperator {
     }
 
     public void stop() {
+        // Clear before SDK shutdown, even if it fails or blocks. The SDK shutdown hook bypasses
+        // this method, so process termination does not guarantee a final zero can be scraped.
+        leaderElectionMetric.onStopLeading();
         operator.stop();
     }
 
