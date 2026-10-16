@@ -171,8 +171,8 @@ its sizing policy is unchanged. The parent template stays declarative. New image
 application settings and savepoint paths are not replaced with the old child's
 configuration, and autoscaler metrics/history are not copied.
 
-The operator records private sizing provenance in each child spec so a subsequent
-upgrade can distinguish an unchanged template seed from inherited runtime sizing.
+The operator records private sizing provenance in autoscaler-enabled child specs so
+an upgrade can distinguish an unchanged template seed from inherited runtime sizing.
 This also preserves a pending reset across operator restarts and status updates
 that acknowledge a resource generation before the child has applied that reset.
 Existing children without this provenance use their raw template seed for the
@@ -193,8 +193,9 @@ Do not edit operator-owned child configuration directly.
 
 State restoration and sizing are independent: stateless upgrades, explicit
 savepoint redeploys and suspend/resume do not themselves request a sizing reset.
-Changed resolved sizing constraints fall back to the template. Malformed recorded
-targets are not inherited. The operator does not clamp arbitrary per-vertex targets:
+Changed resolved sizing policies conservatively fall back to the template, even
+when a bound is widened; this is a deployment policy, not a hard-cap check. Malformed
+recorded targets are not inherited. The operator does not clamp arbitrary per-vertex targets:
 `pipeline.max-parallelism` is only a default for operators without their own maximum,
 and autoscaler bounds are not universal hard limits on current parallelism.
 

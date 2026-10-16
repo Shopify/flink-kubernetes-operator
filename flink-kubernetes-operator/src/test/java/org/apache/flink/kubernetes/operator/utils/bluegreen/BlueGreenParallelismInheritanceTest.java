@@ -51,6 +51,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class BlueGreenParallelismInheritanceTest {
@@ -300,6 +301,27 @@ class BlueGreenParallelismInheritanceTest {
     @Test
     void disablingAutoscalerThroughResolvedDefaultsUsesTheTemplate() {
         targetDefault(AutoScalerOptions.AUTOSCALER_ENABLED, "false");
+        assertTrue(overrides().isEmpty());
+    }
+
+    @Test
+    void disabledTargetDoesNotDecodeUnusedBoundsOrRecordSizingIntent() {
+        targetDefault(AutoScalerOptions.AUTOSCALER_ENABLED, "false");
+        targetDefault(AutoScalerOptions.VERTEX_MAX_PARALLELISM, "unused");
+        var target = prepared();
+        var config = target.getSpec().getFlinkConfiguration();
+        assertTrue(config.asConfiguration().get(PipelineOptions.PARALLELISM_OVERRIDES).isEmpty());
+        assertFalse(config.asFlatMap().containsKey(BlueGreenParallelism.INTENT_KEY));
+    }
+
+    @Test
+    void disabledSourceDoesNotDecodeUnusedBounds() {
+        source.getSpec()
+                .getFlinkConfiguration()
+                .put(AutoScalerOptions.AUTOSCALER_ENABLED.key(), "false");
+        source.getSpec()
+                .getFlinkConfiguration()
+                .put(AutoScalerOptions.VERTEX_MIN_PARALLELISM.key(), "unused");
         assertTrue(overrides().isEmpty());
     }
 

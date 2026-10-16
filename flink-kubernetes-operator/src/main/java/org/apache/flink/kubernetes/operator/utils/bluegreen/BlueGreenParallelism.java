@@ -44,6 +44,8 @@ import java.util.Objects;
 import java.util.TreeMap;
 import java.util.TreeSet;
 
+import static org.apache.flink.configuration.PipelineOptions.PARALLELISM_OVERRIDES;
+
 /** Preserves horizontal sizing without turning runtime decisions into parent configuration. */
 final class BlueGreenParallelism {
     private static final Logger LOG = LoggerFactory.getLogger(BlueGreenParallelism.class);
@@ -56,22 +58,24 @@ final class BlueGreenParallelism {
 
     static void apply(
             BlueGreenContext context, @Nullable FlinkDeployment source, FlinkDeployment target) {
-        if (target.getSpec().getJob() == null) {
+        var requested = target.getSpec();
+        if (requested.getJob() == null) {
             return;
         }
         var targetConfig =
                 context.getCtxFactory()
                         .getResourceContext(target, context.getJosdkContext())
-                        .getDeployConfig(target.getSpec());
+                        .getDeployConfig(requested);
+        if (!targetConfig.get(AutoScalerOptions.AUTOSCALER_ENABLED)) {
+            requested.getFlinkConfiguration().remove(INTENT_KEY);
+            return;
+        }
         var targetIntent =
-                intent(
-                        target.getSpec(),
-                        targetConfig,
-                        target.getSpec().getJob().getAutoscalerResetNonce());
+                intent(requested, targetConfig, requested.getJob().getAutoscalerResetNonce());
         if (source != null && source.getMetadata().getDeletionTimestamp() == null) {
             inherit(context, source, target, targetConfig, targetIntent);
         }
-        target.getSpec().getFlinkConfiguration().put(INTENT_KEY, targetIntent.encoded());
+        requested.getFlinkConfiguration().put(INTENT_KEY, targetIntent.encoded());
     }
 
     private static void inherit(
@@ -80,29 +84,30 @@ final class BlueGreenParallelism {
             FlinkDeployment target,
             Configuration targetConfig,
             Intent targetIntent) {
-        if (source.getSpec().getJob() == null) {
+        var requested = target.getSpec();
+        var sourceSpec = source.getSpec();
+        if (sourceSpec.getJob() == null) {
             return;
         }
+        var sourceReset = sourceSpec.getJob().getAutoscalerResetNonce();
         var sourceContext =
                 context.getCtxFactory().getResourceContext(source, context.getJosdkContext());
-        var sourceSeedConfig = sourceContext.getDeployConfig(source.getSpec());
-        var recorded = source.getSpec().getFlinkConfiguration().asFlatMap().get(INTENT_KEY);
+        var seedConfig = sourceContext.getDeployConfig(sourceSpec);
+        if (!seedConfig.get(AutoScalerOptions.AUTOSCALER_ENABLED)) {
+            return;
+        }
+        var recorded = sourceSpec.getFlinkConfiguration().asFlatMap().get(INTENT_KEY);
         Intent sourceIntent;
         if (recorded == null) {
-            // A legacy child has no record of the central defaults used at creation. Keep today's
-            // defaults authoritative rather than guessing whether they were an unchanged seed.
-            if (!source.getSpec()
+            // Legacy children do not record which central defaults were used at creation.
+            if (!sourceSpec
                     .getFlinkConfiguration()
                     .asConfiguration()
-                    .get(PipelineOptions.PARALLELISM_OVERRIDES)
-                    .equals(sourceSeedConfig.get(PipelineOptions.PARALLELISM_OVERRIDES))) {
+                    .get(PARALLELISM_OVERRIDES)
+                    .equals(seedConfig.get(PARALLELISM_OVERRIDES))) {
                 return;
             }
-            sourceIntent =
-                    intent(
-                            source.getSpec(),
-                            sourceSeedConfig,
-                            source.getSpec().getJob().getAutoscalerResetNonce());
+            sourceIntent = intent(sourceSpec, seedConfig, sourceReset);
         } else {
             sourceIntent = Intent.parse(recorded);
             if (sourceIntent == null) {
@@ -112,56 +117,47 @@ final class BlueGreenParallelism {
                 return;
             }
         }
-        var resetNonce = target.getSpec().getJob().getAutoscalerResetNonce();
+        var reset = requested.getJob().getAutoscalerResetNonce();
         var comparison =
-                resetNonce == null
-                        ? intent(
-                                target.getSpec(),
-                                targetConfig,
-                                source.getSpec().getJob().getAutoscalerResetNonce())
-                        : targetIntent;
+                reset == null ? intent(requested, targetConfig, sourceReset) : targetIntent;
         if (!sourceIntent.equals(comparison)) {
             return;
         }
 
+        var status = source.getStatus();
         var deployed =
-                source.getStatus() == null || source.getStatus().getReconciliationStatus() == null
+                status == null || status.getReconciliationStatus() == null
                         ? null
                         : ReconciliationUtils.getDeployedSpec(source);
         var deployedIntent =
                 deployed == null
                         ? null
                         : deployed.getFlinkConfiguration().asFlatMap().get(INTENT_KEY);
+        var deployedJob = deployed == null ? null : deployed.getJob();
         boolean pendingReset =
                 deployed != null
-                        && (deployed.getJob() == null
-                                || (source.getSpec().getJob().getAutoscalerResetNonce() != null
+                        && (deployedJob == null
+                                || (sourceReset != null
                                         && !Objects.equals(
-                                                source.getSpec().getJob().getAutoscalerResetNonce(),
-                                                deployed.getJob().getAutoscalerResetNonce())));
+                                                sourceReset,
+                                                deployedJob.getAutoscalerResetNonce())));
         // Observation can acknowledge a generation while retaining an older deployed spec.
-        // Comparing the spec's provenance protects pending intent across those status updates.
         var sourceConfig =
                 deployed == null || !Objects.equals(recorded, deployedIntent) || pendingReset
-                        ? sourceSeedConfig
+                        ? seedConfig
                         : sourceContext.getObserveConfig();
-        if (!sourceConfig.get(AutoScalerOptions.AUTOSCALER_ENABLED)
-                || !targetConfig.get(AutoScalerOptions.AUTOSCALER_ENABLED)) {
+        if (!sourceConfig.get(AutoScalerOptions.AUTOSCALER_ENABLED)) {
             return;
         }
-        var overrides = sourceConfig.get(PipelineOptions.PARALLELISM_OVERRIDES);
+        var overrides = sourceConfig.get(PARALLELISM_OVERRIDES);
         if (!validTargets(overrides)) {
             LOG.info(
                     "Retaining template sizing for {} because inherited targets are invalid",
                     target.getMetadata().getName());
-            return;
-        }
-        if (!overrides.isEmpty()) {
+        } else if (!overrides.isEmpty()) {
             String serialized =
                     ConfigurationUtils.convertValue(new TreeMap<>(overrides), String.class);
-            target.getSpec()
-                    .getFlinkConfiguration()
-                    .put(PipelineOptions.PARALLELISM_OVERRIDES.key(), serialized);
+            requested.getFlinkConfiguration().put(PARALLELISM_OVERRIDES.key(), serialized);
         }
     }
 
@@ -183,15 +179,13 @@ final class BlueGreenParallelism {
         var declared = spec.getFlinkConfiguration().asConfiguration();
         String seed =
                 ConfigurationUtils.convertValue(
-                        new TreeMap<>(declared.get(PipelineOptions.PARALLELISM_OVERRIDES)),
-                        String.class);
+                        new TreeMap<>(declared.get(PARALLELISM_OVERRIDES)), String.class);
         var values = new TreeMap<String, String>();
         values.put("seed", seed);
         values.put(
                 "resolved-seed",
                 ConfigurationUtils.convertValue(
-                        new TreeMap<>(resolved.get(PipelineOptions.PARALLELISM_OVERRIDES)),
-                        String.class));
+                        new TreeMap<>(resolved.get(PARALLELISM_OVERRIDES)), String.class));
         values.put("parallelism", Integer.toString(spec.getJob().getParallelism()));
         values.put("reset", Objects.toString(resetNonce));
         var replicas = spec.getTaskManager() == null ? null : spec.getTaskManager().getReplicas();

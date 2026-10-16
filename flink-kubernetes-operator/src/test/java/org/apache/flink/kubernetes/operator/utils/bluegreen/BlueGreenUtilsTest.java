@@ -17,6 +17,7 @@
 
 package org.apache.flink.kubernetes.operator.utils.bluegreen;
 
+import org.apache.flink.autoscaler.config.AutoScalerOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.PipelineOptions;
 import org.apache.flink.kubernetes.operator.TestUtils;
@@ -313,9 +314,11 @@ public class BlueGreenUtilsTest {
         status.setLastReconciledSpec(SpecUtils.writeSpecAsJSON(bgDeployment.getSpec(), "spec"));
         bgDeployment.setStatus(status);
 
+        var config = new Configuration();
+        config.set(AutoScalerOptions.AUTOSCALER_ENABLED, true);
         var factory =
                 new TestingFlinkResourceContextFactory(
-                        new FlinkConfigManager(new Configuration()),
+                        new FlinkConfigManager(config),
                         TestUtils.createTestMetricGroup(new Configuration()),
                         null,
                         null);

@@ -129,7 +129,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         var bg = autoscaledDeployment();
         var rs = executeBasicDeployment(FlinkVersion.v1_20, bg, false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:new-image");
+        templateSpec(rs.deployment).setImage("flink:new-image");
         var parentSpec = SpecUtils.writeSpecAsJSON(rs.deployment.getSpec(), "spec");
 
         rs = reconcile(rs.deployment);
@@ -168,16 +168,14 @@ public class FlinkBlueGreenDeploymentControllerTest {
     public void verifySizingIntentWinsOverInheritance(String change) throws Exception {
         var bg = autoscaledDeployment();
         if ("replicaSlots".equals(change)) {
-            bg.getSpec().getTemplate().getSpec().getTaskManager().setReplicas(3);
+            templateSpec(bg).getTaskManager().setReplicas(3);
         }
-        bg.getSpec()
-                .getTemplate()
-                .getSpec()
+        templateSpec(bg)
                 .getFlinkConfiguration()
                 .put(PipelineOptions.PARALLELISM_OVERRIDES.key(), "vertex:2");
         var rs = executeBasicDeployment(FlinkVersion.v1_20, bg, false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
-        var spec = rs.deployment.getSpec().getTemplate().getSpec();
+        var spec = templateSpec(rs.deployment);
         var config = spec.getFlinkConfiguration();
         switch (change) {
             case "parallelism":
@@ -235,7 +233,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         var bg = autoscaledDeployment();
         var rs = executeBasicDeployment(FlinkVersion.v1_20, bg, false, null);
         assertEquals(Map.of(), sizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID)));
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:new-image");
+        templateSpec(rs.deployment).setImage("flink:new-image");
         rs = reconcile(rs.deployment);
         assertEquals(Map.of(), sizing(getFlinkDeploymentByName(GREEN_CLUSTER_ID)));
         assertEquals(
@@ -247,16 +245,16 @@ public class FlinkBlueGreenDeploymentControllerTest {
     public void verifyPendingChildUpdatesPreserveInheritanceAndExplicitReset() throws Exception {
         var rs = executeBasicDeployment(FlinkVersion.v1_20, autoscaledDeployment(), false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:second");
+        templateSpec(rs.deployment).setImage("flink:second");
         rs = reconcile(rs.deployment);
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:third");
+        templateSpec(rs.deployment).setImage("flink:third");
         rs = reconcile(rs.deployment);
         assertEquals(Map.of("vertex", "24"), sizing(getFlinkDeploymentByName(GREEN_CLUSTER_ID)));
 
-        rs.deployment.getSpec().getTemplate().getSpec().getJob().setAutoscalerResetNonce(1L);
+        templateSpec(rs.deployment).getJob().setAutoscalerResetNonce(1L);
         rs = reconcile(rs.deployment);
         assertEquals(Map.of(), sizing(getFlinkDeploymentByName(GREEN_CLUSTER_ID)));
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:fourth");
+        templateSpec(rs.deployment).setImage("flink:fourth");
         rs = reconcile(rs.deployment);
         assertEquals(Map.of(), sizing(getFlinkDeploymentByName(GREEN_CLUSTER_ID)));
         assertEquals(2, getFlinkDeployments().size());
@@ -266,14 +264,14 @@ public class FlinkBlueGreenDeploymentControllerTest {
     public void verifyUnobservedResetDoesNotResurrectOldSizing() throws Exception {
         var rs = executeBasicDeployment(FlinkVersion.v1_20, autoscaledDeployment(), false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
-        rs.deployment.getSpec().getTemplate().getSpec().getJob().setAutoscalerResetNonce(1L);
+        templateSpec(rs.deployment).getJob().setAutoscalerResetNonce(1L);
         rs = reconcile(rs.deployment);
         var blue = getFlinkDeploymentByName(BLUE_CLUSTER_ID);
         assertEquals(Map.of(), sizing(blue));
         blue.getMetadata().setGeneration(2L);
         blue.getStatus().setObservedGeneration(1L);
         kubernetesClient.resource(blue).update();
-        rs.deployment.getSpec().getTemplate().getSpec().getJob().setAllowNonRestoredState(true);
+        templateSpec(rs.deployment).getJob().setAllowNonRestoredState(true);
         rs = reconcile(rs.deployment);
         assertEquals(Map.of(), sizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID)));
         assertEquals(1, getFlinkDeployments().size());
@@ -283,13 +281,13 @@ public class FlinkBlueGreenDeploymentControllerTest {
     public void verifySizingSurvivesSuspendAndResume() throws Exception {
         var rs = executeBasicDeployment(FlinkVersion.v1_20, autoscaledDeployment(), false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
-        rs.deployment.getSpec().getTemplate().getSpec().getJob().setState(JobState.SUSPENDED);
+        templateSpec(rs.deployment).getJob().setState(JobState.SUSPENDED);
         rs = reconcile(rs.deployment);
         var blue = getFlinkDeploymentByName(BLUE_CLUSTER_ID);
         assertEquals(Map.of("vertex", "24"), sizing(blue));
         simulateSuccessfulSuspend(blue);
         rs = reconcile(rs.deployment);
-        rs.deployment.getSpec().getTemplate().getSpec().getJob().setState(JobState.RUNNING);
+        templateSpec(rs.deployment).getJob().setState(JobState.RUNNING);
         rs = reconcile(rs.deployment);
         assertEquals(Map.of("vertex", "24"), sizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID)));
         assertEquals(1, getFlinkDeployments().size());
@@ -299,7 +297,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
     public void verifyAbortRetryAndAlternatingColorsUseCurrentSizing() throws Exception {
         var rs = executeBasicDeployment(FlinkVersion.v1_20, autoscaledDeployment(), false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:failed");
+        templateSpec(rs.deployment).setImage("flink:failed");
         rs = reconcile(rs.deployment);
         rs.deployment
                 .getStatus()
@@ -308,13 +306,13 @@ public class FlinkBlueGreenDeploymentControllerTest {
         assertEquals(1, getFlinkDeployments().size());
         assertEquals(
                 FlinkBlueGreenDeploymentState.ACTIVE_BLUE, rs.reconciledStatus.getBlueGreenState());
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:retry");
+        templateSpec(rs.deployment).setImage("flink:retry");
         rs = reconcile(rs.deployment);
         assertEquals(Map.of("vertex", "24"), sizing(getFlinkDeploymentByName(GREEN_CLUSTER_ID)));
         simulateSuccessfulJobStart(getFlinkDeploymentByName(GREEN_CLUSTER_ID));
         rs = finishSizingTransition(rs, FlinkBlueGreenDeploymentState.ACTIVE_GREEN);
         setDeployedSizing(getFlinkDeploymentByName(GREEN_CLUSTER_ID), Map.of("vertex", "48"));
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:next");
+        templateSpec(rs.deployment).setImage("flink:next");
         rs = reconcile(rs.deployment);
         assertEquals(Map.of("vertex", "48"), sizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID)));
         simulateSuccessfulJobStart(getFlinkDeploymentByName(BLUE_CLUSTER_ID));
@@ -343,9 +341,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
     @ValueSource(strings = {"SAVEPOINT", "LAST_STATE", "redeploy"})
     public void verifyStatefulRestoreAndRedeployKeepSizing(String mode) throws Exception {
         var bg = autoscaledDeployment();
-        bg.getSpec()
-                .getTemplate()
-                .getSpec()
+        templateSpec(bg)
                 .getJob()
                 .setUpgradeMode(
                         "redeploy".equals(mode)
@@ -353,7 +349,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
                                 : UpgradeMode.valueOf(mode));
         var rs = executeBasicDeployment(FlinkVersion.v1_20, bg, false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
-        var spec = rs.deployment.getSpec().getTemplate().getSpec();
+        var spec = templateSpec(rs.deployment);
         spec.setImage("flink:new-image");
         spec.getFlinkConfiguration().put(CUSTOM_CONFIG_FIELD, "new-value");
         var expectedPath = "savepoint_1";
@@ -372,21 +368,18 @@ public class FlinkBlueGreenDeploymentControllerTest {
         assertEquals("flink:new-image", green.getSpec().getImage());
     }
 
-    @ParameterizedTest
-    @ValueSource(strings = {"job.autoscaler.enabled"})
-    public void verifyDisabledSourceDoesNotSeedEnabledReplacement(String disabledOption)
-            throws Exception {
+    @Test
+    public void verifyDisabledSourceDoesNotSeedEnabledReplacement() throws Exception {
         var bg = autoscaledDeployment();
-        bg.getSpec().getTemplate().getSpec().getFlinkConfiguration().put(disabledOption, "false");
+        templateSpec(bg)
+                .getFlinkConfiguration()
+                .put(AutoScalerOptions.AUTOSCALER_ENABLED.key(), "false");
         var rs = executeBasicDeployment(FlinkVersion.v1_20, bg, false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
-        rs.deployment
-                .getSpec()
-                .getTemplate()
-                .getSpec()
+        templateSpec(rs.deployment)
                 .getFlinkConfiguration()
-                .put(disabledOption, "true");
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:new-image");
+                .put(AutoScalerOptions.AUTOSCALER_ENABLED.key(), "true");
+        templateSpec(rs.deployment).setImage("flink:new-image");
         rs = reconcile(rs.deployment);
         assertEquals(Map.of(), sizing(getFlinkDeploymentByName(GREEN_CLUSTER_ID)));
     }
@@ -394,14 +387,12 @@ public class FlinkBlueGreenDeploymentControllerTest {
     @Test
     public void verifyEquivalentSizingOptionsRetainRuntimeOverrides() throws Exception {
         var bg = autoscaledDeployment();
-        bg.getSpec()
-                .getTemplate()
-                .getSpec()
+        templateSpec(bg)
                 .getFlinkConfiguration()
                 .put(PipelineOptions.PARALLELISM_OVERRIDES.key(), "a:2,b:3");
         var rs = executeBasicDeployment(FlinkVersion.v1_20, bg, false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("a", "24", "b", "48"));
-        var spec = rs.deployment.getSpec().getTemplate().getSpec();
+        var spec = templateSpec(rs.deployment);
         spec.getFlinkConfiguration().put(PipelineOptions.PARALLELISM_OVERRIDES.key(), "b:3,a:2");
         spec.getFlinkConfiguration()
                 .put(
@@ -418,21 +409,16 @@ public class FlinkBlueGreenDeploymentControllerTest {
     public void verifyScalingPausePreservesSizing(boolean alreadyPaused) throws Exception {
         var bg = autoscaledDeployment();
         if (alreadyPaused) {
-            bg.getSpec()
-                    .getTemplate()
-                    .getSpec()
+            templateSpec(bg)
                     .getFlinkConfiguration()
                     .put(AutoScalerOptions.SCALING_ENABLED.key(), "false");
         }
         var rs = executeBasicDeployment(FlinkVersion.v1_20, bg, false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
-        rs.deployment
-                .getSpec()
-                .getTemplate()
-                .getSpec()
+        templateSpec(rs.deployment)
                 .getFlinkConfiguration()
                 .put(AutoScalerOptions.SCALING_ENABLED.key(), "false");
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:paused-upgrade");
+        templateSpec(rs.deployment).setImage("flink:paused-upgrade");
         rs = reconcile(rs.deployment);
         assertEquals(Map.of("vertex", "24"), sizing(getFlinkDeploymentByName(GREEN_CLUSTER_ID)));
     }
@@ -442,7 +428,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         var rs = executeBasicDeployment(FlinkVersion.v1_20, autoscaledDeployment(), false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
         var oldStatus = SpecUtils.clone(getFlinkDeploymentByName(BLUE_CLUSTER_ID).getStatus());
-        rs.deployment.getSpec().getTemplate().getSpec().getJob().setAutoscalerResetNonce(1L);
+        templateSpec(rs.deployment).getJob().setAutoscalerResetNonce(1L);
         rs = reconcile(rs.deployment);
         var blue = getFlinkDeploymentByName(BLUE_CLUSTER_ID);
         blue.setStatus(oldStatus);
@@ -456,7 +442,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         rs = reconcile(rs.deployment);
         assertEquals(
                 FlinkBlueGreenDeploymentState.ACTIVE_BLUE, rs.reconciledStatus.getBlueGreenState());
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:after-reset");
+        templateSpec(rs.deployment).setImage("flink:after-reset");
         rs = reconcile(rs.deployment);
         assertEquals(Map.of(), sizing(getFlinkDeploymentByName(GREEN_CLUSTER_ID)));
     }
@@ -466,7 +452,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         var rs = executeBasicDeployment(FlinkVersion.v1_20, autoscaledDeployment(), false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
         simulateJobFailure(getFlinkDeploymentByName(BLUE_CLUSTER_ID));
-        var requested = rs.deployment.getSpec().getTemplate().getSpec();
+        var requested = templateSpec(rs.deployment);
         requested.getJob().setParallelism(7);
         requested.setImage("flink:rejected");
         rs = reconcile(rs.deployment);
@@ -474,7 +460,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         assertEquals(1, getFlinkDeployments().size());
         simulateSuccessfulJobStart(getFlinkDeploymentByName(BLUE_CLUSTER_ID));
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:retry");
+        templateSpec(rs.deployment).setImage("flink:retry");
         rs = reconcile(rs.deployment);
         assertEquals(
                 7, getFlinkDeploymentByName(GREEN_CLUSTER_ID).getSpec().getJob().getParallelism());
@@ -485,8 +471,8 @@ public class FlinkBlueGreenDeploymentControllerTest {
     public void verifyRestartAndAbortDoNotConsumeNewSizingIntent() throws Exception {
         var rs = executeBasicDeployment(FlinkVersion.v1_20, autoscaledDeployment(), false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
-        rs.deployment.getSpec().getTemplate().getSpec().getJob().setParallelism(7);
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:failed");
+        templateSpec(rs.deployment).getJob().setParallelism(7);
+        templateSpec(rs.deployment).setImage("flink:failed");
         rs = reconcile(rs.deployment);
         testController = new TestingFlinkBlueGreenDeploymentController(configManager, flinkService);
         rs.deployment
@@ -495,7 +481,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
         rs = reconcile(rs.deployment);
         assertEquals(
                 FlinkBlueGreenDeploymentState.ACTIVE_BLUE, rs.reconciledStatus.getBlueGreenState());
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:retry-after-restart");
+        templateSpec(rs.deployment).setImage("flink:retry-after-restart");
         rs = reconcile(rs.deployment);
         assertEquals(
                 7, getFlinkDeploymentByName(GREEN_CLUSTER_ID).getSpec().getJob().getParallelism());
@@ -507,13 +493,13 @@ public class FlinkBlueGreenDeploymentControllerTest {
         var rs = executeBasicDeployment(FlinkVersion.v1_20, autoscaledDeployment(), false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
         var staleBlue = SpecUtils.clone(getFlinkDeploymentByName(BLUE_CLUSTER_ID));
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:green");
+        templateSpec(rs.deployment).setImage("flink:green");
         rs = reconcile(rs.deployment);
         simulateSuccessfulJobStart(getFlinkDeploymentByName(GREEN_CLUSTER_ID));
         rs = finishSizingTransition(rs, FlinkBlueGreenDeploymentState.ACTIVE_GREEN);
         setDeployedSizing(getFlinkDeploymentByName(GREEN_CLUSTER_ID), Map.of("vertex", "48"));
         kubernetesClient.resource(staleBlue).createOrReplace();
-        rs.deployment.getSpec().getTemplate().getSpec().setImage("flink:new-blue");
+        templateSpec(rs.deployment).setImage("flink:new-blue");
         rs = reconcile(rs.deployment);
         assertEquals(Map.of("vertex", "48"), sizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID)));
     }
@@ -522,7 +508,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
     public void verifyNewMemorySettingsAreNotReplayedFromTheOldChild() throws Exception {
         var rs = executeBasicDeployment(FlinkVersion.v1_20, autoscaledDeployment(), false, null);
         setDeployedSizing(getFlinkDeploymentByName(BLUE_CLUSTER_ID), Map.of("vertex", "24"));
-        var requested = rs.deployment.getSpec().getTemplate().getSpec();
+        var requested = templateSpec(rs.deployment);
         requested.getTaskManager().getResource().setMemory("3072m");
         requested.setImage("flink:memory-update");
         rs = reconcile(rs.deployment);
@@ -544,9 +530,7 @@ public class FlinkBlueGreenDeploymentControllerTest {
                         FlinkVersion.v1_20,
                         null,
                         UpgradeMode.STATELESS);
-        bg.getSpec()
-                .getTemplate()
-                .getSpec()
+        templateSpec(bg)
                 .getFlinkConfiguration()
                 .put(AutoScalerOptions.AUTOSCALER_ENABLED.key(), "true");
         bg.getSpec().getConfiguration().put(ABORT_GRACE_PERIOD.key(), "1 min");
@@ -570,6 +554,10 @@ public class FlinkBlueGreenDeploymentControllerTest {
                 .getFlinkConfiguration()
                 .asConfiguration()
                 .get(PipelineOptions.PARALLELISM_OVERRIDES);
+    }
+
+    private FlinkDeploymentSpec templateSpec(FlinkBlueGreenDeployment deployment) {
+        return deployment.getSpec().getTemplate().getSpec();
     }
 
     @ParameterizedTest
