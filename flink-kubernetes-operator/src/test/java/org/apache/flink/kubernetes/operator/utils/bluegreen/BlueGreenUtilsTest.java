@@ -17,24 +17,32 @@
 
 package org.apache.flink.kubernetes.operator.utils.bluegreen;
 
+import org.apache.flink.autoscaler.config.AutoScalerOptions;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.PipelineOptions;
+import org.apache.flink.kubernetes.operator.TestUtils;
+import org.apache.flink.kubernetes.operator.TestingFlinkResourceContextFactory;
 import org.apache.flink.kubernetes.operator.api.FlinkBlueGreenDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDeploymentType;
-import org.apache.flink.kubernetes.operator.api.spec.ConfigObjectNode;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentSpec;
-import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentSpec;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentTemplateSpec;
-import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
+import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentStatus;
+import org.apache.flink.kubernetes.operator.api.status.FlinkDeploymentStatus;
 import org.apache.flink.kubernetes.operator.api.status.Savepoint;
 import org.apache.flink.kubernetes.operator.api.status.SavepointFormatType;
 import org.apache.flink.kubernetes.operator.api.status.SnapshotTriggerType;
 import org.apache.flink.kubernetes.operator.api.utils.SpecUtils;
+import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
+import org.apache.flink.kubernetes.operator.controller.FlinkBlueGreenDeployments;
 import org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenContext;
 
 import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -87,6 +95,54 @@ public class BlueGreenUtilsTest {
                 "s3://" + parentDeploymentName + "/highavailability",
                 resultFlinkConfig.get("high-availability.storageDir"));
         assertEquals(parentDeploymentName + ".jm", resultFlinkConfig.get("metrics.scope.jm"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    public void testLegacySourceDoesNotOverrideNewDeclaredSizing(boolean missingStatus) {
+        var bg = buildBlueGreenDeployment("test-app", TEST_NAMESPACE);
+        var context = createContext(bg);
+        var source = new FlinkDeployment();
+        source.setMetadata(
+                new ObjectMetaBuilder()
+                        .withName("test-app-blue")
+                        .withNamespace(TEST_NAMESPACE)
+                        .build());
+        source.setStatus(new FlinkDeploymentStatus());
+        source.setSpec(SpecUtils.clone(bg.getSpec().getTemplate().getSpec()));
+        source.getSpec()
+                .getFlinkConfiguration()
+                .put(PipelineOptions.PARALLELISM_OVERRIDES.key(), "vertex:24");
+        if (missingStatus) {
+            source.setStatus(null);
+        }
+        var deployments = new FlinkBlueGreenDeployments();
+        deployments.setFlinkDeploymentBlue(source);
+        context =
+                new BlueGreenContext(
+                        bg, bg.getStatus(), null, deployments, context.getCtxFactory());
+
+        var target =
+                BlueGreenUtils.prepareFlinkDeployment(
+                        context,
+                        BlueGreenDeploymentType.GREEN,
+                        null,
+                        false,
+                        bg.getMetadata(),
+                        source);
+
+        assertTemplateSpec(bg, target);
+    }
+
+    @Test
+    public void testInitialDeploymentDoesNotNeedParentHistory() {
+        var bg = buildBlueGreenDeployment("test-app", TEST_NAMESPACE);
+        var context = createContext(bg);
+        bg.getStatus().setLastReconciledSpec(null);
+        var target =
+                BlueGreenUtils.prepareFlinkDeployment(
+                        context, BlueGreenDeploymentType.BLUE, null, true, bg.getMetadata());
+        assertTemplateSpec(bg, target);
     }
 
     @Test
@@ -224,6 +280,12 @@ public class BlueGreenUtilsTest {
         assertEquals(freshSavepoint, result.getSpec().getJob().getInitialSavepointPath());
     }
 
+    private void assertTemplateSpec(FlinkBlueGreenDeployment parent, FlinkDeployment child) {
+        var actual = SpecUtils.clone(child.getSpec());
+        assertNotNull(actual.getFlinkConfiguration().remove(BlueGreenParallelism.INTENT_KEY));
+        assertEquals(parent.getSpec().getTemplate().getSpec(), actual);
+    }
+
     private static FlinkBlueGreenDeployment buildBlueGreenDeployment(
             String name, String namespace) {
         var deployment = new FlinkBlueGreenDeployment();
@@ -234,11 +296,8 @@ public class BlueGreenUtilsTest {
                         .withUid(UUID.randomUUID().toString())
                         .build());
 
-        var flinkDeploymentSpec =
-                FlinkDeploymentSpec.builder()
-                        .flinkConfiguration(new ConfigObjectNode())
-                        .job(JobSpec.builder().upgradeMode(UpgradeMode.STATELESS).build())
-                        .build();
+        var flinkDeploymentSpec = TestUtils.buildApplicationCluster(FlinkVersion.v1_20).getSpec();
+        flinkDeploymentSpec.getJob().setUpgradeMode(UpgradeMode.STATELESS);
 
         var bgDeploymentSpec =
                 new FlinkBlueGreenDeploymentSpec(
@@ -255,6 +314,14 @@ public class BlueGreenUtilsTest {
         status.setLastReconciledSpec(SpecUtils.writeSpecAsJSON(bgDeployment.getSpec(), "spec"));
         bgDeployment.setStatus(status);
 
-        return new BlueGreenContext(bgDeployment, status, null, null, null);
+        var config = new Configuration();
+        config.set(AutoScalerOptions.AUTOSCALER_ENABLED, true);
+        var factory =
+                new TestingFlinkResourceContextFactory(
+                        new FlinkConfigManager(config),
+                        TestUtils.createTestMetricGroup(new Configuration()),
+                        null,
+                        null);
+        return new BlueGreenContext(bgDeployment, status, null, null, factory);
     }
 }

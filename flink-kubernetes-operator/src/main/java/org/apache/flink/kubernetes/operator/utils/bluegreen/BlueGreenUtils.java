@@ -319,6 +319,17 @@ public class BlueGreenUtils {
             Savepoint lastCheckpoint,
             boolean isFirstDeployment,
             ObjectMeta bgMeta) {
+        return prepareFlinkDeployment(
+                context, blueGreenDeploymentType, lastCheckpoint, isFirstDeployment, bgMeta, null);
+    }
+
+    public static FlinkDeployment prepareFlinkDeployment(
+            BlueGreenContext context,
+            BlueGreenDeploymentType blueGreenDeploymentType,
+            Savepoint lastCheckpoint,
+            boolean isFirstDeployment,
+            ObjectMeta bgMeta,
+            @org.jetbrains.annotations.Nullable FlinkDeployment sizingSource) {
         // Deployment
         FlinkDeployment flinkDeployment = new FlinkDeployment();
         FlinkBlueGreenDeploymentSpec originalSpec = context.getBgDeployment().getSpec();
@@ -379,6 +390,7 @@ public class BlueGreenUtils {
         flinkDeploymentMeta.setLabels(
                 Map.of(BlueGreenDeploymentType.LABEL_KEY, blueGreenDeploymentType.toString()));
         flinkDeployment.setMetadata(flinkDeploymentMeta);
+        BlueGreenParallelism.apply(context, sizingSource, flinkDeployment);
         return flinkDeployment;
     }
 }

@@ -164,13 +164,10 @@ class RestApiMetricsCollectorTest {
                                     new StandaloneClientHAServices(
                                             miniCluster.getRestAddress().get().toString()));
             var collector = new RestApiMetricsCollector<>();
-            Map<FlinkMetric, Metric> flinkMetricMetricMap = new HashMap<>();
-            // Metrics might not be available yet so retry the query until it returns results or the
-            // timeout reached.
             await().atMost(Duration.ofSeconds(60))
-                    .until(
+                    .untilAsserted(
                             () -> {
-                                final Map<FlinkMetric, Metric> results =
+                                var metrics =
                                         collector.queryJmMetrics(
                                                 client,
                                                 Map.of(
@@ -178,18 +175,15 @@ class RestApiMetricsCollectorTest {
                                                         FlinkMetric.NUM_TASK_SLOTS_TOTAL,
                                                         "taskSlotsAvailable",
                                                         FlinkMetric.NUM_TASK_SLOTS_AVAILABLE));
-                                flinkMetricMetricMap.putAll(results);
-                                return !results.isEmpty();
+                                assertThat(metrics)
+                                        .hasSize(2)
+                                        .hasEntrySatisfying(
+                                                FlinkMetric.NUM_TASK_SLOTS_TOTAL,
+                                                metricValue -> assertMetricValueIs(metricValue, 3))
+                                        .hasEntrySatisfying(
+                                                FlinkMetric.NUM_TASK_SLOTS_AVAILABLE,
+                                                metricValue -> assertMetricValueIs(metricValue, 3));
                             });
-
-            assertThat(flinkMetricMetricMap)
-                    .hasSize(2)
-                    .hasEntrySatisfying(
-                            FlinkMetric.NUM_TASK_SLOTS_TOTAL,
-                            metricValue -> assertMetricValueIs(metricValue, 3))
-                    .hasEntrySatisfying(
-                            FlinkMetric.NUM_TASK_SLOTS_AVAILABLE,
-                            metricValue -> assertMetricValueIs(metricValue, 3));
         }
     }
 
