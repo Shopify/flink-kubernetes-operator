@@ -98,6 +98,22 @@ public class BlueGreenDeploymentService {
             FlinkBlueGreenDeploymentState nextState,
             Savepoint lastCheckpoint,
             boolean isFirstDeployment) {
+        return initiateDeployment(
+                context,
+                nextBlueGreenDeploymentType,
+                nextState,
+                lastCheckpoint,
+                isFirstDeployment,
+                null);
+    }
+
+    private UpdateControl<FlinkBlueGreenDeployment> initiateDeployment(
+            BlueGreenContext context,
+            BlueGreenDeploymentType nextBlueGreenDeploymentType,
+            FlinkBlueGreenDeploymentState nextState,
+            Savepoint lastCheckpoint,
+            boolean isFirstDeployment,
+            @Nullable FlinkDeployment sizingSource) {
         ObjectMeta bgMeta = context.getBgDeployment().getMetadata();
 
         FlinkDeployment flinkDeployment =
@@ -106,7 +122,8 @@ public class BlueGreenDeploymentService {
                         nextBlueGreenDeploymentType,
                         lastCheckpoint,
                         isFirstDeployment,
-                        bgMeta);
+                        bgMeta,
+                        sizingSource);
 
         deployCluster(context, flinkDeployment);
 
@@ -289,7 +306,8 @@ public class BlueGreenDeploymentService {
                 blueGreenDeploymentTypeToPatch,
                 patchingState,
                 lastSavepoint,
-                isFirstDeployment);
+                isFirstDeployment,
+                context.getDeploymentByType(blueGreenDeploymentTypeToPatch));
     }
 
     @Nullable
@@ -337,7 +355,8 @@ public class BlueGreenDeploymentService {
                 transition.nextBlueGreenDeploymentType,
                 transition.nextState,
                 lastCheckpoint,
-                false);
+                false,
+                currentFlinkDeployment);
     }
 
     /**
@@ -357,7 +376,8 @@ public class BlueGreenDeploymentService {
                 transition.nextBlueGreenDeploymentType,
                 transition.nextState,
                 null, // Use initialSavepointPath from spec
-                false);
+                false,
+                context.getDeploymentByType(currentBlueGreenDeploymentType));
     }
 
     private DeploymentTransition calculateTransition(BlueGreenDeploymentType currentType) {

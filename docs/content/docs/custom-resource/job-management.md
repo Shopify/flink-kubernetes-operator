@@ -163,6 +163,53 @@ For this purpose you can use the `restartNonce` top level field in the spec. Set
 
 Restarts work exactly the same way as other application upgrades and follow the semantics detailed in the previous section.
 
+## Parallelism during blue-green upgrades
+
+For `FlinkBlueGreenDeployment` application jobs, a replacement inherits the source
+child's recorded per-vertex autoscaler targets before its first submission when
+its sizing policy is unchanged. The parent template stays declarative. New images,
+application settings and savepoint paths are not replaced with the old child's
+configuration, and autoscaler metrics/history are not copied.
+
+The operator records private sizing provenance in each child spec so a subsequent
+upgrade can distinguish an unchanged template seed from inherited runtime sizing.
+This also preserves a pending reset across operator restarts and status updates
+that acknowledge a resource generation before the child has applied that reset.
+Existing children without this provenance use their raw template seed for the
+first handoff. If they use a non-declared per-vertex seed from central defaults,
+those current defaults stay authoritative for that first handoff; provenance then
+allows subsequent upgrades to distinguish unchanged defaults from a new seed.
+Do not edit operator-owned child configuration directly.
+
+| Change | Replacement sizing |
+| --- | --- |
+| Image or other non-sizing settings | Inherit compatible recorded targets. |
+| `job.parallelism`, `parallelism.default`, per-vertex overrides, maximum parallelism, autoscaler vertex bounds/exclusions | Use the requested template sizing. |
+| TaskManager replicas, or slots when replicas explicitly determine parallelism | Use the requested template sizing. |
+| New non-null `job.autoscalerResetNonce` | Reset to the template seed. Removing the nonce is not a reset. |
+| `job.autoscaler.enabled: false` | Do not inherit autoscaled targets. |
+| `job.autoscaler.scaling.enabled: false` | Preserve existing targets; pausing execution is not a sizing reset. |
+| First deployment or no usable source targets | Use template sizing. |
+
+State restoration and sizing are independent: stateless upgrades, explicit
+savepoint redeploys and suspend/resume do not themselves request a sizing reset.
+Changed resolved sizing constraints fall back to the template. Malformed recorded
+targets are not inherited. The operator does not clamp arbitrary per-vertex targets:
+`pipeline.max-parallelism` is only a default for operators without their own maximum,
+and autoscaler bounds are not universal hard limits on current parallelism.
+
+Inheritance is horizontal only and assumes compatible JobVertex identities across
+versions. Renamed or rechained vertices do not acquire the old vertices' sizing;
+use an explicit sizing change or reset nonce when changing that contract. The
+application runtime must support startup per-vertex overrides. For application-specific
+sizing parameters in job arguments or custom configuration, also change the reset
+nonce: the generic operator cannot infer their meaning.
+
+This does not change the blue-green readiness gate or make autoscaling itself use
+blue-green transitions. A recorded target is not proof the replacement has acquired
+all required resources or caught up on its input. Validate capacity, restore,
+cutover and rollback separately before production rollout.
+
 ## Recovery of missing job deployments
 
 When HA is enabled, the operator can recover the Flink cluster deployments in cases when it was accidentally deleted
