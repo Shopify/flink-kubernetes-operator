@@ -165,6 +165,7 @@ public class ReconciliationUtils {
                     // upgrade
                     job.setSavepointTriggerNonce(lastSpec.getJob().getSavepointTriggerNonce());
                     job.setCheckpointTriggerNonce(lastSpec.getJob().getCheckpointTriggerNonce());
+                    RedeployRequest.preserveConsumedNonces(lastSpec.getJob(), job);
                 }
 
                 if (target instanceof FlinkDeployment) {
@@ -539,6 +540,7 @@ public class ReconciliationUtils {
         var reconciliationStatus = status.getReconciliationStatus();
         var lastSpecWithMeta = reconciliationStatus.deserializeLastReconciledSpecWithMeta();
         var lastJobSpec = lastSpecWithMeta.getSpec().getJob();
+        boolean redeploy = RedeployRequest.isPendingRedeploy(status);
         if (lastJobSpec != null) {
             lastJobSpec.setState(JobState.RUNNING);
             status.getJobStatus().setState(RECONCILING);
@@ -547,6 +549,9 @@ public class ReconciliationUtils {
         reconciliationStatus.setLastReconciledSpec(
                 SpecUtils.writeSpecWithMeta(
                         lastSpecWithMeta.getSpec(), lastSpecWithMeta.getMeta()));
+        if (redeploy) {
+            reconciliationStatus.markReconciledSpecAsStable();
+        }
     }
 
     public static <SPEC extends AbstractFlinkSpec> void updateReconciliationMetadata(

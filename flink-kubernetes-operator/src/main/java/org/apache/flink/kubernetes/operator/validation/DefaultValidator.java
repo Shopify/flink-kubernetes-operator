@@ -598,43 +598,7 @@ public class DefaultValidator implements FlinkResourceValidator {
                     "Cannot switch from standalone kubernetes to native kubernetes cluster");
         }
 
-        return validateRedeploy(oldSpec.getJob(), newSpec.getJob());
-    }
-
-    /**
-     * Validates the redeploy triggers of a job spec change.
-     *
-     * @param oldJob Last reconciled job spec.
-     * @param newJob New job spec.
-     * @return Optional error string.
-     */
-    private static Optional<String> validateRedeploy(JobSpec oldJob, JobSpec newJob) {
-        if (oldJob == null || newJob == null) {
-            return Optional.empty();
-        }
-
-        boolean redeploy = RedeployRequest.isRedeployNonceChanged(oldJob, newJob);
-        boolean legacyRedeploy = RedeployRequest.isLegacyNonceChanged(oldJob, newJob);
-
-        if (redeploy && legacyRedeploy) {
-            return Optional.of(
-                    "Cannot change redeploy.nonce and the deprecated savepointRedeployNonce at the same time");
-        }
-
-        if (redeploy) {
-            var savepointPath = newJob.getRedeploy().getSavepointPath();
-            if (savepointPath != null && savepointPath.isBlank()) {
-                return Optional.of(
-                        "redeploy.savepointPath must not be blank, leave it unset to redeploy without state");
-            }
-        }
-
-        if (legacyRedeploy
-                && StringUtils.isNullOrWhitespaceOnly(newJob.getInitialSavepointPath())) {
-            return Optional.of("InitialSavepointPath must not be empty for savepoint redeployment");
-        }
-
-        return Optional.empty();
+        return RedeployRequest.validate(oldSpec.getJob(), newSpec.getJob());
     }
 
     // validate session job
@@ -758,7 +722,7 @@ public class DefaultValidator implements FlinkResourceValidator {
             return Optional.of("The deploymentName can't be changed");
         }
 
-        return validateRedeploy(lastReconciledSpec.getJob(), sessionJob.getSpec().getJob());
+        return RedeployRequest.validate(lastReconciledSpec.getJob(), sessionJob.getSpec().getJob());
     }
 
     private Optional<String> validateServiceAccount(String serviceAccount) {

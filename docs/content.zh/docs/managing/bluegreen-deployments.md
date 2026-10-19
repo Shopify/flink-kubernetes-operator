@@ -135,7 +135,7 @@ Not every spec change causes a transition. The controller compares the desired t
 | `redeploy.nonce` (or the deprecated `savepointRedeployNonce`) changed                                                                                                                         | A full transition that starts the new deployment from the requested state instead of taking a new savepoint      |
 | Any other template change                                                                                                                                                                     | A full blue/green transition                                                                                     |
 
-Changes that arrive while a transition is already running are applied to the incoming deployment, so the transition completes directly with the newest spec. The one exception is suspending: a `job.state: suspended` request during a transition is deferred until the transition completes, and the then-active deployment is suspended afterwards.
+Changes that arrive while a transition is already running are applied to the incoming deployment, so the transition completes directly with the newest spec. A new redeploy nonce also replaces the incoming child's restore target, including before that child's first deployment. Blank redeploy paths and simultaneous changes to both redeploy triggers are rejected without consuming the request. If the active child is not ready, a redeploy remains pending rather than being silently consumed. The one exception is suspending: a `job.state: suspended` request during a transition is deferred until the transition completes, and the then-active deployment is suspended afterwards.
 
 ## Kubernetes Resources
 

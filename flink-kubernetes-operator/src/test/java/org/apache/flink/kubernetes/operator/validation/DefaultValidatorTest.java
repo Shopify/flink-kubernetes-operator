@@ -724,7 +724,6 @@ public class DefaultValidatorTest {
     }
 
     @Test
-    @SuppressWarnings("deprecation")
     public void testRedeployValidation() {
         // Stateless redeploy
         testSuccess(
@@ -787,7 +786,6 @@ public class DefaultValidatorTest {
     }
 
     @Test
-    @SuppressWarnings("deprecation")
     public void testSessionJobRedeployValidation() {
         testSessionJobValidateWithModifier(
                 sessionJob -> {

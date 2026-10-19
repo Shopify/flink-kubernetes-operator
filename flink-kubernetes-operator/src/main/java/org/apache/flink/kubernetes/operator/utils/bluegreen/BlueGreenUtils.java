@@ -27,6 +27,7 @@ import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDeploymentTyp
 import org.apache.flink.kubernetes.operator.api.bluegreen.BlueGreenDiffType;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentSpec;
 import org.apache.flink.kubernetes.operator.api.spec.IngressSpec;
+import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
 import org.apache.flink.kubernetes.operator.api.spec.KubernetesDeploymentMode;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentStatus;
@@ -98,20 +99,35 @@ public class BlueGreenUtils {
      * @return the requested redeploy, or empty if the spec change does not request one
      */
     public static Optional<RedeployRequest> getRedeployRequest(BlueGreenContext context) {
-        FlinkBlueGreenDeploymentSpec lastSpec =
-                SpecUtils.readSpecFromJSON(
-                        context.getDeploymentStatus().getLastReconciledSpec(),
-                        "spec",
-                        FlinkBlueGreenDeploymentSpec.class);
         return RedeployRequest.resolve(
-                lastSpec.getTemplate().getSpec().getJob(),
+                getLastReconciledJob(context),
                 context.getBgDeployment().getSpec().getTemplate().getSpec().getJob());
+    }
+
+    public static Optional<String> getRedeployValidationError(BlueGreenContext context) {
+        return RedeployRequest.validate(
+                getLastReconciledJob(context),
+                context.getBgDeployment().getSpec().getTemplate().getSpec().getJob());
+    }
+
+    @Nullable
+    private static JobSpec getLastReconciledJob(BlueGreenContext context) {
+        var lastSpecJson = context.getDeploymentStatus().getLastReconciledSpec();
+        if (lastSpecJson == null) {
+            return null;
+        }
+        return SpecUtils.readSpecFromJSON(lastSpecJson, "spec", FlinkBlueGreenDeploymentSpec.class)
+                .getTemplate()
+                .getSpec()
+                .getJob();
     }
 
     public static void setLastReconciledSpec(BlueGreenContext context) {
         FlinkBlueGreenDeploymentStatus deploymentStatus = context.getDeploymentStatus();
-        deploymentStatus.setLastReconciledSpec(
-                SpecUtils.writeSpecAsJSON(context.getBgDeployment().getSpec(), "spec"));
+        var spec = SpecUtils.clone(context.getBgDeployment().getSpec());
+        RedeployRequest.preserveConsumedNonces(
+                getLastReconciledJob(context), spec.getTemplate().getSpec().getJob());
+        deploymentStatus.setLastReconciledSpec(SpecUtils.writeSpecAsJSON(spec, "spec"));
         deploymentStatus.setLastReconciledTimestamp(Instant.now().toString());
     }
 
@@ -361,21 +377,9 @@ public class BlueGreenUtils {
                         FlinkBlueGreenDeploymentSpec.class);
 
         // Determine which savepoint/checkpoint to restore from:
-        // 1. First-time deployments: use initialSavepointPath from spec (if set)
-        // 2. Redeploys: use the savepoint of the redeploy request, or no state
-        // 3. Normal transitions: use lastCheckpoint from previous deployment
-        // 4. Otherwise (lastCheckpoint is null, e.g. upgradeMode is STATELESS): use
-        //    initialSavepointPath from spec
-        if (isFirstDeployment) {
-            String initialSavepointPath =
-                    spec.getTemplate().getSpec().getJob().getInitialSavepointPath();
-            if (initialSavepointPath != null && !initialSavepointPath.isEmpty()) {
-                LOG.info("Using initialSavepointPath: " + initialSavepointPath);
-                spec.getTemplate().getSpec().getJob().setInitialSavepointPath(initialSavepointPath);
-            } else {
-                LOG.info("Clean startup with no checkpoint/savepoint restoration");
-            }
-        } else if (redeploy != null) {
+        // Explicit requests also apply when patching a child before its first reconciliation.
+        // A parent's first deployment passes no request and uses initialSavepointPath as before.
+        if (redeploy != null) {
             if (redeploy.getSavepointPath() != null) {
                 LOG.info("Redeploying from savepoint: {}", redeploy.getSavepointPath());
             } else {
@@ -385,6 +389,25 @@ public class BlueGreenUtils {
                     .getSpec()
                     .getJob()
                     .setInitialSavepointPath(redeploy.getSavepointPath());
+        } else if (context.getDeployments() != null
+                && context.getDeploymentByType(blueGreenDeploymentType) != null) {
+            // A patch must preserve an existing child's operation target, including empty state.
+            var childJob = context.getDeploymentByType(blueGreenDeploymentType).getSpec().getJob();
+            spec.getTemplate()
+                    .getSpec()
+                    .getJob()
+                    .setInitialSavepointPath(
+                            lastCheckpoint == null
+                                    ? childJob.getInitialSavepointPath()
+                                    : lastCheckpoint.getLocation().replace("file:", ""));
+        } else if (isFirstDeployment) {
+            String initialSavepointPath =
+                    spec.getTemplate().getSpec().getJob().getInitialSavepointPath();
+            if (initialSavepointPath != null && !initialSavepointPath.isEmpty()) {
+                LOG.info("Using initialSavepointPath: {}", initialSavepointPath);
+            } else {
+                LOG.info("Clean startup with no checkpoint/savepoint restoration");
+            }
         } else if (lastCheckpoint != null) {
             String location = lastCheckpoint.getLocation().replace("file:", "");
             LOG.info("Using Blue/Green savepoint/checkpoint: " + location);

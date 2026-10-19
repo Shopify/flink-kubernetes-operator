@@ -20,12 +20,17 @@ package org.apache.flink.kubernetes.operator.api.utils;
 
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentSpec;
+import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
+import org.apache.flink.kubernetes.operator.api.spec.RedeploySpec;
+import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import org.junit.jupiter.api.Test;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
@@ -33,6 +38,31 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 
 /** Test for {@link SpecUtils}. */
 class SpecUtilsTest {
+
+    @Test
+    void testRedeploySerializationAndOlderOperatorCompatibility() throws Exception {
+        var app = BaseTestUtils.buildApplicationCluster();
+        app.getSpec().getJob().setUpgradeMode(UpgradeMode.SAVEPOINT);
+        app.getSpec()
+                .getJob()
+                .setRedeploy(
+                        RedeploySpec.builder().nonce(7L).savepointPath("requested-sp").build());
+        var json = SpecUtils.writeSpecWithMeta(app.getSpec(), app);
+        var restored = SpecUtils.deserializeSpecWithMeta(json, FlinkDeploymentSpec.class);
+        assertThat(restored.getSpec()).isEqualTo(app.getSpec());
+        // An older JobSpec ignores this unknown field and drops it when rewriting status.
+        var olderMapper = new ObjectMapper().addMixIn(JobSpec.class, JobSpecWithoutRedeploy.class);
+        var olderJob =
+                olderMapper.readValue(
+                        new ObjectMapper().writeValueAsString(app.getSpec().getJob()),
+                        JobSpec.class);
+        assertThat(olderJob.getRedeploy()).isNull();
+        assertThat(olderJob.getUpgradeMode()).isEqualTo(UpgradeMode.SAVEPOINT);
+        assertThat(olderMapper.writeValueAsString(olderJob)).doesNotContain("redeploy");
+    }
+
+    @JsonIgnoreProperties("redeploy")
+    private abstract static class JobSpecWithoutRedeploy {}
 
     @Test
     void testCloneProducesDeepCopy() {

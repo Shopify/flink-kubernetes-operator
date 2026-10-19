@@ -131,6 +131,9 @@ public class ReflectiveDiffBuilder<T> implements Builder<DiffResult<T>> {
                                         .build());
                     } else if (Diffable.class.isAssignableFrom(field.getType())
                             && field.isAnnotationPresent(SpecDiff.NullAsEmpty.class)) {
+                        if (leftField == null && rightField == null) {
+                            continue;
+                        }
                         diffBuilder.append(
                                 field.getName(),
                                 new ReflectiveDiffBuilder<T>(

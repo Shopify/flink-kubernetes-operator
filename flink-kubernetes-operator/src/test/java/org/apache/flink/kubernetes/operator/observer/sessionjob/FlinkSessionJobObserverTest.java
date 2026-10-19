@@ -28,6 +28,8 @@ import org.apache.flink.kubernetes.operator.TestUtils;
 import org.apache.flink.kubernetes.operator.api.FlinkSessionJob;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkSessionJobSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobState;
+import org.apache.flink.kubernetes.operator.api.spec.RedeploySpec;
+import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.api.status.FlinkSessionJobStatus;
 import org.apache.flink.kubernetes.operator.api.status.ReconciliationState;
 import org.apache.flink.kubernetes.operator.api.status.SnapshotTriggerType;
@@ -44,10 +46,14 @@ import lombok.Getter;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.Map;
+import java.util.stream.Stream;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -70,6 +76,65 @@ public class FlinkSessionJobObserverTest extends OperatorTestBase {
                         this,
                         new SessionJobReconciler(
                                 eventRecorder, statusRecorder, new NoopJobAutoscaler<>()));
+    }
+
+    private static Stream<Arguments> redeployScenarios() {
+        return Stream.of(UpgradeMode.values())
+                .flatMap(
+                        mode ->
+                                Stream.of(
+                                        Arguments.of(mode, null, false),
+                                                Arguments.of(mode, "requested-sp", false),
+                                        Arguments.of(mode, null, true),
+                                                Arguments.of(mode, "requested-sp", true)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("redeployScenarios")
+    public void testRedeployCancellationObservedBeforeReplacement(
+            UpgradeMode mode, String path, boolean suspended) throws Exception {
+        var job = TestUtils.buildSessionJob();
+        job.getSpec().getJob().setUpgradeMode(mode);
+        var ready = TestUtils.createContextWithReadyFlinkDeployment(kubernetesClient);
+        reconciler.reconcile(job, ready);
+        observer.observe(job, ready);
+        var oldId = job.getStatus().getJobStatus().getJobId();
+        job.getSpec()
+                .getJob()
+                .setRedeploy(RedeploySpec.builder().nonce(1L).savepointPath(path).build());
+        if (suspended) {
+            job.getSpec().getJob().setState(JobState.SUSPENDED);
+        }
+        reconciler.reconcile(job, ready);
+        reconciler.reconcile(job, ready);
+        assertThat(flinkService.listJobs()).hasSize(1);
+        assertThat(flinkService.getCancelJobCallCount()).isEqualTo(1);
+        assertThat(
+                        flinkResourceEventCollector.events.stream()
+                                .filter(event -> event.getMessage().startsWith("Redeploying job")))
+                .hasSize(1);
+        observer.observe(job, ready);
+        var status = job.getStatus().getReconciliationStatus();
+        assertThat(job.getStatus().getJobStatus().getState()).isEqualTo(JobStatus.CANCELED);
+        assertThat(status.deserializeLastReconciledSpec().getJob().getState())
+                .isEqualTo(JobState.SUSPENDED);
+        assertThat(status.deserializeLastReconciledSpec().getJob().getRedeploy()).isNull();
+        assertThat(status.getState())
+                .isEqualTo(
+                        suspended ? ReconciliationState.DEPLOYED : ReconciliationState.UPGRADING);
+        reconciler.reconcile(job, ready);
+        if (suspended) {
+            assertThat(flinkService.listJobs()).hasSize(1);
+            job.getSpec().getJob().setState(JobState.RUNNING);
+            reconciler.reconcile(job, ready);
+        }
+        assertThat(flinkService.listJobs()).hasSize(2);
+        assertThat(flinkService.listJobs().get(1).f0).isEqualTo(path);
+        assertThat(job.getStatus().getJobStatus().getJobId()).isNotEqualTo(oldId);
+        assertThat(job.getSpec().getJob().getUpgradeMode()).isEqualTo(mode);
+        assertThat(status.isLastReconciledSpecStable()).isTrue();
+        observer.observe(job, ready);
+        assertThat(job.getStatus().getJobStatus().getState()).isEqualTo(JobStatus.RUNNING);
     }
 
     @Test

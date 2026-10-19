@@ -140,7 +140,6 @@ public class BlueGreenDeploymentService {
                     context.getDeploymentByType(currentBlueGreenDeploymentType);
 
             if (specDiff == BlueGreenDiffType.SUSPEND && currentFlinkDeployment != null) {
-                setLastReconciledSpec(context);
                 LOG.info(
                         "In-place suspension for '{}'",
                         currentFlinkDeployment.getMetadata().getName());
@@ -148,7 +147,6 @@ public class BlueGreenDeploymentService {
             }
 
             if (specDiff == BlueGreenDiffType.RESUME && currentFlinkDeployment != null) {
-                setLastReconciledSpec(context);
                 LOG.info(
                         "In-place resume for '{}'", currentFlinkDeployment.getMetadata().getName());
                 return patchFlinkDeployment(context, currentBlueGreenDeploymentType);
@@ -156,7 +154,6 @@ public class BlueGreenDeploymentService {
 
             // Check if child is currently suspended - if so, just patch specs without restart
             if (isChildSuspended(currentFlinkDeployment)) {
-                setLastReconciledSpec(context);
                 LOG.info(
                         "Spec change while suspended for '{}'",
                         currentFlinkDeployment.getMetadata().getName());
@@ -205,10 +202,12 @@ public class BlueGreenDeploymentService {
                             "Redeploy triggered for '{}', using savepoint: {}",
                             context.getBgDeployment().getMetadata().getName(),
                             Objects.toString(redeploy.getSavepointPath(), "<none>"));
-                    setLastReconciledSpec(context);
                     try {
-                        return startSavepointRedeployTransition(
-                                context, currentBlueGreenDeploymentType, redeploy);
+                        var result =
+                                startSavepointRedeployTransition(
+                                        context, currentBlueGreenDeploymentType, redeploy);
+                        setLastReconciledSpec(context);
+                        return result;
                     } catch (Exception e) {
                         var error =
                                 "Could not start Savepoint Redeploy Transition. Details: "
@@ -216,7 +215,6 @@ public class BlueGreenDeploymentService {
                         return markDeploymentFailing(context, error);
                     }
                 } else {
-                    setLastReconciledSpec(context);
                     LOG.info(
                             "Patching FlinkDeployment '{}' during checkAndInitiateDeployment",
                             currentFlinkDeployment.getMetadata().getName());
@@ -224,7 +222,10 @@ public class BlueGreenDeploymentService {
                 }
             } else {
                 if (context.getDeploymentStatus().getJobStatus().getState() != JobStatus.FAILING) {
-                    setLastReconciledSpec(context);
+                    // A one-shot operation must remain pending until it can actually start.
+                    if (specDiff != BlueGreenDiffType.SAVEPOINT_REDEPLOY) {
+                        setLastReconciledSpec(context);
+                    }
                     var childName =
                             currentFlinkDeployment != null
                                     ? currentFlinkDeployment.getMetadata().getName()
@@ -256,13 +257,14 @@ public class BlueGreenDeploymentService {
 
     private UpdateControl<FlinkBlueGreenDeployment> patchFlinkDeployment(
             BlueGreenContext context, BlueGreenDeploymentType blueGreenDeploymentTypeToPatch) {
-        return patchFlinkDeployment(context, blueGreenDeploymentTypeToPatch, true);
+        return patchFlinkDeployment(
+                context, blueGreenDeploymentTypeToPatch, getRedeployRequest(context).orElse(null));
     }
 
     private UpdateControl<FlinkBlueGreenDeployment> patchFlinkDeployment(
             BlueGreenContext context,
             BlueGreenDeploymentType blueGreenDeploymentTypeToPatch,
-            boolean carryOverSavepointInPatch) {
+            @Nullable RedeployRequest redeploy) {
 
         String childDeploymentName =
                 context.getBgDeployment().getMetadata().getName()
@@ -281,17 +283,21 @@ public class BlueGreenDeploymentService {
         //  will it be used by this patching? otherwise this is unnecessary, keep lastSavepoint =
         // null.
         Savepoint lastSavepoint =
-                carryOverSavepointInPatch
+                redeploy == null
                         ? carryOverSavepoint(
                                 context, blueGreenDeploymentTypeToPatch, childDeploymentName)
                         : null;
 
-        return initiateDeployment(
-                context,
-                blueGreenDeploymentTypeToPatch,
-                patchingState,
-                lastSavepoint,
-                isFirstDeployment);
+        var result =
+                initiateDeployment(
+                        context,
+                        blueGreenDeploymentTypeToPatch,
+                        patchingState,
+                        lastSavepoint,
+                        isFirstDeployment,
+                        redeploy);
+        setLastReconciledSpec(context);
+        return result;
     }
 
     @Nullable
@@ -300,6 +306,11 @@ public class BlueGreenDeploymentService {
             BlueGreenDeploymentType blueGreenDeploymentTypeToPatch,
             String childDeploymentName) {
         var deploymentToPatch = context.getDeploymentByType(blueGreenDeploymentTypeToPatch);
+        if (deploymentToPatch.getStatus().getReconciliationStatus().isBeforeFirstDeployment()) {
+            // There is no observed snapshot yet. prepareFlinkDeployment preserves this
+            // child's current initial path directly, including an explicit empty target.
+            return null;
+        }
         var initialSavepointPath = deploymentToPatch.getSpec().getJob().getInitialSavepointPath();
 
         if (initialSavepointPath == null || initialSavepointPath.isEmpty()) {
@@ -556,7 +567,6 @@ public class BlueGreenDeploymentService {
             }
 
             if (diffType != BlueGreenDiffType.IGNORE) {
-                setLastReconciledSpec(context);
                 var oppositeDeploymentType =
                         context.getOppositeDeploymentType(currentBlueGreenDeploymentType);
                 LOG.info(
@@ -565,9 +575,7 @@ public class BlueGreenDeploymentService {
                                 .getMetadata()
                                 .getName());
                 return patchFlinkDeployment(
-                        context,
-                        oppositeDeploymentType,
-                        diffType != BlueGreenDiffType.SAVEPOINT_REDEPLOY);
+                        context, oppositeDeploymentType, getRedeployRequest(context).orElse(null));
             }
         }
 

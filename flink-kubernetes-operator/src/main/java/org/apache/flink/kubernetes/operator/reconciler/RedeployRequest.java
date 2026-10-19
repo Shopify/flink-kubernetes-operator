@@ -19,13 +19,18 @@
 package org.apache.flink.kubernetes.operator.reconciler;
 
 import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
+import org.apache.flink.kubernetes.operator.api.spec.JobState;
 import org.apache.flink.kubernetes.operator.api.spec.RedeploySpec;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
+import org.apache.flink.kubernetes.operator.api.status.CommonStatus;
+import org.apache.flink.kubernetes.operator.api.utils.SpecUtils;
+import org.apache.flink.util.StringUtils;
 
 import lombok.Value;
 
 import javax.annotation.Nullable;
 
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -72,11 +77,99 @@ public class RedeployRequest {
         return Optional.empty();
     }
 
+    /**
+     * Validates the redeploy triggers of a job spec change.
+     *
+     * @param oldJob Last reconciled job spec.
+     * @param newJob New job spec.
+     * @return Optional error string.
+     */
+    public static Optional<String> validate(@Nullable JobSpec oldJob, @Nullable JobSpec newJob) {
+        if (oldJob == null || newJob == null) {
+            return Optional.empty();
+        }
+
+        boolean redeploy = isRedeployNonceChanged(oldJob, newJob);
+        boolean legacyRedeploy = isLegacyNonceChanged(oldJob, newJob);
+
+        if (redeploy && legacyRedeploy) {
+            return Optional.of(
+                    "Cannot change redeploy.nonce and the deprecated savepointRedeployNonce at the same time");
+        }
+
+        if (redeploy) {
+            var savepointPath = newJob.getRedeploy().getSavepointPath();
+            if (savepointPath != null && savepointPath.isBlank()) {
+                return Optional.of(
+                        "redeploy.savepointPath must not be blank, leave it unset to redeploy without state");
+            }
+        }
+
+        if (legacyRedeploy
+                && StringUtils.isNullOrWhitespaceOnly(newJob.getInitialSavepointPath())) {
+            return Optional.of("InitialSavepointPath must not be empty for savepoint redeployment");
+        }
+
+        return Optional.empty();
+    }
+
+    /** Preserves consumed triggers when an ordinary update clears them. */
+    public static void preserveConsumedNonces(@Nullable JobSpec reconciled, JobSpec desired) {
+        if (reconciled == null || desired == null) {
+            return;
+        }
+        if (nonce(desired.getRedeploy()) == null) {
+            desired.setRedeploy(SpecUtils.clone(reconciled.getRedeploy()));
+        }
+        if (desired.getSavepointRedeployNonce() == null) {
+            desired.setSavepointRedeployNonce(reconciled.getSavepointRedeployNonce());
+        }
+    }
+
+    /** Whether recorded operation intent still needs to be confirmed after submission. */
+    public static boolean isPendingRedeploy(CommonStatus<?> status) {
+        var reconciliation = status.getReconciliationStatus();
+        var recorded = reconciliation.deserializeLastReconciledSpecWithMeta();
+        if (recorded == null || recorded.getMeta() == null) {
+            return false;
+        }
+        var job = recorded.getSpec().getJob();
+        if (job == null
+                || (nonce(job.getRedeploy()) == null && job.getSavepointRedeployNonce() == null)) {
+            return false;
+        }
+        var path = status.getJobStatus().getUpgradeSavepointPath();
+        var block = job.getRedeploy();
+        boolean targetMatches =
+                block != null
+                                && block.getNonce() != null
+                                && job.getUpgradeMode()
+                                        == new RedeployRequest(block.getSavepointPath(), false)
+                                                .getRestoreMode()
+                                && Objects.equals(block.getSavepointPath(), path)
+                        || job.getSavepointRedeployNonce() != null
+                                && job.getUpgradeMode() == UpgradeMode.SAVEPOINT
+                                && job.getInitialSavepointPath() != null
+                                && Objects.equals(job.getInitialSavepointPath(), path);
+        var stable = reconciliation.deserializeLastStableSpec();
+        if (!targetMatches) {
+            return false;
+        }
+        if (stable == null) {
+            // An explicit restore must survive failures even before the first stable job.
+            // Do not treat a retained empty-state block as proof that an ordinary fix is stable.
+            return path != null && !recorded.getMeta().isFirstDeployment();
+        }
+        return stable.getJob() != null
+                && (stable.getJob().getState() == JobState.SUSPENDED
+                        || isRedeployNonceChanged(stable.getJob(), job)
+                        || isLegacyNonceChanged(stable.getJob(), job));
+    }
+
     public static boolean isRedeployNonceChanged(JobSpec reconciled, JobSpec desired) {
         return nonceChanged(nonce(reconciled.getRedeploy()), nonce(desired.getRedeploy()));
     }
 
-    @SuppressWarnings("deprecation")
     public static boolean isLegacyNonceChanged(JobSpec reconciled, JobSpec desired) {
         return nonceChanged(
                 reconciled.getSavepointRedeployNonce(), desired.getSavepointRedeployNonce());

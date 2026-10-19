@@ -31,6 +31,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.Optional;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /** Tests for {@link RedeployRequest}. */
@@ -66,7 +67,6 @@ public class RedeployRequestTest {
     }
 
     @Test
-    @SuppressWarnings("deprecation")
     public void testLegacySavepointRedeployNonce() {
         var reconciled = spec();
         reconciled.getJob().setInitialSavepointPath("s3://initial");
@@ -81,7 +81,6 @@ public class RedeployRequestTest {
     }
 
     @Test
-    @SuppressWarnings("deprecation")
     public void testRedeployNonceTakesPrecedence() {
         var reconciled = spec();
         var desired = SpecUtils.clone(reconciled);
@@ -95,6 +94,38 @@ public class RedeployRequestTest {
     public void testNoJob() {
         assertEquals(Optional.empty(), RedeployRequest.resolve(null, spec().getJob()));
         assertEquals(Optional.empty(), RedeployRequest.resolve(spec().getJob(), null));
+    }
+
+    @Test
+    public void testDowngradeReplayAndRemovingBlockBeforeDowngrade() {
+        var desired = spec();
+        desired.getJob().setRedeploy(RedeploySpec.builder().nonce(7L).build());
+        var recorded = SpecUtils.clone(desired);
+        assertThat(RedeployRequest.resolve(recorded.getJob(), desired.getJob())).isEmpty();
+        // Simulate an older operator dropping the unknown block when it rewrites status.
+        recorded.getJob().setRedeploy(null);
+        assertThat(RedeployRequest.resolve(recorded.getJob(), desired.getJob()))
+                .contains(new RedeployRequest(null, false));
+        desired.getJob().setRedeploy(null);
+        assertThat(RedeployRequest.resolve(recorded.getJob(), desired.getJob())).isEmpty();
+    }
+
+    @Test
+    public void testOrdinaryUpdatesPreserveConsumedTriggers() {
+        var recorded = spec().getJob();
+        recorded.setRedeploy(RedeploySpec.builder().nonce(7L).savepointPath("recorded-sp").build());
+        recorded.setSavepointRedeployNonce(3L);
+        var desired = spec().getJob();
+        RedeployRequest.preserveConsumedNonces(recorded, desired);
+        assertThat(desired.getRedeploy())
+                .isEqualTo(recorded.getRedeploy())
+                .isNotSameAs(recorded.getRedeploy());
+        assertThat(desired.getSavepointRedeployNonce()).isEqualTo(3L);
+        desired.setRedeploy(RedeploySpec.builder().nonce(8L).build());
+        RedeployRequest.preserveConsumedNonces(recorded, desired);
+        assertThat(desired.getRedeploy().getNonce()).isEqualTo(8L);
+        assertThat(RedeployRequest.resolve(recorded, desired))
+                .contains(new RedeployRequest(null, false));
     }
 
     private static FlinkDeploymentSpec spec() {

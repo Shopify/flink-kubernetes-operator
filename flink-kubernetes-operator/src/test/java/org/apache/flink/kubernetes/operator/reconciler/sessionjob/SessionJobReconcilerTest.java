@@ -1229,11 +1229,60 @@ public class SessionJobReconcilerTest extends OperatorTestBase {
     }
 
     @Test
+    public void testSavepointRedeployRecoversFromFailedDeployment() throws Exception {
+        var readyCtx = TestUtils.createContextWithReadyFlinkDeployment(kubernetesClient);
+        FlinkSessionJob sessionJob = TestUtils.buildSessionJob();
+
+        reconciler.reconcile(sessionJob, readyCtx);
+        verifyAndSetRunningJobsToStatus(
+                sessionJob, JobState.RUNNING, RECONCILING, null, flinkService.listJobs());
+
+        sessionJob.getSpec().getJob().setInitialSavepointPath("s3://bucket/savepoint-explicit");
+        sessionJob.getSpec().getJob().setSavepointRedeployNonce(1L);
+
+        // Wait for the old job before exercising the failed deployment attempt.
+        reconciler.reconcile(sessionJob, readyCtx);
+        assertEquals(CANCELLING, sessionJob.getStatus().getJobStatus().getState());
+        sessionJob.getStatus().getJobStatus().setState(CANCELED);
+        ReconciliationUtils.updateLastReconciledSpec(
+                sessionJob, (spec, meta) -> spec.getJob().setState(JobState.SUSPENDED));
+        flinkService.setDeployFailure(true);
+        assertThrows(Exception.class, () -> reconciler.reconcile(sessionJob, readyCtx));
+        statusRecorder.updateStatusFromCache(sessionJob);
+
+        // The target spec must be recorded before the deployment attempt, otherwise the next
+        // reconciliation would detect the savepointRedeployNonce change again and repeat the
+        // cancel + redeploy cycle forever
+        var status = sessionJob.getStatus();
+        assertEquals(ReconciliationState.UPGRADING, status.getReconciliationStatus().getState());
+        var lastReconciledJob =
+                status.getReconciliationStatus().deserializeLastReconciledSpec().getJob();
+        assertEquals(1L, lastReconciledJob.getSavepointRedeployNonce());
+        assertEquals(JobState.SUSPENDED, lastReconciledJob.getState());
+        assertEquals(UpgradeMode.SAVEPOINT, lastReconciledJob.getUpgradeMode());
+        assertEquals(
+                "s3://bucket/savepoint-explicit", status.getJobStatus().getUpgradeSavepointPath());
+
+        // The next reconciliation restores from the recorded savepoint
+        flinkService.setDeployFailure(false);
+        reconciler.reconcile(sessionJob, readyCtx);
+        assertEquals(
+                "s3://bucket/savepoint-explicit",
+                verifyAndReturnTheSubmittedJob(sessionJob, flinkService.listJobs()).f0);
+        assertEquals(ReconciliationState.DEPLOYED, status.getReconciliationStatus().getState());
+        lastReconciledJob =
+                status.getReconciliationStatus().deserializeLastReconciledSpec().getJob();
+        assertEquals(1L, lastReconciledJob.getSavepointRedeployNonce());
+        assertEquals(JobState.RUNNING, lastReconciledJob.getState());
+        // Like a redeploy that succeeds on the first attempt, a retried one cannot be rolled back
+        assertTrue(status.getReconciliationStatus().isLastReconciledSpecStable());
+    }
+
+    @Test
     public void testSavepointRedeployWaitsForCancellation() throws Exception {
         var readyCtx = TestUtils.createContextWithReadyFlinkDeployment(kubernetesClient);
         FlinkSessionJob sessionJob = TestUtils.buildSessionJob();
         sessionJob.getSpec().getJob().setUpgradeMode(UpgradeMode.SAVEPOINT);
-
         reconciler.reconcile(sessionJob, readyCtx);
         verifyAndSetRunningJobsToStatus(
                 sessionJob, JobState.RUNNING, RECONCILING, null, flinkService.listJobs());

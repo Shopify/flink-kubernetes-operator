@@ -201,12 +201,20 @@ public abstract class AbstractJobReconciler<
         }
 
         if (currentJobState == JobState.SUSPENDED && desiredJobState == JobState.RUNNING) {
-            // We inherit the upgrade mode unless stateless upgrade requested. An upgrade that is
-            // already in progress always completes with the restore mode it was recorded with,
-            // so a retried deployment attempt cannot lose the state it was meant to restore.
-            boolean upgrading =
-                    status.getReconciliationStatus().getState() == ReconciliationState.UPGRADING;
-            if (upgrading || currentDeploySpec.getJob().getUpgradeMode() != UpgradeMode.STATELESS) {
+            // Explicit redeploy targets override the steady-state mode, including after a failed
+            // submission. Ordinary upgrades retain the stateless escape hatch.
+            boolean restoreFromRedeploy = restoringFromRedeploy(resource, lastReconciledSpec);
+            if (restoreFromRedeploy) {
+                // Path edits and clearing the block are not new operations. Keep the recorded
+                // target in the retry spec even if this deployment attempt fails again.
+                currentDeploySpec.getJob().setRedeploy(lastReconciledSpec.getJob().getRedeploy());
+                currentDeploySpec
+                        .getJob()
+                        .setInitialSavepointPath(
+                                lastReconciledSpec.getJob().getInitialSavepointPath());
+            }
+            if (currentDeploySpec.getJob().getUpgradeMode() != UpgradeMode.STATELESS
+                    || restoreFromRedeploy) {
                 currentDeploySpec
                         .getJob()
                         .setUpgradeMode(lastReconciledSpec.getJob().getUpgradeMode());
@@ -223,8 +231,40 @@ public abstract class AbstractJobReconciler<
                     lastReconciledSpec.getJob().getUpgradeMode() == UpgradeMode.LAST_STATE);
 
             ReconciliationUtils.updateStatusForDeployedSpec(resource, deployConfig, clock);
+            if (restoreFromRedeploy) {
+                // Redeploys cannot be rolled back, regardless of their completion path.
+                resource.getStatus().getReconciliationStatus().markReconciledSpecAsStable();
+            }
         }
         return true;
+    }
+
+    /**
+     * Checks whether the suspended job is to be restored from the savepoint the user explicitly
+     * requested through initialSavepointPath, recorded as the upgrade savepoint by a savepoint
+     * redeploy or the first deployment. Such a savepoint is honoured even for stateless specs,
+     * otherwise a savepoint redeploy requested while suspended, or one whose deployment attempt
+     * failed, would be replaced by an empty state restore.
+     *
+     * <p>The check reads initialSavepointPath from the last reconciled spec, not the current one.
+     * initialSavepointPath is ignored by the spec diff, so editing or clearing it without a new
+     * savepointRedeployNonce is not a new operation and must not change which savepoint the
+     * recorded redeploy restores from.
+     */
+    private boolean restoringFromInitialSavepoint(CR resource, SPEC lastReconciledSpec) {
+        var initialSavepointPath = lastReconciledSpec.getJob().getInitialSavepointPath();
+        return initialSavepointPath != null
+                && lastReconciledSpec.getJob().getUpgradeMode() == UpgradeMode.SAVEPOINT
+                && initialSavepointPath.equals(
+                        resource.getStatus().getJobStatus().getUpgradeSavepointPath());
+    }
+
+    /** Identifies an explicit recorded redeploy, not a later ordinary upgrade of the same job. */
+    private boolean restoringFromRedeploy(CR resource, SPEC lastReconciledSpec) {
+        if (restoringFromInitialSavepoint(resource, lastReconciledSpec)) {
+            return true;
+        }
+        return RedeployRequest.isPendingRedeploy(resource.getStatus());
     }
 
     protected JobUpgrade getJobUpgrade(FlinkResourceContext<CR> ctx, Configuration deployConfig)
@@ -650,7 +690,7 @@ public abstract class AbstractJobReconciler<
                 request.getSavepointPath() == null
                         ? MSG_REDEPLOY_STATELESS
                         : String.format(MSG_REDEPLOY_FROM_SAVEPOINT, request.getSavepointPath());
-        LOG.info(message);
+        LOG.info("{}", message);
         // The redeploy is retried until the job is gone, only report it once per spec generation
         eventRecorder.triggerEventOnce(
                 resource,

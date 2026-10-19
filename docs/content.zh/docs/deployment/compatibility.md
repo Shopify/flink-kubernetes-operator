@@ -47,6 +47,8 @@ There is no guarantee that new resources can always be deployed using old API ve
 For example, when the API moves from `v1beta1` to `v1`, current jobs are guaranteed to keep running, but submitting new resources may require upgrading them to `v1`.
 {{< /hint >}}
 
+The optional `job.redeploy` field requires updated CRDs and an operator version supporting it. Remove redeploy blocks before allowing an older operator version to reconcile the resources, including on rollback or during mixed-version deployments: older status rewrites can forget consumed nonces and cause replay on a subsequent upgrade. Follow the [operator upgrade guidance]({{< ref "docs/operations/upgrade#before-upgrading" >}}).
+
 ### Resource Status Contents
 
 Currently, the `FlinkDeployment`, `FlinkSessionJob`, `FlinkStateSnapshot`, and `FlinkBlueGreenDeployment` resources carry very detailed status information, containing everything the operator needs to manage them.

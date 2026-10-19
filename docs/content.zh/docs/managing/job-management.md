@@ -270,19 +270,29 @@ job:
     savepointPath: s3://bucket/savepoints/savepoint-123
 ```
 
-When `redeploy.nonce` changes to a new non-null value, the operator cancels the job without taking a savepoint, removes the HA metadata of an application cluster, and deploys the job again from `redeploy.savepointPath`, or from empty state if no path is set. Discarding the state only means that the operator forgets the checkpoints and savepoints of the previous job for restores, no savepoint files or `FlinkStateSnapshot` resources are deleted. The redeployment takes the rest of the spec as it is, so it can be combined with other spec changes. If the job is suspended, the redeployment is recorded and the job is restored from the requested state when resumed, unless it uses the `stateless` upgrade mode, which always resumes from empty state.
+When `redeploy.nonce` changes to a new non-null value, the operator cancels the job without taking a savepoint, removes the HA metadata of an application cluster, and deploys the job again from `redeploy.savepointPath`, or from empty state if no path is set. An empty-state redeploy deliberately starts without restoring the previous job's state. It does not dispose savepoint files or delete `FlinkStateSnapshot` resources, but Flink may remove checkpoints on cancellation depending on checkpoint-retention settings. Take a savepoint first if you need a recovery point, or set `redeploy.savepointPath` explicitly. The redeployment takes the rest of the spec as it is, so it can be combined with other spec changes. If the job is [suspended](#suspending-and-resuming), the redeployment is recorded without starting the job. On resume, the job starts from the requested savepoint, or from empty state if no path was set, regardless of its `upgradeMode`. The desired `upgradeMode` still governs subsequent ordinary upgrades.
 
-- Only a change of `redeploy.nonce` triggers a redeployment: changing `redeploy.savepointPath` alone, clearing the nonce or removing the `redeploy` block has no effect.
+- Only a change of `redeploy.nonce` triggers a redeployment: changing `redeploy.savepointPath` alone, clearing the nonce or removing the `redeploy` block does not trigger a new operation. These edits do not change the target of a recorded redeployment or undo cancellation already started.
 - A redeployment is never triggered by the first deployment of a resource, which always starts from `initialSavepointPath`.
 - The autoscaler state is not reset by a redeployment, change `spec.job.autoscalerResetNonce` together with the redeploy nonce to reset it as well.
-- A redeployment requested while an operator version without this feature is running is executed once the operator is upgraded. Conversely, remove the `redeploy` block before downgrading the operator to such a version, otherwise the redeployment is executed again after the next operator upgrade.
+- Consumed nonces are retained in the recorded spec when later ordinary updates remove them, so restoring the same nonce does not replay the operation while this operator version is running. A different non-null nonce, including an older value, is a new request.
+- If submission fails temporarily, the operator retries the recorded restore target. To abandon an unusable target and start fresh, change the nonce again and omit `savepointPath`, rather than changing `upgradeMode`.
+- While asynchronous cancellation is pending, the nonce has not yet been consumed and the latest request is re-evaluated. After it has been recorded, edits without a new nonce cannot change its target.
+- The first-deployment exception also applies to a blue/green first deployment that was aborted before becoming active: correct `initialSavepointPath` for that initial deployment rather than bumping the redeploy nonce.
+- A redeployment requested while an operator version without this feature is running is executed once the operator is upgraded.
+
+{{< hint warning >}}
+Before downgrading to an operator version without `job.redeploy` support, complete any in-flight redeployments and remove the `redeploy` blocks from both the live resources and their source manifests (including GitOps configuration). Removing a completed block does not restart the job.
+
+An older operator can drop the consumed nonce when rewriting its recorded spec. If the block remains, upgrading the operator again can replay the operation. With no `savepointPath`, that replay discards the job's current state. Install the updated CRDs before using this feature; older CRDs can prune the new field.
+{{< /hint >}}
 
 {{< hint warning >}}
 Rollbacks are not supported after redeployments.
 {{< /hint >}}
 
 {{< hint info >}}
-The `spec.job.savepointRedeployNonce` field is deprecated. Changing it redeploys the job from `spec.job.initialSavepointPath`, which must not be empty, same as a change of `redeploy.nonce` with `redeploy.savepointPath` set to that path. This is now also validated for `FlinkSessionJob` resources, which previously silently redeployed without state when the path was missing, use `redeploy.nonce` without a `redeploy.savepointPath` for that. To migrate, remove `savepointRedeployNonce` and set `redeploy.nonce` and `redeploy.savepointPath` instead, both fields must not be changed in the same update. Using the deprecated field raises a Warning event on the resource.
+The `spec.job.savepointRedeployNonce` field is deprecated. Changing it redeploys the job from `spec.job.initialSavepointPath`, which must not be empty, same as a change of `redeploy.nonce` with `redeploy.savepointPath` set to that path. This is now also validated for `FlinkSessionJob` resources, which previously silently redeployed without state when the path was missing, use `redeploy.nonce` without a `redeploy.savepointPath` for that. For the next intentional redeployment, clear `savepointRedeployNonce` and set `redeploy.nonce` and `redeploy.savepointPath` instead. Setting the new nonce triggers a redeployment; it is not a metadata-only rename. Bumping both nonces in the same update is rejected. Using the deprecated field raises a Warning event on a `FlinkDeployment` or `FlinkSessionJob` resource.
 {{< /hint >}}
 
 ### Deleting and Recreating the Resource

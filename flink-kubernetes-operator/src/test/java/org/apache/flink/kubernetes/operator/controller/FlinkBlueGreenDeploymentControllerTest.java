@@ -53,9 +53,11 @@ import io.javaoperatorsdk.operator.api.reconciler.Context;
 import io.javaoperatorsdk.operator.api.reconciler.UpdateControl;
 import org.jetbrains.annotations.NotNull;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -75,6 +77,7 @@ import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConf
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.BLUEGREEN_DEPLOYMENT_DELETION_DELAY;
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.BLUEGREEN_RECONCILIATION_RESCHEDULING_INTERVAL;
 import static org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils.instantStrToMillis;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -336,6 +339,228 @@ public class FlinkBlueGreenDeploymentControllerTest {
         assertTrue(child.getMetadata().getName().endsWith("-blue"));
         assertEquals(JobState.SUSPENDED, child.getSpec().getJob().getState());
         assertEquals(7L, child.getSpec().getJob().getRedeploy().getNonce());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "s3://bucket/new-request"})
+    public void verifyRedeployDuringTransitionUsesRequestedState(String path) throws Exception {
+        var requestedPath = path.isEmpty() ? null : path;
+        var bg =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        FlinkVersion.v1_20,
+                        "s3://bucket/original-initial",
+                        UpgradeMode.SAVEPOINT);
+        var rs = executeBasicDeployment(FlinkVersion.v1_20, bg, false, null);
+        rs.deployment.getSpec().getConfiguration().put(BLUEGREEN_ABORT_GRACE_PERIOD.key(), "1m");
+        rs.deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getJob()
+                .setRedeploy(
+                        RedeploySpec.builder()
+                                .nonce(1L)
+                                .savepointPath("s3://bucket/first-request")
+                                .build());
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        assertThat(rs.reconciledStatus.getBlueGreenState())
+                .isEqualTo(FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN);
+        var green =
+                getFlinkDeployments().stream()
+                        .filter(d -> d.getMetadata().getName().endsWith("-green"))
+                        .findFirst()
+                        .orElseThrow();
+        assertThat(green.getStatus().getReconciliationStatus().getLastReconciledSpec()).isNull();
+        assertThat(green.getSpec().getJob().getInitialSavepointPath())
+                .isEqualTo("s3://bucket/first-request");
+        rs.deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getJob()
+                .setRedeploy(RedeploySpec.builder().nonce(2L).savepointPath(requestedPath).build());
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        green =
+                getFlinkDeployments().stream()
+                        .filter(d -> d.getMetadata().getName().endsWith("-green"))
+                        .findFirst()
+                        .orElseThrow();
+        assertThat(green.getSpec().getJob().getRedeploy().getNonce()).isEqualTo(2L);
+        assertThat(green.getSpec().getJob().getInitialSavepointPath()).isEqualTo(requestedPath);
+        // A later ordinary patch must not undo the already consumed restore target.
+        rs.deployment.getSpec().getTemplate().getSpec().setImage("fixed-image");
+        rs.deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getJob()
+                .getRedeploy()
+                .setSavepointPath("ignored-edit");
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        green = getFlinkDeploymentByName(green.getMetadata().getName());
+        assertThat(green.getSpec().getJob().getInitialSavepointPath()).isEqualTo(requestedPath);
+        var recorded = rs.reconciledStatus.getLastReconciledSpec();
+        var job = rs.deployment.getSpec().getTemplate().getSpec().getJob();
+        job.setRedeploy(RedeploySpec.builder().nonce(3L).savepointPath(" ").build());
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        assertThat(rs.reconciledStatus.getError()).contains("must not be blank");
+        assertThat(rs.reconciledStatus.getLastReconciledSpec()).isEqualTo(recorded);
+        assertThat(rs.updateControl.getScheduleDelay()).isPresent();
+        assertThat(
+                        getFlinkDeploymentByName(green.getMetadata().getName())
+                                .getSpec()
+                                .getJob()
+                                .getInitialSavepointPath())
+                .isEqualTo(requestedPath);
+        rs.deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getJob()
+                .setRedeploy(RedeploySpec.builder().nonce(2L).savepointPath(requestedPath).build());
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        assertThat(rs.reconciledStatus.getError()).isNull();
+        assertThat(rs.updateControl.getScheduleDelay()).isPresent();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "s3://bucket/requested"})
+    public void verifyRedeployDuringSingleChildInitializationUsesRequestedState(String path)
+            throws Exception {
+        var requestedPath = path.isEmpty() ? null : path;
+        var bg =
+                buildSessionCluster(
+                        TEST_DEPLOYMENT_NAME,
+                        TEST_NAMESPACE,
+                        FlinkVersion.v1_20,
+                        "s3://bucket/original-initial",
+                        UpgradeMode.STATELESS);
+        var rs = initialPhaseBasicDeployment(bg, false);
+        var job = rs.deployment.getSpec().getTemplate().getSpec().getJob();
+        job.setRedeploy(RedeploySpec.builder().nonce(1L).savepointPath(requestedPath).build());
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        assertThat(getFlinkDeployments()).hasSize(1);
+        assertThat(getFlinkDeployments().get(0).getSpec().getJob().getInitialSavepointPath())
+                .isEqualTo(requestedPath);
+        rs.deployment.getSpec().getTemplate().getSpec().setImage("fixed-image");
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        assertThat(getFlinkDeployments().get(0).getSpec().getJob().getInitialSavepointPath())
+                .isEqualTo(requestedPath);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", " ", "\n"})
+    public void verifyBlankRedeployPathIsRejectedWithoutConsumingNonce(String path)
+            throws Exception {
+        var rs = setupActiveBlueDeployment(FlinkVersion.v1_20);
+        var lastSpec = rs.reconciledStatus.getLastReconciledSpec();
+        rs.deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getJob()
+                .setRedeploy(RedeploySpec.builder().nonce(1L).savepointPath(path).build());
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        assertThat(rs.reconciledStatus.getError())
+                .contains("redeploy.savepointPath must not be blank");
+        assertThat(rs.reconciledStatus.getJobStatus().getState()).isEqualTo(JobStatus.RUNNING);
+        assertThat(rs.reconciledStatus.getLastReconciledSpec()).isEqualTo(lastSpec);
+        assertThat(getFlinkDeployments()).hasSize(1);
+        rs.deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getJob()
+                .getRedeploy()
+                .setSavepointPath(null);
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        assertThat(getFlinkDeployments()).hasSize(2);
+        assertThat(rs.reconciledStatus.getBlueGreenState())
+                .isEqualTo(FlinkBlueGreenDeploymentState.TRANSITIONING_TO_GREEN);
+    }
+
+    @Test
+    public void verifyRejectedRedeployRevertClearsValidationError() throws Exception {
+        var rs = setupActiveBlueDeployment(FlinkVersion.v1_20);
+        rs.deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getJob()
+                .setRedeploy(RedeploySpec.builder().nonce(1L).savepointPath(" ").build());
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        assertThat(rs.reconciledStatus.getError()).contains("must not be blank");
+        rs.deployment.getSpec().getTemplate().getSpec().getJob().setRedeploy(null);
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        assertThat(rs.reconciledStatus.getError()).isNull();
+        assertThat(rs.reconciledStatus.getJobStatus().getState()).isEqualTo(JobStatus.RUNNING);
+        assertThat(getFlinkDeployments()).hasSize(1);
+    }
+
+    @Test
+    public void verifyBothRedeployTriggersAreRejected() throws Exception {
+        var rs = setupActiveBlueDeployment(FlinkVersion.v1_20);
+        var lastSpec = rs.reconciledStatus.getLastReconciledSpec();
+        var job = rs.deployment.getSpec().getTemplate().getSpec().getJob();
+        job.setSavepointRedeployNonce(1L);
+        job.setRedeploy(RedeploySpec.builder().nonce(1L).build());
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        assertThat(rs.reconciledStatus.getError()).contains("Cannot change redeploy.nonce");
+        assertThat(rs.reconciledStatus.getLastReconciledSpec()).isEqualTo(lastSpec);
+        assertThat(getFlinkDeployments()).hasSize(1);
+    }
+
+    @Test
+    public void verifyRedeployWaitsForReadyChildWithoutConsumingNonce() throws Exception {
+        var rs = setupActiveBlueDeployment(FlinkVersion.v1_20);
+        var blue = getFlinkDeployments().get(0);
+        blue.getStatus().getJobStatus().setState(JobStatus.FAILED);
+        kubernetesClient.resource(blue).createOrReplace();
+        var lastSpec = rs.reconciledStatus.getLastReconciledSpec();
+        rs.deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getJob()
+                .setRedeploy(RedeploySpec.builder().nonce(1L).build());
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        assertThat(rs.reconciledStatus.getLastReconciledSpec()).isEqualTo(lastSpec);
+        assertThat(getFlinkDeployments()).hasSize(1);
+        var failure = rs.reconciledStatus.getError();
+        var job = rs.deployment.getSpec().getTemplate().getSpec().getJob();
+        job.getRedeploy().setSavepointPath(" ");
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        assertThat(rs.reconciledStatus.getError()).isEqualTo(failure);
+        assertThat(rs.reconciledStatus.getJobStatus().getState()).isEqualTo(JobStatus.FAILING);
+        rs.deployment
+                .getSpec()
+                .getTemplate()
+                .getSpec()
+                .getJob()
+                .getRedeploy()
+                .setSavepointPath(null);
+        kubernetesClient.resource(rs.deployment).createOrReplace();
+        rs = reconcile(rs.deployment);
+        assertThat(rs.reconciledStatus.getError()).isEqualTo(failure);
+        simulateSuccessfulJobStart(getFlinkDeployments().get(0));
+        rs = reconcile(rs.deployment);
+        assertThat(getFlinkDeployments()).hasSize(2);
     }
 
     @ParameterizedTest
