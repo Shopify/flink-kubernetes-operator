@@ -46,6 +46,7 @@ import org.apache.flink.kubernetes.operator.api.spec.JobReference;
 import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobState;
 import org.apache.flink.kubernetes.operator.api.spec.KubernetesDeploymentMode;
+import org.apache.flink.kubernetes.operator.api.spec.RedeploySpec;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.api.status.Checkpoint;
 import org.apache.flink.kubernetes.operator.api.status.CheckpointInfo;
@@ -67,12 +68,15 @@ import org.apache.flink.kubernetes.operator.exception.UpgradeFailureException;
 import org.apache.flink.kubernetes.operator.health.ClusterHealthInfo;
 import org.apache.flink.kubernetes.operator.observer.ClusterHealthEvaluator;
 import org.apache.flink.kubernetes.operator.observer.ClusterHealthResult;
+import org.apache.flink.kubernetes.operator.observer.TestObserverAdapter;
+import org.apache.flink.kubernetes.operator.observer.deployment.ApplicationObserver;
 import org.apache.flink.kubernetes.operator.reconciler.ReconciliationUtils;
 import org.apache.flink.kubernetes.operator.reconciler.SnapshotType;
 import org.apache.flink.kubernetes.operator.reconciler.TestReconcilerAdapter;
 import org.apache.flink.kubernetes.operator.service.NativeFlinkService;
 import org.apache.flink.kubernetes.operator.service.SuspendMode;
 import org.apache.flink.kubernetes.operator.utils.EventRecorder;
+import org.apache.flink.kubernetes.operator.utils.FlinkUtils;
 import org.apache.flink.kubernetes.operator.utils.SnapshotStatus;
 import org.apache.flink.kubernetes.operator.utils.SnapshotUtils;
 import org.apache.flink.runtime.client.JobStatusMessage;
@@ -96,6 +100,8 @@ import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.junit.platform.commons.util.StringUtils;
+
+import javax.annotation.Nullable;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -136,6 +142,7 @@ import static org.apache.flink.kubernetes.operator.reconciler.deployment.Applica
 import static org.apache.flink.kubernetes.operator.reconciler.deployment.ApplicationReconciler.MSG_RECOVERY;
 import static org.apache.flink.kubernetes.operator.utils.SnapshotUtils.getLastSnapshotStatus;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -1682,6 +1689,82 @@ public class ApplicationReconcilerTest extends OperatorTestBase {
         assertTrue(status.getReconciliationStatus().isLastReconciledSpecStable());
     }
 
+    @ParameterizedTest
+    @EnumSource(UpgradeMode.class)
+    public void testRedeploy(UpgradeMode upgradeMode) throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        deployment.getSpec().getJob().setUpgradeMode(upgradeMode);
+        deployment.getSpec().getJob().setInitialSavepointPath("initial-sp");
+
+        reconciler.reconcile(deployment, context);
+        var runningJobs = flinkService.listJobs();
+        verifyAndSetRunningJobsToStatus(deployment, runningJobs, "initial-sp");
+
+        // Stateless redeploy of a running job
+        verifyRedeploy(deployment, runningJobs, null);
+
+        // Redeploy from savepoint
+        deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+        verifyRedeploy(deployment, runningJobs, "sp-1");
+
+        // Stateless redeploy of a suspended job, resumed without state
+        deployment.getSpec().getJob().setState(JobState.SUSPENDED);
+        verifyRedeploy(deployment, runningJobs, null);
+        deployment.getSpec().getJob().setState(JobState.RUNNING);
+        reconciler.reconcile(deployment, context);
+        assertEquals(1, runningJobs.size());
+        assertNull(runningJobs.get(0).f0);
+
+        // Redeploy from savepoint of a suspended job, resumed from the savepoint
+        deployment.getSpec().getJob().setState(JobState.SUSPENDED);
+        verifyRedeploy(deployment, runningJobs, "sp-2");
+        deployment.getSpec().getJob().setState(JobState.RUNNING);
+        reconciler.reconcile(deployment, context);
+        assertEquals(1, runningJobs.size());
+        assertEquals("sp-2", runningJobs.get(0).f0);
+    }
+
+    private void verifyRedeploy(
+            FlinkDeployment deployment,
+            List<Tuple3<String, JobStatusMessage, Configuration>> runningJobs,
+            @Nullable String savepoint)
+            throws Exception {
+        // Known state of the current job, which must be discarded by the redeploy
+        var jobStatus = deployment.getStatus().getJobStatus();
+        jobStatus.setUpgradeSavepointPath("previous-sp");
+        jobStatus
+                .getSavepointInfo()
+                .updateLastSavepoint(Savepoint.of("previous-sp", SnapshotTriggerType.PERIODIC));
+
+        var job = deployment.getSpec().getJob();
+        var nonce = job.getRedeploy() == null ? 0L : job.getRedeploy().getNonce();
+        job.setRedeploy(RedeploySpec.builder().nonce(nonce + 1).savepointPath(savepoint).build());
+        reconciler.reconcile(deployment, context);
+
+        var status = deployment.getStatus();
+        if (job.getState() == JobState.RUNNING) {
+            assertEquals(1, runningJobs.size());
+            assertEquals(savepoint, runningJobs.get(0).f0);
+            assertEquals(
+                    JobManagerDeploymentStatus.DEPLOYING, status.getJobManagerDeploymentStatus());
+        } else {
+            assertTrue(runningJobs.isEmpty());
+            assertEquals(
+                    JobManagerDeploymentStatus.MISSING, status.getJobManagerDeploymentStatus());
+        }
+
+        assertEquals(savepoint, status.getJobStatus().getUpgradeSavepointPath());
+        assertNull(status.getJobStatus().getSavepointInfo().getLastSavepoint());
+        var reconciledJob =
+                status.getReconciliationStatus().deserializeLastReconciledSpec().getJob();
+        assertEquals(
+                savepoint == null ? UpgradeMode.STATELESS : UpgradeMode.SAVEPOINT,
+                reconciledJob.getUpgradeMode());
+        assertEquals(job.getRedeploy(), reconciledJob.getRedeploy());
+        assertEquals(ReconciliationState.DEPLOYED, status.getReconciliationStatus().getState());
+        assertTrue(status.getReconciliationStatus().isLastReconciledSpecStable());
+    }
+
     @Test
     public void testSavepointRedeployRetryIsNotRolledBack() throws Exception {
         var deployment = TestUtils.buildApplicationCluster();
@@ -1768,6 +1851,391 @@ public class ApplicationReconcilerTest extends OperatorTestBase {
         reconciler.reconcile(deployment, context);
         assertEquals(1, runningJobs.size());
         assertEquals("sp-t1", runningJobs.get(0).f0);
+    }
+
+    @Test
+    public void testStatelessRedeployIsNotRestoredOnFailure() throws Exception {
+        var conf = configManager.getDefaultConfig();
+        conf.set(KubernetesOperatorConfigOptions.OPERATOR_JOB_RESTART_FAILED, true);
+        configManager.updateDefaultConfig(conf);
+
+        var deployment = TestUtils.buildApplicationCluster();
+        deployment.getSpec().getJob().setUpgradeMode(UpgradeMode.SAVEPOINT);
+        reconciler.reconcile(deployment, context);
+        var runningJobs = flinkService.listJobs();
+        verifyAndSetRunningJobsToStatus(deployment, runningJobs);
+
+        verifyRedeploy(deployment, runningJobs, null);
+        // Observe the new job running, keeping the rest of the job status (savepoint info) as is
+        var jobStatus = deployment.getStatus().getJobStatus();
+        jobStatus.setJobId(runningJobs.get(0).f1.getJobId().toHexString());
+        jobStatus.setState(RUNNING);
+        deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+
+        // The new job fails before its first checkpoint, the previous state must not be used
+        jobStatus.setState(org.apache.flink.api.common.JobStatus.FAILED);
+        reconciler.reconcile(deployment, context);
+        assertEquals(1, runningJobs.size());
+        assertNull(runningJobs.get(0).f0);
+        assertNull(jobStatus.getUpgradeSavepointPath());
+    }
+
+    @ParameterizedTest
+    @EnumSource(UpgradeMode.class)
+    public void testRedeployRetryAfterDeploymentFailure(UpgradeMode upgradeMode) throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        deployment.getSpec().getJob().setUpgradeMode(upgradeMode);
+        reconciler.reconcile(deployment, context);
+        var runningJobs = flinkService.listJobs();
+        verifyAndSetRunningJobsToStatus(deployment, runningJobs);
+
+        deployment
+                .getSpec()
+                .getJob()
+                .setRedeploy(RedeploySpec.builder().nonce(1L).savepointPath("sp").build());
+        flinkService.setDeployFailure(true);
+        assertThrows(Exception.class, () -> reconciler.reconcile(deployment, context));
+        assertTrue(runningJobs.isEmpty());
+
+        // The redeploy is recorded before the deployment attempt
+        var status = deployment.getStatus();
+        assertEquals(ReconciliationState.UPGRADING, status.getReconciliationStatus().getState());
+        assertEquals("sp", status.getJobStatus().getUpgradeSavepointPath());
+        assertThat(
+                        status.getReconciliationStatus()
+                                .deserializeLastReconciledSpecWithMeta()
+                                .getMeta()
+                                .isFirstDeployment())
+                .isFalse();
+        var recorded = status.getReconciliationStatus().getLastReconciledSpec();
+        new TestObserverAdapter<>(this, new ApplicationObserver(eventRecorder))
+                .observe(deployment, TestUtils.createEmptyContext());
+        assertThat(status.getReconciliationStatus().getLastReconciledSpec()).isEqualTo(recorded);
+
+        // The retry restores the requested state, not the last-state of the previous job and not
+        // from empty state for stateless jobs: the in-flight upgrade completes as recorded
+        flinkService.setDeployFailure(false);
+        reconciler.reconcile(deployment, context);
+        assertEquals(1, runningJobs.size());
+        assertEquals("sp", runningJobs.get(0).f0);
+        assertEquals(ReconciliationState.DEPLOYED, status.getReconciliationStatus().getState());
+        assertEquals(
+                UpgradeMode.SAVEPOINT,
+                status.getReconciliationStatus()
+                        .deserializeLastReconciledSpec()
+                        .getJob()
+                        .getUpgradeMode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    public void testFirstDeploymentIgnoresRedeployBlock(boolean initiallySuspended)
+            throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        var job = deployment.getSpec().getJob();
+        job.setInitialSavepointPath("initial-sp");
+        job.setRedeploy(
+                RedeploySpec.builder().nonce(1L).savepointPath("ignored-redeploy-sp").build());
+        if (initiallySuspended) {
+            job.setState(JobState.SUSPENDED);
+            reconciler.reconcile(deployment, context);
+            assertThat(flinkService.listJobs()).isEmpty();
+            job.setState(JobState.RUNNING);
+        }
+        reconciler.reconcile(deployment, context);
+        var jobs = flinkService.listJobs();
+        assertThat(jobs).hasSize(1);
+        assertThat(jobs.get(0).f0).isEqualTo("initial-sp");
+        verifyAndSetRunningJobsToStatus(deployment, jobs, "initial-sp");
+        reconciler.reconcile(deployment, context);
+        assertThat(flinkService.getCancelJobCallCount()).isZero();
+        assertThat(jobs).hasSize(1);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "ignored-initial-request"})
+    public void testRetainedFirstDeploymentBlockDoesNotStabilizeOrdinaryUpgrade(String path)
+            throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        deployment.getSpec().getJob().setUpgradeMode(UpgradeMode.STATELESS);
+        deployment
+                .getSpec()
+                .getJob()
+                .setRedeploy(
+                        RedeploySpec.builder()
+                                .nonce(7L)
+                                .savepointPath(path.isEmpty() ? null : path)
+                                .build());
+        reconciler.reconcile(deployment, context);
+        assertThat(deployment.getStatus().getReconciliationStatus().getLastStableSpec()).isNull();
+        deployment.getSpec().setImage("ordinary-fix-before-stable");
+        reconciler.reconcile(deployment, context);
+        reconciler.reconcile(deployment, context);
+        var reconciliation = deployment.getStatus().getReconciliationStatus();
+        assertThat(reconciliation.deserializeLastReconciledSpec().getImage())
+                .isEqualTo("ordinary-fix-before-stable");
+        assertThat(reconciliation.getLastStableSpec()).isNull();
+    }
+
+    private static Stream<Arguments> redeployModesAndPaths() {
+        return Stream.of(UpgradeMode.values())
+                .flatMap(mode -> Stream.of(arguments(mode, null), arguments(mode, "requested-sp")));
+    }
+
+    @ParameterizedTest
+    @MethodSource("redeployModesAndPaths")
+    public void testRedeployRetryCannotRollBack(UpgradeMode mode, String path) throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        deployment.getSpec().getJob().setUpgradeMode(mode);
+        deployment
+                .getSpec()
+                .getFlinkConfiguration()
+                .putAllFrom(
+                        Map.of(
+                                KubernetesOperatorConfigOptions.DEPLOYMENT_ROLLBACK_ENABLED.key(),
+                                        "true",
+                                KubernetesOperatorConfigOptions.DEPLOYMENT_READINESS_TIMEOUT.key(),
+                                        "10s"));
+        offsetReconcilerClock(deployment, Duration.ZERO);
+        reconciler.reconcile(deployment, context);
+        var jobs = flinkService.listJobs();
+        verifyAndSetRunningJobsToStatus(deployment, jobs);
+        deployment.getStatus().getReconciliationStatus().markReconciledSpecAsStable();
+        deployment
+                .getSpec()
+                .getJob()
+                .setRedeploy(RedeploySpec.builder().nonce(1L).savepointPath(path).build());
+        flinkService.setDeployFailure(true);
+        assertThatThrownBy(() -> reconciler.reconcile(deployment, context))
+                .isInstanceOf(Exception.class);
+        statusRecorder.updateStatusFromCache(deployment);
+        flinkService.setDeployFailure(false);
+        reconciler.reconcile(deployment, context);
+        assertThat(jobs).hasSize(1);
+        assertThat(jobs.get(0).f0).isEqualTo(path);
+        assertThat(deployment.getStatus().getReconciliationStatus().isLastReconciledSpecStable())
+                .isTrue();
+        flinkService.setHaDataAvailable(true);
+        flinkService.setJobManagerReady(true);
+        offsetReconcilerClock(deployment, Duration.ofSeconds(15));
+        reconciler.reconcile(deployment, context);
+        assertThat(deployment.getStatus().getReconciliationStatus().getState())
+                .isEqualTo(ReconciliationState.DEPLOYED);
+        assertThat(deployment.getSpec().getJob().getUpgradeMode()).isEqualTo(mode);
+    }
+
+    @ParameterizedTest
+    @MethodSource("redeployModesAndPaths")
+    public void testObserverCompletedRedeployCannotRollBack(UpgradeMode mode, String path)
+            throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        deployment.getMetadata().setGeneration(1L);
+        deployment.getSpec().getJob().setUpgradeMode(mode);
+        deployment
+                .getSpec()
+                .getFlinkConfiguration()
+                .putAllFrom(
+                        Map.of(
+                                KubernetesOperatorConfigOptions.DEPLOYMENT_ROLLBACK_ENABLED.key(),
+                                        "true",
+                                KubernetesOperatorConfigOptions.DEPLOYMENT_READINESS_TIMEOUT.key(),
+                                        "10s"));
+        offsetReconcilerClock(deployment, Duration.ZERO);
+        reconciler.reconcile(deployment, context);
+        verifyAndSetRunningJobsToStatus(deployment, flinkService.listJobs());
+        var status = deployment.getStatus();
+        status.getReconciliationStatus().markReconciledSpecAsStable();
+        deployment
+                .getSpec()
+                .getJob()
+                .setRedeploy(RedeploySpec.builder().nonce(1L).savepointPath(path).build());
+        flinkService.setDeployFailure(true);
+        assertThatThrownBy(() -> reconciler.reconcile(deployment, context))
+                .isInstanceOf(Exception.class);
+        statusRecorder.updateStatusFromCache(deployment);
+        status = deployment.getStatus();
+        flinkService.setDeployFailure(false);
+        // Simulate submission succeeding after the persisted pre-deploy patch, but losing
+        // the final status patch. The generation annotation is the observer's evidence.
+        var kubernetesDeployment = TestUtils.createDeployment(true);
+        kubernetesDeployment
+                .getMetadata()
+                .setAnnotations(
+                        Map.of(
+                                FlinkUtils.CR_GENERATION_LABEL,
+                                deployment.getMetadata().getGeneration().toString()));
+        status.setJobManagerDeploymentStatus(JobManagerDeploymentStatus.MISSING);
+        new TestObserverAdapter<>(this, new ApplicationObserver(eventRecorder))
+                .observe(
+                        deployment,
+                        TestUtils.createContextWithDeployment(
+                                kubernetesDeployment, kubernetesClient));
+        assertThat(status.getReconciliationStatus().getState())
+                .isEqualTo(ReconciliationState.DEPLOYED);
+        assertThat(status.getReconciliationStatus().isLastReconciledSpecStable()).isTrue();
+        flinkService.setHaDataAvailable(true);
+        offsetReconcilerClock(deployment, Duration.ofSeconds(15));
+        reconciler.reconcile(deployment, context);
+        assertThat(status.getReconciliationStatus().getState())
+                .isEqualTo(ReconciliationState.DEPLOYED);
+    }
+
+    @Test
+    public void testRemovedRedeployNonceIsNotReplayedAfterOrdinaryUpgrade() throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        deployment.getSpec().getJob().setUpgradeMode(UpgradeMode.STATELESS);
+        reconciler.reconcile(deployment, context);
+        var jobs = flinkService.listJobs();
+        verifyAndSetRunningJobsToStatus(deployment, jobs);
+        verifyRedeploy(deployment, jobs, null);
+        var consumed = deployment.getSpec().getJob().getRedeploy();
+        verifyAndSetRunningJobsToStatus(deployment, jobs);
+        deployment.getSpec().getJob().setRedeploy(null);
+        deployment.getSpec().setImage("ordinary-upgrade");
+        reconciler.reconcile(deployment, context);
+        reconciler.reconcile(deployment, context);
+        verifyAndSetRunningJobsToStatus(deployment, jobs);
+        var jobId = deployment.getStatus().getJobStatus().getJobId();
+        deployment.getSpec().getJob().setRedeploy(consumed);
+        reconciler.reconcile(deployment, context);
+        assertThat(deployment.getStatus().getJobStatus().getJobId()).isEqualTo(jobId);
+    }
+
+    @ParameterizedTest
+    @MethodSource("redeployModesAndPaths")
+    public void testSuspendedRedeployKeepsRecordedTargetAcrossResumeFailure(
+            UpgradeMode mode, String path) throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        var job = deployment.getSpec().getJob();
+        job.setUpgradeMode(mode);
+        reconciler.reconcile(deployment, context);
+        var jobs = flinkService.listJobs();
+        verifyAndSetRunningJobsToStatus(deployment, jobs);
+        job.setState(JobState.SUSPENDED);
+        reconciler.reconcile(deployment, context);
+        job.setRedeploy(RedeploySpec.builder().nonce(1L).savepointPath(path).build());
+        reconciler.reconcile(deployment, context);
+        assertThat(jobs).isEmpty();
+        // An ignored path edit must not reinterpret the already recorded operation.
+        job.getRedeploy().setSavepointPath("ignored-path-edit");
+        job.setState(JobState.RUNNING);
+        flinkService.setDeployFailure(true);
+        assertThatThrownBy(() -> reconciler.reconcile(deployment, context))
+                .isInstanceOf(Exception.class);
+        statusRecorder.updateStatusFromCache(deployment);
+        job.setRedeploy(null);
+        flinkService.setDeployFailure(false);
+        reconciler.reconcile(deployment, context);
+        assertThat(jobs).hasSize(1);
+        assertThat(jobs.get(0).f0).isEqualTo(path);
+        assertThat(job.getUpgradeMode()).isEqualTo(mode);
+        assertThat(deployment.getStatus().getReconciliationStatus().isLastReconciledSpecStable())
+                .isTrue();
+    }
+
+    @ParameterizedTest
+    @EnumSource(
+            value = UpgradeMode.class,
+            names = {"SAVEPOINT", "LAST_STATE"})
+    public void testNormalUpgradeAfterEmptyRedeployUsesSteadyStateMode(UpgradeMode mode)
+            throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        deployment.getSpec().getJob().setUpgradeMode(mode);
+        reconciler.reconcile(deployment, context);
+        var jobs = flinkService.listJobs();
+        verifyAndSetRunningJobsToStatus(deployment, jobs);
+        verifyRedeploy(deployment, jobs, null);
+        verifyAndSetRunningJobsToStatus(deployment, jobs);
+        deployment.getStatus().setJobManagerDeploymentStatus(JobManagerDeploymentStatus.READY);
+        deployment.getSpec().setImage("upgraded-image");
+        reconciler.reconcile(deployment, context);
+        reconciler.reconcile(deployment, context);
+        assertThat(
+                        deployment
+                                .getStatus()
+                                .getReconciliationStatus()
+                                .deserializeLastReconciledSpec()
+                                .getJob()
+                                .getUpgradeMode())
+                .isEqualTo(mode);
+        assertThat(deployment.getSpec().getJob().getUpgradeMode()).isEqualTo(mode);
+        if (mode == UpgradeMode.SAVEPOINT) {
+            assertThat(jobs.get(0).f0).startsWith("savepoint_");
+        }
+    }
+
+    @Test
+    public void testOrdinaryUpgradeRetryCanStillBeMadeStateless() throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        deployment.getSpec().getJob().setUpgradeMode(UpgradeMode.SAVEPOINT);
+        reconciler.reconcile(deployment, context);
+        var jobs = flinkService.listJobs();
+        verifyAndSetRunningJobsToStatus(deployment, jobs);
+        deployment.getSpec().setImage("upgraded-image");
+        reconciler.reconcile(deployment, context);
+        flinkService.setDeployFailure(true);
+        assertThatThrownBy(() -> reconciler.reconcile(deployment, context))
+                .isInstanceOf(Exception.class);
+        statusRecorder.updateStatusFromCache(deployment);
+        deployment.getSpec().getJob().setUpgradeMode(UpgradeMode.STATELESS);
+        flinkService.setDeployFailure(false);
+        reconciler.reconcile(deployment, context);
+        assertThat(jobs).hasSize(1);
+        assertThat(jobs.get(0).f0).isNull();
+    }
+
+    @Test
+    public void testRedeployDuringRollbackUsesRequestedState() throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        deployment.getSpec().getJob().setUpgradeMode(UpgradeMode.SAVEPOINT);
+        reconciler.reconcile(deployment, context);
+        verifyAndSetRunningJobsToStatus(deployment, flinkService.listJobs());
+        deployment.getStatus().getReconciliationStatus().markReconciledSpecAsStable();
+        deployment.getStatus().getReconciliationStatus().setState(ReconciliationState.ROLLING_BACK);
+        deployment.getStatus().getJobStatus().setUpgradeSavepointPath("unwanted-old-state");
+        deployment
+                .getSpec()
+                .getJob()
+                .setRedeploy(
+                        RedeploySpec.builder().nonce(1L).savepointPath("requested-sp").build());
+        // In a real rollback the previous cluster has already been removed.
+        flinkService.clear();
+        reconciler.reconcile(deployment, context);
+        assertThat(flinkService.listJobs()).hasSize(1);
+        assertThat(flinkService.listJobs().get(0).f0).isEqualTo("requested-sp");
+        assertThat(deployment.getStatus().getReconciliationStatus().isLastReconciledSpecStable())
+                .isTrue();
+    }
+
+    @Test
+    public void testEmptyRedeployDeletesHaMetadataWithoutDisposingSavepoints() throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        deployment.getSpec().getJob().setUpgradeMode(UpgradeMode.LAST_STATE);
+        reconciler.reconcile(deployment, context);
+        var jobs = flinkService.listJobs();
+        verifyAndSetRunningJobsToStatus(deployment, jobs);
+        var metadata =
+                new io.fabric8.kubernetes.api.model.ConfigMapBuilder()
+                        .withNewMetadata()
+                        .withName("redeploy-ha")
+                        .withNamespace(deployment.getMetadata().getNamespace())
+                        .addToLabels("app", deployment.getMetadata().getName())
+                        .addToLabels("type", "flink-native-kubernetes")
+                        .addToLabels("component", "high-availability")
+                        .endMetadata()
+                        .addToData("state", "old-ha-state")
+                        .build();
+        kubernetesClient.resource(metadata).create();
+        verifyRedeploy(deployment, jobs, null);
+        assertThat(kubernetesClient.resource(metadata).get()).isNull();
+        assertThat(
+                        flinkService
+                                .getSubmittedConf()
+                                .get(
+                                        org.apache.flink.runtime.jobgraph.SavepointConfigOptions
+                                                .SAVEPOINT_PATH))
+                .isNull();
+        assertThat(flinkService.getDisposedSavepoints()).isEmpty();
     }
 
     private void verifySavepointRedeploy(

@@ -28,10 +28,12 @@ import org.apache.flink.kubernetes.operator.api.FlinkSessionJob;
 import org.apache.flink.kubernetes.operator.api.lifecycle.ResourceLifecycleState;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkSessionJobSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobState;
+import org.apache.flink.kubernetes.operator.api.spec.RedeploySpec;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
 import org.apache.flink.kubernetes.operator.api.status.FlinkSessionJobStatus;
 import org.apache.flink.kubernetes.operator.api.status.JobStatus;
 import org.apache.flink.kubernetes.operator.api.status.ReconciliationState;
+import org.apache.flink.kubernetes.operator.api.status.Savepoint;
 import org.apache.flink.kubernetes.operator.api.status.SnapshotTriggerType;
 import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
@@ -1126,6 +1128,104 @@ public class SessionJobReconcilerTest extends OperatorTestBase {
         assertEquals(
                 "s3://bucket/savepoint-explicit",
                 verifyAndReturnTheSubmittedJob(sessionJob, flinkService.listJobs()).f0);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "s3://bucket/redeploy-sp"})
+    public void testRedeployWaitsForCancellation(String savepointPath) throws Exception {
+        var requestedSavepoint = savepointPath.isEmpty() ? null : savepointPath;
+        var readyCtx = TestUtils.createContextWithReadyFlinkDeployment(kubernetesClient);
+        FlinkSessionJob sessionJob = TestUtils.buildSessionJob();
+        sessionJob.getSpec().getJob().setUpgradeMode(UpgradeMode.SAVEPOINT);
+
+        reconciler.reconcile(sessionJob, readyCtx);
+        verifyAndSetRunningJobsToStatus(
+                sessionJob, JobState.RUNNING, RECONCILING, null, flinkService.listJobs());
+        var oldJobId = sessionJob.getStatus().getJobStatus().getJobId();
+        sessionJob
+                .getStatus()
+                .getJobStatus()
+                .getSavepointInfo()
+                .updateLastSavepoint(Savepoint.of("previous-sp", SnapshotTriggerType.PERIODIC));
+
+        // Redeploy, the cancellation completes asynchronously
+        sessionJob
+                .getSpec()
+                .getJob()
+                .setRedeploy(
+                        RedeploySpec.builder().nonce(1L).savepointPath(requestedSavepoint).build());
+        reconciler.reconcile(sessionJob, readyCtx);
+        assertEquals(CANCELLING, sessionJob.getStatus().getJobStatus().getState());
+        assertEquals(1, flinkService.listJobs().size());
+        assertNull(getReconciledJobSpec(sessionJob).getRedeploy());
+        assertEquals(
+                ReconciliationState.UPGRADING,
+                sessionJob.getStatus().getReconciliationStatus().getState());
+
+        // Nothing is submitted while the job is cancelling
+        reconciler.reconcile(sessionJob, readyCtx);
+        assertEquals(CANCELLING, sessionJob.getStatus().getJobStatus().getState());
+        assertEquals(1, flinkService.listJobs().size());
+
+        // The observer records the cancellation, marks the job suspended and records the last
+        // checkpoint of the cancelled job as the upgrade savepoint
+        sessionJob.getStatus().getJobStatus().setState(CANCELED);
+        sessionJob.getStatus().getJobStatus().setUpgradeSavepointPath("previous-job-checkpoint");
+        ReconciliationUtils.updateLastReconciledSpec(
+                sessionJob, (spec, meta) -> spec.getJob().setState(JobState.SUSPENDED));
+
+        // The redeploy completes without cancelling the terminated job again, from the requested
+        // state only
+        reconciler.reconcile(sessionJob, readyCtx);
+        assertEquals(2, flinkService.listJobs().size());
+        var newJob = verifyAndReturnTheSubmittedJob(sessionJob, flinkService.listJobs());
+        Assertions.assertNotEquals(oldJobId, newJob.f1.getJobId().toHexString());
+        assertEquals(requestedSavepoint, newJob.f0);
+        verifyJobState(sessionJob, JobState.RUNNING, RECONCILING);
+        assertEquals(1L, getReconciledJobSpec(sessionJob).getRedeploy().getNonce());
+        assertEquals(
+                requestedSavepoint == null ? UpgradeMode.STATELESS : UpgradeMode.SAVEPOINT,
+                getReconciledJobSpec(sessionJob).getUpgradeMode());
+        assertEquals(
+                requestedSavepoint,
+                sessionJob.getStatus().getJobStatus().getUpgradeSavepointPath());
+        assertNull(sessionJob.getStatus().getJobStatus().getSavepointInfo().getLastSavepoint());
+        assertEquals(
+                ReconciliationState.DEPLOYED,
+                sessionJob.getStatus().getReconciliationStatus().getState());
+        assertTrue(sessionJob.getStatus().getReconciliationStatus().isLastReconciledSpecStable());
+    }
+
+    @Test
+    public void testRedeployOfMissingJob() throws Exception {
+        var readyCtx = TestUtils.createContextWithReadyFlinkDeployment(kubernetesClient);
+        FlinkSessionJob sessionJob = TestUtils.buildSessionJob();
+        sessionJob.getSpec().getJob().setUpgradeMode(UpgradeMode.SAVEPOINT);
+
+        reconciler.reconcile(sessionJob, readyCtx);
+        verifyAndSetRunningJobsToStatus(
+                sessionJob, JobState.RUNNING, RECONCILING, null, flinkService.listJobs());
+
+        // The job is lost on the cluster, e.g. the session cluster was restarted without HA
+        flinkService.clear();
+        flinkService.setFlinkJobNotFound(true);
+
+        // The redeploy completes in a single pass, there is nothing to wait for
+        sessionJob
+                .getSpec()
+                .getJob()
+                .setRedeploy(
+                        RedeploySpec.builder()
+                                .nonce(1L)
+                                .savepointPath("s3://bucket/recovery-sp")
+                                .build());
+        reconciler.reconcile(sessionJob, readyCtx);
+        assertEquals(1, flinkService.listJobs().size());
+        assertEquals(
+                "s3://bucket/recovery-sp",
+                verifyAndReturnTheSubmittedJob(sessionJob, flinkService.listJobs()).f0);
+        verifyJobState(sessionJob, JobState.RUNNING, RECONCILING);
+        assertEquals(1L, getReconciledJobSpec(sessionJob).getRedeploy().getNonce());
     }
 
     @Test

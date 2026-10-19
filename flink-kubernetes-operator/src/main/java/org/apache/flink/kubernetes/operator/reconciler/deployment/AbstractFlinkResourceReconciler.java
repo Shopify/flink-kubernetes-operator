@@ -144,7 +144,9 @@ public abstract class AbstractFlinkResourceReconciler<
         if (shouldRollBack(ctx, specChanged, lastReconciledSpec)) {
             prepareCrForRollback(ctx, specChanged, lastReconciledSpec);
             specChanged = true;
-            diffType = DiffType.UPGRADE;
+            if (diffType != DiffType.SAVEPOINT_REDEPLOY) {
+                diffType = DiffType.UPGRADE;
+            }
         }
 
         if (specChanged) {

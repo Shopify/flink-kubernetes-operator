@@ -46,6 +46,7 @@ import org.apache.flink.kubernetes.operator.api.validation.FlinkResourceValidato
 import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
 import org.apache.flink.kubernetes.operator.exception.ReconciliationException;
+import org.apache.flink.kubernetes.operator.reconciler.RedeployRequest;
 import org.apache.flink.kubernetes.operator.utils.FlinkStateSnapshotUtils;
 import org.apache.flink.kubernetes.operator.utils.IngressUtils;
 import org.apache.flink.kubernetes.operator.utils.JarUriValidationUtils;
@@ -597,20 +598,7 @@ public class DefaultValidator implements FlinkResourceValidator {
                     "Cannot switch from standalone kubernetes to native kubernetes cluster");
         }
 
-        JobSpec oldJob = oldSpec.getJob();
-        JobSpec newJob = newSpec.getJob();
-        if (oldJob != null && newJob != null) {
-            if (newJob.getSavepointRedeployNonce() != null
-                    && !newJob.getSavepointRedeployNonce()
-                            .equals(oldJob.getSavepointRedeployNonce())) {
-                if (StringUtils.isNullOrWhitespaceOnly(newJob.getInitialSavepointPath())) {
-                    return Optional.of(
-                            "InitialSavepointPath must not be empty for savepoint redeployment");
-                }
-            }
-        }
-
-        return Optional.empty();
+        return RedeployRequest.validate(oldSpec.getJob(), newSpec.getJob());
     }
 
     // validate session job
@@ -724,20 +712,17 @@ public class DefaultValidator implements FlinkResourceValidator {
     private Optional<String> validateSpecChange(FlinkSessionJob sessionJob) {
         if (sessionJob.getStatus().getReconciliationStatus().isBeforeFirstDeployment()) {
             return Optional.empty();
-        } else {
-            var lastReconciledSpec =
-                    sessionJob
-                            .getStatus()
-                            .getReconciliationStatus()
-                            .deserializeLastReconciledSpec();
-            if (!lastReconciledSpec
-                    .getDeploymentName()
-                    .equals(sessionJob.getSpec().getDeploymentName())) {
-                return Optional.of("The deploymentName can't be changed");
-            }
         }
 
-        return Optional.empty();
+        var lastReconciledSpec =
+                sessionJob.getStatus().getReconciliationStatus().deserializeLastReconciledSpec();
+        if (!lastReconciledSpec
+                .getDeploymentName()
+                .equals(sessionJob.getSpec().getDeploymentName())) {
+            return Optional.of("The deploymentName can't be changed");
+        }
+
+        return RedeployRequest.validate(lastReconciledSpec.getJob(), sessionJob.getSpec().getJob());
     }
 
     private Optional<String> validateServiceAccount(String serviceAccount) {

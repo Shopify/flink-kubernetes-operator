@@ -40,6 +40,10 @@ Every operator release moves the compatibility envelope, so the [Compatibility](
 - **Kubernetes**: a new release can raise the minimum supported Kubernetes version or start relying on newer API objects. Check the [Kubernetes]({{< ref "docs/deployment/compatibility#kubernetes" >}}) requirements against the cluster's API server version.
 - **Helm chart**: the chart's values schema is allowed to change shape between releases. Review any custom values against the new chart's `values.yaml`, as described under [Helm Chart]({{< ref "docs/deployment/compatibility#helm-chart" >}}).
 
+{{< hint warning >}}
+When adopting `spec.job.redeploy`, update the CRDs first and wait until every operator replica runs a version supporting the feature before adding redeploy blocks. Older CRDs can prune the field. Before a downgrade or Helm rollback to a version without support, complete in-flight redeployments and remove the blocks from live resources and source/GitOps manifests. An older operator rewriting the recorded spec can forget consumed nonces; a later upgrade can replay an empty-state redeploy and discard current job state. See [Redeploying a Job]({{< ref "docs/managing/job-management#redeploying-a-job" >}}).
+{{< /hint >}}
+
 The backward compatibility guarantees for already deployed resources are described under [Custom Resource]({{< ref "docs/deployment/compatibility#custom-resource" >}}).
 
 ## Normal Upgrade Process

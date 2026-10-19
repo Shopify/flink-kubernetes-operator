@@ -29,6 +29,7 @@ import org.apache.flink.kubernetes.operator.api.AbstractFlinkResource;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkSessionJob;
 import org.apache.flink.kubernetes.operator.api.FlinkStateSnapshot;
+import org.apache.flink.kubernetes.operator.api.spec.AbstractFlinkSpec;
 import org.apache.flink.kubernetes.operator.api.spec.CheckpointSpec;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentSpec;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
@@ -38,6 +39,7 @@ import org.apache.flink.kubernetes.operator.api.spec.JobReference;
 import org.apache.flink.kubernetes.operator.api.spec.JobSpec;
 import org.apache.flink.kubernetes.operator.api.spec.JobState;
 import org.apache.flink.kubernetes.operator.api.spec.KubernetesDeploymentMode;
+import org.apache.flink.kubernetes.operator.api.spec.RedeploySpec;
 import org.apache.flink.kubernetes.operator.api.spec.SavepointSpec;
 import org.apache.flink.kubernetes.operator.api.spec.TaskManagerSpec;
 import org.apache.flink.kubernetes.operator.api.spec.UpgradeMode;
@@ -719,6 +721,109 @@ public class DefaultValidatorTest {
                     job.setInitialSavepointPath(null);
                 },
                 "InitialSavepointPath must not be empty for savepoint redeploymen");
+    }
+
+    @Test
+    public void testRedeployValidation() {
+        // Stateless redeploy
+        testSuccess(
+                dep -> {
+                    markReconciled(dep);
+                    dep.getSpec().getJob().setRedeploy(RedeploySpec.builder().nonce(1L).build());
+                });
+
+        // Redeploy from savepoint
+        testSuccess(
+                dep -> {
+                    markReconciled(dep);
+                    dep.getSpec()
+                            .getJob()
+                            .setRedeploy(
+                                    RedeploySpec.builder().nonce(1L).savepointPath("s").build());
+                });
+
+        // Migrating from the deprecated nonce
+        testSuccess(
+                dep -> {
+                    var job = dep.getSpec().getJob();
+                    job.setSavepointRedeployNonce(1L);
+                    job.setInitialSavepointPath("s");
+                    markReconciled(dep);
+                    job.setSavepointRedeployNonce(null);
+                    job.setRedeploy(RedeploySpec.builder().nonce(1L).build());
+                });
+
+        // A blank path is only validated when redeploying
+        testSuccess(
+                dep ->
+                        dep.getSpec()
+                                .getJob()
+                                .setRedeploy(
+                                        RedeploySpec.builder()
+                                                .nonce(1L)
+                                                .savepointPath(" ")
+                                                .build()));
+
+        testError(
+                dep -> {
+                    markReconciled(dep);
+                    dep.getSpec()
+                            .getJob()
+                            .setRedeploy(
+                                    RedeploySpec.builder().nonce(1L).savepointPath(" ").build());
+                },
+                "redeploy.savepointPath must not be blank");
+
+        testError(
+                dep -> {
+                    markReconciled(dep);
+                    var job = dep.getSpec().getJob();
+                    job.setInitialSavepointPath("s");
+                    job.setSavepointRedeployNonce(1L);
+                    job.setRedeploy(RedeploySpec.builder().nonce(1L).build());
+                },
+                "Cannot change redeploy.nonce and the deprecated savepointRedeployNonce");
+    }
+
+    @Test
+    public void testSessionJobRedeployValidation() {
+        testSessionJobValidateWithModifier(
+                sessionJob -> {
+                    markReconciled(sessionJob);
+                    sessionJob
+                            .getSpec()
+                            .getJob()
+                            .setRedeploy(RedeploySpec.builder().nonce(1L).build());
+                },
+                session -> {},
+                null);
+
+        testSessionJobValidateWithModifier(
+                sessionJob -> {
+                    markReconciled(sessionJob);
+                    sessionJob.getSpec().getJob().setSavepointRedeployNonce(1L);
+                },
+                session -> {},
+                "InitialSavepointPath must not be empty for savepoint redeployment");
+
+        testSessionJobValidateWithModifier(
+                sessionJob -> {
+                    markReconciled(sessionJob);
+                    sessionJob
+                            .getSpec()
+                            .getJob()
+                            .setRedeploy(
+                                    RedeploySpec.builder().nonce(1L).savepointPath("").build());
+                },
+                session -> {},
+                "redeploy.savepointPath must not be blank");
+    }
+
+    private static <SPEC extends AbstractFlinkSpec> void markReconciled(
+            AbstractFlinkResource<SPEC, ?> resource) {
+        resource.getStatus()
+                .getReconciliationStatus()
+                .serializeAndSetLastReconciledSpec(resource.getSpec(), resource);
     }
 
     @Test

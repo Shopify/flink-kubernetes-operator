@@ -81,9 +81,8 @@ public class FlinkBlueGreenDeploymentSpecDiff {
         // Extract the diff type from ReflectiveDiffBuilder result
         DiffType diffType = diffResult.getType();
 
-        // Case 1: Check for savepoint redeploy first (savepointRedeployNonce changed)
-        // This takes precedence as it indicates user wants to redeploy from their
-        // initialSavepointPath
+        // Case 1: Check for redeploy first (redeploy.nonce or savepointRedeployNonce changed)
+        // This takes precedence as it indicates user wants to discard the current state
         if (diffType == DiffType.SAVEPOINT_REDEPLOY) {
             return BlueGreenDiffType.SAVEPOINT_REDEPLOY;
         }

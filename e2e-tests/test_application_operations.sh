@@ -20,6 +20,7 @@
 # This script tests the application job operations:
 # 1. Trigger savepoint
 # 2. last state mode upgrade
+# 3. empty-state redeploy followed by a normal last-state upgrade
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 source "${SCRIPT_DIR}/utils.sh"
 
@@ -68,3 +69,30 @@ wait_for_status flinkdep/flink-example-statemachine '.status.jobStatus.state' RU
 assert_available_slots 1 $CLUSTER_ID
 
 echo "Successfully run the last-state upgrade test"
+
+# A one-shot fresh start must discard old restore state without changing the upgrade policy.
+kubectl patch "$APPLICATION_IDENTIFIER" --type merge --patch '{"spec":{"job":{"redeploy":{"nonce":1}}}}'
+wait_for_status "$APPLICATION_IDENTIFIER" '.status.reconciliationStatus.lastReconciledSpec|from_json|.spec.job.redeploy.nonce' 1 "$TIMEOUT" || exit 1
+wait_for_status "$APPLICATION_IDENTIFIER" '.status.jobManagerDeploymentStatus' READY "$TIMEOUT" || exit 1
+wait_for_status "$APPLICATION_IDENTIFIER" '.status.jobStatus.state' RUNNING "$TIMEOUT" || exit 1
+wait_for_status "$APPLICATION_IDENTIFIER" '.status.reconciliationStatus.lastReconciledSpec|from_json|.spec.job.upgradeMode' stateless "$TIMEOUT" || exit 1
+jm_pod_name=$(get_jm_pod_name "$CLUSTER_ID")
+job_id=$(kubectl get "$APPLICATION_IDENTIFIER" -o yaml | yq '.status.jobStatus.jobId')
+if kubectl logs "$jm_pod_name" -c flink-main-container | grep -E "Restoring job $job_id from"; then
+  echo "Empty-state redeploy unexpectedly restored old state"
+  exit 1
+fi
+wait_for_logs "$jm_pod_name" "Completed checkpoint [0-9]+ for job $job_id" "$TIMEOUT" || exit 1
+
+# The retained redeploy block must not make the next normal upgrade stateless.
+kubectl patch "$APPLICATION_IDENTIFIER" --type merge --patch '{"spec":{"job":{"parallelism":2}}}'
+kubectl wait --for=delete deployment --timeout="${TIMEOUT}s" --selector="app=${CLUSTER_ID}"
+wait_for_jobmanager_running "$CLUSTER_ID" "$TIMEOUT"
+jm_pod_name=$(get_jm_pod_name "$CLUSTER_ID")
+wait_for_logs "$jm_pod_name" "Restoring job $job_id from Checkpoint" "$TIMEOUT" || exit 1
+wait_for_status "$APPLICATION_IDENTIFIER" '.status.jobManagerDeploymentStatus' READY "$TIMEOUT" || exit 1
+wait_for_status "$APPLICATION_IDENTIFIER" '.status.jobStatus.state' RUNNING "$TIMEOUT" || exit 1
+wait_for_status "$APPLICATION_IDENTIFIER" '.status.reconciliationStatus.lastReconciledSpec|from_json|.spec.job.upgradeMode' last-state "$TIMEOUT" || exit 1
+assert_available_slots 0 "$CLUSTER_ID"
+
+echo "Successfully run the empty redeploy and subsequent stateful upgrade test"

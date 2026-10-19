@@ -36,6 +36,15 @@ public @interface SpecDiff {
 
     boolean onNullIgnore() default false;
 
+    /**
+     * Marks a nested {@link Diffable} field whose null value is equivalent to an empty instance.
+     * The field is then always compared field by field, instead of as a whole when one side is
+     * null.
+     */
+    @Target(ElementType.FIELD)
+    @Retention(RetentionPolicy.RUNTIME)
+    @interface NullAsEmpty {}
+
     /** Spec diff config annotation. */
     @Target(ElementType.FIELD)
     @Retention(RetentionPolicy.RUNTIME)

@@ -18,8 +18,10 @@
 package org.apache.flink.kubernetes.operator.controller;
 
 import org.apache.flink.kubernetes.operator.api.FlinkBlueGreenDeployment;
+import org.apache.flink.kubernetes.operator.api.spec.FlinkBlueGreenDeploymentSpec;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState;
 import org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentStatus;
+import org.apache.flink.kubernetes.operator.api.utils.SpecUtils;
 import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
 import org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenContext;
 import org.apache.flink.kubernetes.operator.controller.bluegreen.BlueGreenDeploymentService;
@@ -28,6 +30,7 @@ import org.apache.flink.kubernetes.operator.controller.bluegreen.handlers.BlueGr
 import org.apache.flink.kubernetes.operator.service.FlinkResourceContextFactory;
 import org.apache.flink.kubernetes.operator.utils.EventSourceUtils;
 import org.apache.flink.kubernetes.operator.utils.StatusRecorder;
+import org.apache.flink.kubernetes.operator.utils.bluegreen.BlueGreenUtils;
 
 import io.javaoperatorsdk.operator.api.reconciler.Context;
 import io.javaoperatorsdk.operator.api.reconciler.ControllerConfiguration;
@@ -40,6 +43,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 import static org.apache.flink.kubernetes.operator.api.status.FlinkBlueGreenDeploymentState.INITIALIZING_BLUE;
 
@@ -138,8 +142,43 @@ public class FlinkBlueGreenDeploymentController implements Reconciler<FlinkBlueG
                     currentState,
                     context.getDeploymentName());
 
+            var previousError = deploymentStatus.getError();
+            var validationError = BlueGreenUtils.getRedeployValidationError(context);
             BlueGreenStateHandler handler = handlerRegistry.getHandler(currentState);
-            UpdateControl<FlinkBlueGreenDeployment> updateControl = handler.handle(context);
+            var desiredSpec = bgDeployment.getSpec();
+            if (validationError.isPresent()) {
+                // Reject the edit, but keep monitoring/aborting an already running transition.
+                bgDeployment.setSpec(
+                        SpecUtils.readSpecFromJSON(
+                                deploymentStatus.getLastReconciledSpec(),
+                                "spec",
+                                FlinkBlueGreenDeploymentSpec.class));
+            }
+            UpdateControl<FlinkBlueGreenDeployment> updateControl;
+            try {
+                updateControl = handler.handle(context);
+            } finally {
+                bgDeployment.setSpec(desiredSpec);
+            }
+            var validationPrefix = "Invalid redeploy request: ";
+            if (validationError.isPresent()
+                    && (deploymentStatus.getError() == null
+                            || deploymentStatus.getError().startsWith(validationPrefix))) {
+                // Validation must not overwrite the diagnostic for an actual failed transition.
+                deploymentStatus.setError(validationPrefix + validationError.get());
+            } else if (validationError.isEmpty()
+                    && deploymentStatus.getError() != null
+                    && deploymentStatus.getError().startsWith(validationPrefix)) {
+                deploymentStatus.setError(null);
+            }
+            if (updateControl.isNoUpdate()
+                    && !Objects.equals(previousError, deploymentStatus.getError())) {
+                var delay = updateControl.getScheduleDelay();
+                updateControl = UpdateControl.patchStatus(bgDeployment);
+                if (delay.isPresent()) {
+                    updateControl.rescheduleAfter(delay.get());
+                }
+            }
             statusRecorder.patchAndCacheStatus(bgDeployment, josdkContext.getClient());
             return updateControl;
         }
