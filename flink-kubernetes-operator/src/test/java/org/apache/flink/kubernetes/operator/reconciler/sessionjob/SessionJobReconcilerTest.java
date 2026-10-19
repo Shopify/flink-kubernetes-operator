@@ -1140,7 +1140,12 @@ public class SessionJobReconcilerTest extends OperatorTestBase {
         sessionJob.getSpec().getJob().setInitialSavepointPath("s3://bucket/savepoint-explicit");
         sessionJob.getSpec().getJob().setSavepointRedeployNonce(1L);
 
-        // The running job is cancelled but the deployment attempt fails
+        // Wait for the old job before exercising the failed deployment attempt.
+        reconciler.reconcile(sessionJob, readyCtx);
+        assertEquals(CANCELLING, sessionJob.getStatus().getJobStatus().getState());
+        sessionJob.getStatus().getJobStatus().setState(CANCELED);
+        ReconciliationUtils.updateLastReconciledSpec(
+                sessionJob, (spec, meta) -> spec.getJob().setState(JobState.SUSPENDED));
         flinkService.setDeployFailure(true);
         assertThrows(Exception.class, () -> reconciler.reconcile(sessionJob, readyCtx));
         statusRecorder.updateStatusFromCache(sessionJob);
@@ -1171,5 +1176,44 @@ public class SessionJobReconcilerTest extends OperatorTestBase {
         assertEquals(JobState.RUNNING, lastReconciledJob.getState());
         // Like a redeploy that succeeds on the first attempt, a retried one cannot be rolled back
         assertTrue(status.getReconciliationStatus().isLastReconciledSpecStable());
+    }
+
+    @Test
+    public void testSavepointRedeployWaitsForCancellation() throws Exception {
+        var readyCtx = TestUtils.createContextWithReadyFlinkDeployment(kubernetesClient);
+        FlinkSessionJob sessionJob = TestUtils.buildSessionJob();
+        sessionJob.getSpec().getJob().setUpgradeMode(UpgradeMode.SAVEPOINT);
+        reconciler.reconcile(sessionJob, readyCtx);
+        verifyAndSetRunningJobsToStatus(
+                sessionJob, JobState.RUNNING, RECONCILING, null, flinkService.listJobs());
+        var oldJobId = sessionJob.getStatus().getJobStatus().getJobId();
+
+        // Savepoint redeploy of the running job, the cancellation completes asynchronously
+        sessionJob.getSpec().getJob().setInitialSavepointPath("s3://bucket/redeploy-sp");
+        sessionJob.getSpec().getJob().setSavepointRedeployNonce(1L);
+        reconciler.reconcile(sessionJob, readyCtx);
+        assertEquals(CANCELLING, sessionJob.getStatus().getJobStatus().getState());
+        assertEquals(1, flinkService.listJobs().size());
+        assertNull(getReconciledJobSpec(sessionJob).getSavepointRedeployNonce());
+
+        // Nothing is submitted while the job is cancelling
+        reconciler.reconcile(sessionJob, readyCtx);
+        assertEquals(CANCELLING, sessionJob.getStatus().getJobStatus().getState());
+        assertEquals(1, flinkService.listJobs().size());
+
+        // The observer records the cancellation and marks the job suspended
+        sessionJob.getStatus().getJobStatus().setState(CANCELED);
+        ReconciliationUtils.updateLastReconciledSpec(
+                sessionJob, (spec, meta) -> spec.getJob().setState(JobState.SUSPENDED));
+
+        // The redeploy completes without cancelling the terminated job again
+        reconciler.reconcile(sessionJob, readyCtx);
+        assertEquals(2, flinkService.listJobs().size());
+        var newJob = verifyAndReturnTheSubmittedJob(sessionJob, flinkService.listJobs());
+        Assertions.assertNotEquals(oldJobId, newJob.f1.getJobId().toHexString());
+        assertEquals("s3://bucket/redeploy-sp", newJob.f0);
+        verifyJobState(sessionJob, JobState.RUNNING, RECONCILING);
+        assertEquals(1L, getReconciledJobSpec(sessionJob).getSavepointRedeployNonce());
+        assertTrue(sessionJob.getStatus().getReconciliationStatus().isLastReconciledSpecStable());
     }
 }

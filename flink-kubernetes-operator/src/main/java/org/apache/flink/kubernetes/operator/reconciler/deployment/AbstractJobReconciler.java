@@ -655,8 +655,13 @@ public abstract class AbstractJobReconciler<
             SPEC currentDeploySpec,
             JobState desiredJobState)
             throws Exception {
+        if (cancelJob(ctx, SuspendMode.STATELESS)) {
+            // The nonce is only recorded in the last reconciled spec below, so the redeploy is
+            // simply retried once the asynchronous cancellation has completed.
+            LOG.info("Waiting for the job to be cancelled before redeploying from savepoint");
+            return;
+        }
         LOG.info("Redeploying from savepoint");
-        cancelJob(ctx, SuspendMode.STATELESS);
         currentDeploySpec.getJob().setUpgradeMode(UpgradeMode.SAVEPOINT);
 
         Optional<String> savepointPath =
