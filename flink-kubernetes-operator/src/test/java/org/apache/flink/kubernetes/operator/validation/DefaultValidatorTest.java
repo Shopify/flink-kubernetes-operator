@@ -56,6 +56,7 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import javax.annotation.Nullable;
 
@@ -70,6 +71,7 @@ import static org.apache.flink.configuration.JobManagerOptions.JVM_HEAP_MEMORY;
 import static org.apache.flink.configuration.TaskManagerOptions.MANAGED_MEMORY_SIZE;
 import static org.apache.flink.configuration.TaskManagerOptions.TASK_HEAP_MEMORY;
 import static org.apache.flink.configuration.TaskManagerOptions.TOTAL_FLINK_MEMORY;
+import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.OPERATOR_FLINK_CLIENT_TIMEOUT;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -78,6 +80,43 @@ public class DefaultValidatorTest {
 
     private final DefaultValidator validator =
             new DefaultValidator(new FlinkConfigManager(new Configuration()));
+
+    @ParameterizedTest
+    @ValueSource(strings = {"invalid", "0 s", "-1 s", "500 ms"})
+    void testInvalidFlinkClientTimeout(String value) {
+        for (var key :
+                new String[] {
+                    OPERATOR_FLINK_CLIENT_TIMEOUT.key(),
+                    "kubernetes.operator.observer.flink.client.timeout"
+                }) {
+            var deployment = TestUtils.buildApplicationCluster();
+            deployment.getSpec().getFlinkConfiguration().put(key, value);
+            var error = validator.validateDeployment(deployment);
+            assertTrue(error.orElseThrow().contains(OPERATOR_FLINK_CLIENT_TIMEOUT.key()));
+
+            var sessionJob = TestUtils.buildSessionJob();
+            sessionJob.getSpec().getFlinkConfiguration().put(key, value);
+            error = validator.validateSessionJob(sessionJob, Optional.empty());
+            assertTrue(error.orElseThrow().contains(OPERATOR_FLINK_CLIENT_TIMEOUT.key()));
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1 s", "1500 ms", "15 s"})
+    void testValidFlinkClientTimeout(String value) {
+        for (var key :
+                new String[] {
+                    OPERATOR_FLINK_CLIENT_TIMEOUT.key(),
+                    "kubernetes.operator.observer.flink.client.timeout"
+                }) {
+            var deployment = TestUtils.buildApplicationCluster();
+            deployment.getSpec().getFlinkConfiguration().put(key, value);
+            assertTrue(validator.validateDeployment(deployment).isEmpty());
+            var sessionJob = TestUtils.buildSessionJob();
+            sessionJob.getSpec().getFlinkConfiguration().put(key, value);
+            assertTrue(validator.validateSessionJob(sessionJob, Optional.empty()).isEmpty());
+        }
+    }
 
     @Test
     public void testValidationWithoutDefaultConfig() {

@@ -146,6 +146,20 @@ General operator system configuration. Cannot be overridden on a per-resource ba
 
 These options can be configured on both an operator and a per-resource level. When set under `spec.flinkConfiguration` for the Flink resources it will override the default value provided in the operator default configuration (`flink-conf.yaml`).
 
+For example, configure the operator's Flink client timeout for one resource:
+
+```yaml
+spec:
+  flinkConfiguration:
+    kubernetes.operator.flink.client.timeout: 15 s
+```
+
+This option controls operator client waits, including observation and native resource-requirements GET/PUT calls, rather than only scaling. It does not replace the separate job cancellation or submission timeouts. An explicit resource value takes precedence over namespace/version defaults; removing it restores those defaults. Changes take effect in the next reconciliation without restarting the Flink job.
+
+Resource overrides must be at least one second because some client waits use whole-second precision and truncate fractional seconds. Invalid values are reported as validation errors. Observation and error reporting continue using the last reconciled resource timeout, or operator defaults if no valid previous override exists.
+
+The setting belongs to the resource being reconciled: a `FlinkDeployment` value does not implicitly become the timeout of every `FlinkSessionJob` targeting that session cluster. Configure each session-job resource separately when needed. Longer waits can occupy shared reconciliation workers longer during failures; resource-local configuration is not worker-capacity isolation.
+
 {{< generated/dynamic_section >}}
 
 ### Autoscaler Configuration

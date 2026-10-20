@@ -28,6 +28,7 @@ import org.apache.flink.kubernetes.operator.api.AbstractFlinkResource;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkSessionJob;
 import org.apache.flink.kubernetes.operator.api.FlinkStateSnapshot;
+import org.apache.flink.kubernetes.operator.api.spec.AbstractFlinkSpec;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkDeploymentSpec;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
 import org.apache.flink.kubernetes.operator.api.spec.IngressSpec;
@@ -102,6 +103,7 @@ public class DefaultValidator implements FlinkResourceValidator {
         return firstPresent(
                 validateDeploymentName(deployment.getMetadata().getName()),
                 validateFlinkVersion(deployment),
+                validateFlinkClientTimeout(spec),
                 validateFlinkDeploymentConfig(effectiveConfig),
                 validateIngress(
                         spec.getIngress(),
@@ -182,6 +184,15 @@ public class DefaultValidator implements FlinkResourceValidator {
         }
 
         return Optional.empty();
+    }
+
+    private Optional<String> validateFlinkClientTimeout(AbstractFlinkSpec spec) {
+        try {
+            FlinkConfigManager.getFlinkClientTimeoutOverride(spec);
+            return Optional.empty();
+        } catch (IllegalArgumentException e) {
+            return Optional.of(e.getMessage());
+        }
     }
 
     private Optional<String> validateFlinkDeploymentConfig(Map<String, String> confMap) {
@@ -514,6 +525,7 @@ public class DefaultValidator implements FlinkResourceValidator {
         return firstPresent(
                 validateDeploymentName(sessionJob.getSpec().getDeploymentName()),
                 validateJobNotEmpty(sessionJob),
+                validateFlinkClientTimeout(sessionJob.getSpec()),
                 validateSpecChange(sessionJob));
     }
 

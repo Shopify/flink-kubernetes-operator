@@ -151,8 +151,7 @@ public abstract class FlinkResourceContext<CR extends AbstractFlinkResource<?, ?
             return operatorConfig;
         }
         return operatorConfig =
-                configManager.getOperatorConfiguration(
-                        getResource().getMetadata().getNamespace(), getFlinkVersion());
+                configManager.getResourceOperatorConfiguration(getResource(), getFlinkVersion());
     }
 
     /**

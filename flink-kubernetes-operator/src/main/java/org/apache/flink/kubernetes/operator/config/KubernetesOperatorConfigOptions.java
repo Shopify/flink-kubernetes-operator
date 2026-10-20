@@ -106,14 +106,16 @@ public class KubernetesOperatorConfigOptions {
                     .withDescription(
                             "The interval before a checkpoint trigger attempt is marked as unsuccessful.");
 
-    @Documentation.Section(SECTION_SYSTEM)
+    @Documentation.Section(SECTION_DYNAMIC)
     public static final ConfigOption<Duration> OPERATOR_FLINK_CLIENT_TIMEOUT =
             operatorConfig("flink.client.timeout")
                     .durationType()
                     .defaultValue(Duration.ofSeconds(10))
                     .withDeprecatedKeys(operatorConfigKey("observer.flink.client.timeout"))
                     .withDescription(
-                            "The timeout for the observer to wait the flink rest client to return.");
+                            "The timeout for operator Flink client calls, including observation and resource-requirements updates. "
+                                    + "Can be overridden per resource without restarting the Flink job. "
+                                    + "Per-resource overrides must be at least 1 s.");
 
     @Documentation.Section(SECTION_SYSTEM)
     public static final ConfigOption<Duration> OPERATOR_FLINK_CLIENT_CANCEL_TIMEOUT =

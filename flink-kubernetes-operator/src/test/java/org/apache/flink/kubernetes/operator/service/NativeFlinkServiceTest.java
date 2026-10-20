@@ -44,6 +44,7 @@ import org.apache.flink.runtime.jobgraph.JobResourceRequirements;
 import org.apache.flink.runtime.jobgraph.JobVertexID;
 import org.apache.flink.runtime.jobgraph.JobVertexResourceRequirements;
 import org.apache.flink.runtime.rest.messages.JobMessageParameters;
+import org.apache.flink.runtime.rest.messages.ResponseBody;
 import org.apache.flink.runtime.rest.messages.job.JobResourceRequirementsBody;
 import org.apache.flink.runtime.rest.messages.job.JobResourceRequirementsHeaders;
 import org.apache.flink.util.concurrent.Executors;
@@ -57,6 +58,7 @@ import io.fabric8.kubernetes.client.server.mock.KubernetesMockServer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
 
@@ -66,6 +68,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -516,6 +519,71 @@ public class NativeFlinkServiceTest {
                     reconStatus.serializeAndSetLastReconciledSpec(lastReconciledSpec, fd);
                 },
                 scaled);
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        ", , 10",
+        "kubernetes.operator.flink.client.timeout, 1 s, 1",
+        "kubernetes.operator.flink.client.timeout, 1500 ms, 1",
+        "kubernetes.operator.flink.client.timeout, 15 s, 15",
+        "kubernetes.operator.observer.flink.client.timeout, 15 s, 15"
+    })
+    void testResourceRestApiTimeout(String key, String value, long seconds) throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        deployment.getStatus().getJobStatus().setJobId(new JobID().toHexString());
+        if (key != null) {
+            deployment.getSpec().getFlinkConfiguration().put(key, value);
+        }
+        var factory =
+                new FlinkResourceContextFactory(
+                        configManager, TestUtils.createTestMetricGroup(configuration), null);
+        try (var clusterClient = new TestingClusterClient<String>(configuration)) {
+            var context = factory.getResourceContext(deployment, TestUtils.createEmptyContext());
+            var service = (NativeFlinkService) context.getFlinkService();
+            var requirements =
+                    new JobResourceRequirements(
+                            Map.of(
+                                    new JobVertexID(),
+                                    new JobVertexResourceRequirements(
+                                            new JobVertexResourceRequirements.Parallelism(1, 2))));
+            var getFuture =
+                    new TimeoutCheckingFuture<ResponseBody>(
+                            new JobResourceRequirementsBody(requirements), seconds);
+            var putFuture = new TimeoutCheckingFuture<ResponseBody>(null, seconds);
+            clusterClient.setRequestProcessor(
+                    (headers, parameters, body) ->
+                            headers instanceof JobResourceRequirementsHeaders
+                                    ? getFuture
+                                    : putFuture);
+            assertEquals(
+                    requirements.getJobVertexParallelisms(),
+                    service.getVertexResources(clusterClient, deployment));
+            service.updateVertexResources(
+                    clusterClient, deployment, requirements.getJobVertexParallelisms());
+            assertEquals(1, getFuture.calls);
+            assertEquals(1, putFuture.calls);
+        } finally {
+            factory.cleanup(deployment);
+        }
+    }
+
+    private static class TimeoutCheckingFuture<T> extends CompletableFuture<T> {
+        private final long seconds;
+        private int calls;
+
+        private TimeoutCheckingFuture(T value, long seconds) {
+            this.seconds = seconds;
+            complete(value);
+        }
+
+        @Override
+        public T get(long timeout, TimeUnit unit) {
+            calls++;
+            assertEquals(TimeUnit.SECONDS, unit);
+            assertEquals(seconds, timeout);
+            return getNow(null);
+        }
     }
 
     @Test

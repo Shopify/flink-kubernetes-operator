@@ -23,9 +23,11 @@ import org.apache.flink.kubernetes.operator.TestingFlinkService;
 import org.apache.flink.kubernetes.operator.api.AbstractFlinkResource;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkSessionJob;
+import org.apache.flink.kubernetes.operator.api.spec.ConfigObjectNode;
 import org.apache.flink.kubernetes.operator.api.spec.FlinkVersion;
 import org.apache.flink.kubernetes.operator.config.FlinkConfigManager;
 import org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions;
+import org.apache.flink.kubernetes.operator.reconciler.ReconciliationUtils;
 import org.apache.flink.kubernetes.operator.service.FlinkService;
 
 import io.fabric8.kubernetes.api.model.HasMetadata;
@@ -40,8 +42,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.stream.Stream;
 
+import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.OPERATOR_FLINK_CLIENT_TIMEOUT;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Resource Context tests. */
@@ -117,6 +121,115 @@ public class FlinkResourceContextTest {
         assertEquals(Duration.ofMinutes(2), ctx.getOperatorConfig().getRestApiReadyDelay());
 
         assertEquals(2, counter.get());
+    }
+
+    @ParameterizedTest
+    @MethodSource("crTypes")
+    void testFlinkClientTimeoutOverride(AbstractFlinkResource<?, ?> cr) {
+        var key = OPERATOR_FLINK_CLIENT_TIMEOUT.key();
+        var alias = "kubernetes.operator.observer.flink.client.timeout";
+        var conf = new Configuration();
+        conf.set(OPERATOR_FLINK_CLIENT_TIMEOUT, Duration.ofSeconds(12));
+        conf.setString(
+                KubernetesOperatorConfigOptions.NAMESPACE_CONF_PREFIX
+                        + cr.getMetadata().getNamespace()
+                        + "."
+                        + key,
+                "13 s");
+        var version = getContext(cr).getFlinkVersion();
+        conf.setString(
+                KubernetesOperatorConfigOptions.VERSION_CONF_PREFIX + version + "." + key, "14 s");
+        configManager = new FlinkConfigManager(conf);
+        assertEquals(
+                Duration.ofSeconds(14), getContext(cr).getOperatorConfig().getFlinkClientTimeout());
+
+        // Resolve the resource alias before merging with canonical operator defaults.
+        cr.getSpec().getFlinkConfiguration().put(alias, "15 s");
+        var ctx = getContext(cr);
+        assertEquals(Duration.ofSeconds(15), ctx.getOperatorConfig().getFlinkClientTimeout());
+        assertSame(ctx.getOperatorConfig(), ctx.getOperatorConfig());
+        var sibling = ReconciliationUtils.clone(cr);
+        sibling.getMetadata().setName("other-job");
+        sibling.getSpec().getFlinkConfiguration().remove(alias);
+        assertEquals(
+                Duration.ofSeconds(14),
+                getContext(sibling).getOperatorConfig().getFlinkClientTimeout());
+
+        ReconciliationUtils.updateStatusForDeployedSpec(cr, new Configuration());
+        cr.getSpec().getFlinkConfiguration().put(key, "20 s");
+        cr.getSpec()
+                .getFlinkConfiguration()
+                .put(KubernetesOperatorConfigOptions.OPERATOR_RECONCILE_PARALLELISM.key(), "99");
+        assertEquals(
+                Duration.ofSeconds(20), getContext(cr).getOperatorConfig().getFlinkClientTimeout());
+        assertEquals(
+                conf.get(KubernetesOperatorConfigOptions.OPERATOR_RECONCILE_PARALLELISM),
+                getContext(cr).getOperatorConfig().getReconcilerMaxParallelism());
+
+        // A fresh context sees updates; an existing context remains a consistent snapshot.
+        assertEquals(Duration.ofSeconds(15), ctx.getOperatorConfig().getFlinkClientTimeout());
+        cr.getSpec().getFlinkConfiguration().remove(key);
+        assertEquals(
+                Duration.ofSeconds(15), getContext(cr).getOperatorConfig().getFlinkClientTimeout());
+        cr.getSpec().getFlinkConfiguration().remove(alias);
+        assertEquals(
+                Duration.ofSeconds(14), getContext(cr).getOperatorConfig().getFlinkClientTimeout());
+
+        // No resource override may mutate namespace/version defaults shared with another job.
+        assertEquals(
+                Duration.ofSeconds(14),
+                configManager
+                        .getOperatorConfiguration(cr.getMetadata().getNamespace(), version)
+                        .getFlinkClientTimeout());
+        cr.getSpec().setFlinkConfiguration((ConfigObjectNode) null);
+        assertEquals(
+                Duration.ofSeconds(14), getContext(cr).getOperatorConfig().getFlinkClientTimeout());
+    }
+
+    @ParameterizedTest
+    @MethodSource("crTypes")
+    void testInvalidFlinkClientTimeoutUsesLastReconciledSpec(AbstractFlinkResource<?, ?> cr) {
+        var key = OPERATOR_FLINK_CLIENT_TIMEOUT.key();
+        cr.getSpec().getFlinkConfiguration().put(key, "15 s");
+        ReconciliationUtils.updateStatusForDeployedSpec(cr, new Configuration());
+        cr.getSpec().getFlinkConfiguration().put(key, "invalid");
+        assertEquals(
+                Duration.ofSeconds(15), getContext(cr).getOperatorConfig().getFlinkClientTimeout());
+    }
+
+    @ParameterizedTest
+    @MethodSource("crTypes")
+    void testInvalidInitialFlinkClientTimeoutUsesDefaults(AbstractFlinkResource<?, ?> cr) {
+        cr.getSpec().getFlinkConfiguration().put(OPERATOR_FLINK_CLIENT_TIMEOUT.key(), "500 ms");
+        assertEquals(
+                Duration.ofSeconds(10), getContext(cr).getOperatorConfig().getFlinkClientTimeout());
+        // A spec accepted by an older operator may itself contain an invalid override.
+        ReconciliationUtils.updateStatusForDeployedSpec(cr, new Configuration());
+        assertEquals(
+                Duration.ofSeconds(10), getContext(cr).getOperatorConfig().getFlinkClientTimeout());
+    }
+
+    @Test
+    void testSessionJobTimeoutDoesNotInheritClusterOverride() {
+        josdkCtx.getSecondaryResource(FlinkDeployment.class)
+                .orElseThrow()
+                .getSpec()
+                .getFlinkConfiguration()
+                .put(OPERATOR_FLINK_CLIENT_TIMEOUT.key(), "30 s");
+        var job = TestUtils.buildSessionJob();
+        assertEquals(
+                Duration.ofSeconds(10),
+                getContext(job).getOperatorConfig().getFlinkClientTimeout());
+        job.getSpec().getFlinkConfiguration().put(OPERATOR_FLINK_CLIENT_TIMEOUT.key(), "15 s");
+        assertEquals(
+                Duration.ofSeconds(15),
+                getContext(job).getOperatorConfig().getFlinkClientTimeout());
+        var sibling = ReconciliationUtils.clone(job);
+        sibling.getMetadata().setName("other-job");
+        sibling.getSpec().getFlinkConfiguration().remove(OPERATOR_FLINK_CLIENT_TIMEOUT.key());
+        assertEquals(
+                Duration.ofSeconds(10),
+                getContext(sibling).getOperatorConfig().getFlinkClientTimeout());
     }
 
     @Test

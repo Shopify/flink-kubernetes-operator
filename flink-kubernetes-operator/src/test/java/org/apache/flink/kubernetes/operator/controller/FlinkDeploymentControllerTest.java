@@ -58,6 +58,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
 import java.util.Map;
@@ -65,6 +66,7 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 import static org.apache.flink.kubernetes.operator.TestUtils.MAX_RECONCILE_TIMES;
+import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.OPERATOR_FLINK_CLIENT_TIMEOUT;
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.OPERATOR_JOB_UPGRADE_LAST_STATE_FALLBACK_ENABLED;
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.SNAPSHOT_RESOURCE_ENABLED;
 import static org.apache.flink.kubernetes.operator.utils.EventRecorder.Reason.ValidationError;
@@ -553,6 +555,55 @@ public class FlinkDeploymentControllerTest {
         appCluster.getSpec().getJob().setUpgradeMode(upgradeMode);
         testUpgradeNotReadyCluster(ReconciliationUtils.clone(appCluster));
         assertEquals(upgradeMode, appCluster.getSpec().getJob().getUpgradeMode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"invalid", "0 s", "-1 s", "500 ms"})
+    void testClientTimeoutValidationDoesNotBlockObservation(String value) throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        var key = OPERATOR_FLINK_CLIENT_TIMEOUT.key();
+        deployment.getSpec().getFlinkConfiguration().put(key, value);
+        testController.reconcile(deployment, context);
+        assertTrue(deployment.getStatus().getError().contains(key));
+        assertTrue(flinkService.listJobs().isEmpty());
+
+        testController.updateErrorStatus(
+                deployment, context, new IllegalArgumentException(key + " is invalid"));
+        assertTrue(deployment.getStatus().getError().contains(key));
+        deployment.getSpec().getFlinkConfiguration().put(key, "15 s");
+        testController.reconcile(deployment, context);
+        testController.reconcile(deployment, context);
+        testController.reconcile(deployment, context);
+        assertEquals(
+                JobManagerDeploymentStatus.READY,
+                deployment.getStatus().getJobManagerDeploymentStatus());
+        var jobId = deployment.getStatus().getJobStatus().getJobId();
+        deployment.getSpec().getFlinkConfiguration().put(key, value);
+        testController.reconcile(deployment, context);
+        assertTrue(deployment.getStatus().getError().contains(key));
+        assertEquals(
+                JobManagerDeploymentStatus.READY,
+                deployment.getStatus().getJobManagerDeploymentStatus());
+        assertEquals(jobId, deployment.getStatus().getJobStatus().getJobId());
+        assertEquals(0, flinkService.getCancelJobCallCount());
+    }
+
+    @Test
+    void testClientTimeoutUpdateDoesNotRestartJob() throws Exception {
+        var deployment = TestUtils.buildApplicationCluster();
+        var key = OPERATOR_FLINK_CLIENT_TIMEOUT.key();
+        deployment.getSpec().getFlinkConfiguration().put(key, "15 s");
+        verifyReconcileNormalLifecycle(deployment);
+        var jobId = deployment.getStatus().getJobStatus().getJobId();
+        deployment.getSpec().getFlinkConfiguration().put(key, "20 s");
+        testController.reconcile(deployment, context);
+        deployment.getSpec().getFlinkConfiguration().remove(key);
+        testController.reconcile(deployment, context);
+        assertEquals(jobId, deployment.getStatus().getJobStatus().getJobId());
+        assertEquals(
+                JobManagerDeploymentStatus.READY,
+                deployment.getStatus().getJobManagerDeploymentStatus());
+        assertEquals(0, flinkService.getCancelJobCallCount());
     }
 
     @Test

@@ -23,6 +23,7 @@ import org.apache.flink.autoscaler.config.AutoScalerOptions;
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.GlobalConfiguration;
+import org.apache.flink.kubernetes.operator.api.AbstractFlinkResource;
 import org.apache.flink.kubernetes.operator.api.FlinkDeployment;
 import org.apache.flink.kubernetes.operator.api.FlinkStateSnapshot;
 import org.apache.flink.kubernetes.operator.api.spec.AbstractFlinkSpec;
@@ -70,6 +71,7 @@ import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConf
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.NAMESPACE_CONF_PREFIX;
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.OPERATOR_DYNAMIC_CONFIG_CHECK_INTERVAL;
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.OPERATOR_DYNAMIC_CONFIG_ENABLED;
+import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.OPERATOR_FLINK_CLIENT_TIMEOUT;
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.SNAPSHOT_RESOURCE_ENABLED;
 import static org.apache.flink.kubernetes.operator.config.KubernetesOperatorConfigOptions.VERSION_CONF_PREFIX;
 
@@ -220,6 +222,51 @@ public class FlinkConfigManager {
             String namespace, FlinkVersion flinkVersion) {
         return FlinkOperatorConfiguration.fromConfiguration(
                 getDefaultConfig(namespace, flinkVersion));
+    }
+
+    /**
+     * Build resource-local operator configuration, overriding only the Flink client timeout.
+     * Invalid overrides are reported by DefaultValidator; observation and error reporting must
+     * remain possible before validation, using the last reconciled override or operator defaults.
+     */
+    public FlinkOperatorConfiguration getResourceOperatorConfiguration(
+            AbstractFlinkResource<?, ?> resource, FlinkVersion flinkVersion) {
+        var conf = getDefaultConfig(resource.getMetadata().getNamespace(), flinkVersion);
+        if (!tryApplyFlinkClientTimeout(resource.getSpec(), conf)) {
+            var lastSpec =
+                    resource.getStatus().getReconciliationStatus().deserializeLastReconciledSpec();
+            if (lastSpec != null) {
+                tryApplyFlinkClientTimeout(lastSpec, conf);
+            }
+        }
+        return FlinkOperatorConfiguration.fromConfiguration(conf);
+    }
+
+    private boolean tryApplyFlinkClientTimeout(AbstractFlinkSpec spec, Configuration conf) {
+        try {
+            getFlinkClientTimeoutOverride(spec)
+                    .ifPresent(timeout -> conf.set(OPERATOR_FLINK_CLIENT_TIMEOUT, timeout));
+            return true;
+        } catch (IllegalArgumentException e) {
+            LOG.debug("Leaving invalid resource client timeout for validation", e);
+            return false;
+        }
+    }
+
+    /** Resolve and validate an explicit resource override before merging with operator defaults. */
+    public static Optional<Duration> getFlinkClientTimeoutOverride(AbstractFlinkSpec spec) {
+        if (spec.getFlinkConfiguration() == null) {
+            return Optional.empty();
+        }
+        var timeout =
+                spec.getFlinkConfiguration()
+                        .asConfiguration()
+                        .getOptional(OPERATOR_FLINK_CLIENT_TIMEOUT);
+        if (timeout.isPresent() && timeout.get().compareTo(Duration.ofSeconds(1)) < 0) {
+            throw new IllegalArgumentException(
+                    OPERATOR_FLINK_CLIENT_TIMEOUT.key() + " must be at least 1 s.");
+        }
+        return timeout;
     }
 
     /**

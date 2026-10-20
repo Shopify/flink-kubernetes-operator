@@ -150,7 +150,7 @@
             <td><h5>kubernetes.operator.flink.client.timeout</h5></td>
             <td style="word-wrap: break-word;">10 s</td>
             <td>Duration</td>
-            <td>The timeout for the observer to wait the flink rest client to return.</td>
+            <td>The timeout for operator Flink client calls, including observation and resource-requirements updates. Can be overridden per resource without restarting the Flink job. Per-resource overrides must be at least 1 s.</td>
         </tr>
         <tr>
             <td><h5>kubernetes.operator.health.canary.resource.timeout</h5></td>
