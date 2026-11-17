@@ -66,6 +66,9 @@ public class TestingMetricListener {
                                         viewUpdater.notifyOfAddedView((View) metric);
                                     }
                                 })
+                        .setUnregisterConsumer(
+                                (metric, name, group) ->
+                                        this.metrics.remove(group.getMetricIdentifier(name)))
                         .build();
         this.metricGroup =
                 KubernetesOperatorMetricGroup.create(
